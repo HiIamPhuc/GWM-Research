@@ -1,0 +1,23 @@
+# Config for GWM-RNN-Text
+pretrained_model: bert-base-uncased
+finetune_text_encoder: true
+num_layers: 2
+hidden_dim: 1024
+dropout: 0.1
+learning_rate: 1e-4
+batch_size: 256
+loss: infonce
+num_epochs: 10
+temperature: 0.07
+
+data_dir: data-processed/wn18rr
+output_dir: output/wn18rr_bert_finetune
+    
+add_inverse: true
+context_k: 15
+context_agg: mean
+early_stopping: 2000
+eval_every: 2
+    
+device: cuda
+seed: 42

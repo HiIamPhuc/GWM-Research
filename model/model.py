@@ -31,7 +31,9 @@ class GWM(nn.Module):
         )
         
         # 4. Fusion Layer
-        self.fusion = nn.Linear(config.hidden_dim * 2, config.hidden_dim)
+        # Text Encoder Dim + Structural Dim
+        text_dim = self.text_encoder.config.hidden_size
+        self.fusion = nn.Linear(text_dim + config.hidden_dim, config.hidden_dim)
         
         # 5. Output Projector (Optional but good for matching embeddings)
         self.projector = nn.Linear(config.hidden_dim, config.hidden_dim)

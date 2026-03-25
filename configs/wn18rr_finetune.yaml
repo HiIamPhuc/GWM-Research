@@ -7,7 +7,7 @@ dropout: 0.1
 learning_rate: 1e-4
 batch_size: 64
 loss: infonce
-num_epochs: 50
+num_epochs: 10
 temperature: 0.07
 
 data_dir: data-processed/wn18rr

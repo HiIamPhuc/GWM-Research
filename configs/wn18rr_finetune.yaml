@@ -5,7 +5,7 @@ num_layers: 2
 hidden_dim: 1024
 dropout: 0.1
 learning_rate: 1e-4
-batch_size: 128
+batch_size: 64
 loss: infonce
 num_epochs: 50
 temperature: 0.07

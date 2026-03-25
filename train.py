@@ -129,7 +129,8 @@ def train(args):
         print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
         
         # Validation
-        if valid_loader:
+        eval_every = getattr(config, 'eval_every', 1)
+        if valid_loader and (epoch + 1) % eval_every == 0:
             model.eval()
             val_loss = 0
             

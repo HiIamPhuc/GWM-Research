@@ -1,0 +1,23 @@
+# Config for GWM-RNN-Text
+pretrained_model: bert-base-uncased
+finetune_text_encoder: true
+num_layers: 2
+hidden_dim: 768
+dropout: 0.1
+learning_rate: 1e-4
+batch_size: 64
+num_negatives: 1024
+loss: infonce
+max_steps: 100000
+    
+data_dir: D:/NLP research/Code/graph-world-models/GWM-Research/data/processed/wn18rr
+output_dir: D:/NLP research/Code/graph-world-models/GWM-Research/output/wn18rr_bert_finetune
+    
+add_inverse: true
+context_k: 10
+context_agg: mean
+early_stopping: 2000
+eval_every: 10
+    
+device: cuda
+seed: 42

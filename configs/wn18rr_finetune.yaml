@@ -23,3 +23,8 @@ eval_every: 5
     
 device: cuda
 seed: 42
+
+text_cache_batch_size: 128
+
+eval_batch_size: 32
+candidate_batch_size: 32

@@ -1,10 +1,11 @@
 import os
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import argparse
 import yaml
+import json
 from pathlib import Path
 
 # Need to set PYTHONPATH or import relatively if structure is respected
@@ -13,6 +14,87 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.model import GWM
 from model.dataset import GWMDataset, CollateFN
+
+
+class EntityDataset(Dataset):
+    def __init__(self, data_dir):
+        with open(os.path.join(data_dir, 'entity_text.json'), 'r') as f:
+            self.entity_text = json.load(f)
+
+        with open(os.path.join(data_dir, 'entity2id.json'), 'r') as f:
+            self.entity2id = json.load(f)
+
+        self.num_entities = len(self.entity2id)
+        self.texts = [self.entity_text.get(str(i), "") for i in range(self.num_entities)]
+
+    def __len__(self):
+        return self.num_entities
+
+    def __getitem__(self, idx):
+        return {
+            'id': idx,
+            'text': self.texts[idx]
+        }
+
+
+def load_all_triples(data_dir):
+    all_triples = set()
+    for split in ['train', 'valid', 'test']:
+        path = os.path.join(data_dir, f'{split}_triples.pt')
+        if os.path.exists(path):
+            triples = torch.load(path)
+            for h, r, t in triples:
+                all_triples.add((h.item(), r.item(), t.item()))
+    return all_triples
+
+
+def compute_filtered_ranking_metrics(model, data_loader, all_entity_embeddings, hr_map, device):
+    hits1, hits3, hits10, mrr, mr = 0, 0, 0, 0.0, 0.0
+    total = 0
+
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Filtered Validation"):
+            h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
+            r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
+            context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
+
+            t_ids = batch['t_batch']['id'].to(device)
+            h_ids = batch['h_batch']['id'].cpu().numpy()
+            r_ids = batch['r_batch']['id'].cpu().numpy()
+
+            query_vector = model(h_batch, r_batch, context_batch)
+            scores = torch.mm(query_vector, all_entity_embeddings.t())
+
+            # Filter out other true tails for (h, r)
+            for i in range(scores.size(0)):
+                h_id = h_ids[i]
+                r_id = r_ids[i]
+                true_t = t_ids[i].item()
+
+                filter_mask_indices = list(hr_map.get((h_id, r_id), []))
+                if true_t in filter_mask_indices:
+                    filter_mask_indices.remove(true_t)
+
+                if filter_mask_indices:
+                    scores[i, filter_mask_indices] = -float('inf')
+
+            target_scores = scores.gather(1, t_ids.unsqueeze(1))
+            ranks = (scores > target_scores).sum(dim=1) + 1
+
+            hits1 += (ranks <= 1).sum().item()
+            hits3 += (ranks <= 3).sum().item()
+            hits10 += (ranks <= 10).sum().item()
+            mrr += (1.0 / ranks.float()).sum().item()
+            mr += ranks.float().sum().item()
+            total += ranks.size(0)
+
+    return {
+        'MRR': mrr / total,
+        'MR': mr / total,
+        'Hits@1': hits1 / total,
+        'Hits@3': hits3 / total,
+        'Hits@10': hits10 / total
+    }
 
 def get_config(args):
     with open(args.config, 'r') as f:
@@ -46,7 +128,6 @@ def train(args):
     # Infer input dimensions from dataset
     # e.g., number of entities/relations for embedding layers
     # Load vocabulary sizes
-    import json
     with open(os.path.join(config.data_dir, 'entity2id.json')) as f:
         num_ent = len(json.load(f))
     with open(os.path.join(config.data_dir, 'relation2id.json')) as f:
@@ -96,10 +177,59 @@ def train(args):
             shuffle=False, 
             collate_fn=collate_fn,
             num_workers=2,
-            drop_last=True
+            drop_last=False
         )
     else:
         valid_loader = None
+
+    # Build filtered-ranking structures for standard validation
+    hr_map = None
+    all_entity_embeddings = None
+    entity_loader = None
+    if valid_loader is not None:
+        all_triples = load_all_triples(config.data_dir)
+        hr_map = {}
+        for h, r, t in all_triples:
+            if (h, r) not in hr_map:
+                hr_map[(h, r)] = set()
+            hr_map[(h, r)].add(t)
+
+        entity_dataset = EntityDataset(config.data_dir)
+        candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(int(config.batch_size), 256)))
+
+        def entity_collate(batch):
+            ids = [x['id'] for x in batch]
+
+            # In frozen-text mode, encode_target can use cached text by ID only.
+            if model.use_text_cache and not config.finetune_text_encoder:
+                return {'id': torch.tensor(ids)}
+
+            texts = [x['text'] for x in batch]
+            inputs = model.tokenizer(texts, padding=True, truncation=True, max_length=64, return_tensors='pt')
+            return {
+                'input_ids': inputs['input_ids'],
+                'attention_mask': inputs['attention_mask'],
+                'id': torch.tensor(ids)
+            }
+
+        entity_loader = DataLoader(
+            entity_dataset,
+            batch_size=candidate_batch_size,
+            shuffle=False,
+            collate_fn=entity_collate,
+            num_workers=2
+        )
+
+        # If text encoder is frozen, candidate text embeddings are static.
+        if not config.finetune_text_encoder:
+            print("Encoding all entities once for filtered validation...")
+            all_chunks = []
+            model.eval()
+            with torch.no_grad():
+                for batch in tqdm(entity_loader, desc="Encoding Validation Candidates"):
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    all_chunks.append(model.encode_target(batch).cpu())
+            all_entity_embeddings = torch.cat(all_chunks, dim=0).to(device)
     
     print("Starting training...")
     best_mrr = 0.0
@@ -151,56 +281,39 @@ def train(args):
         eval_every = getattr(config, 'eval_every', 1)
         if valid_loader and (epoch + 1) % eval_every == 0:
             model.eval()
-            val_loss = 0
 
             if hasattr(model, 'reset_alpha_stats'):
                 model.reset_alpha_stats()
-            
-            # Additional Metrics
-            hits1 = 0
-            hits3 = 0
-            hits10 = 0
-            mrr = 0
-            total_examples = 0
-            
-            with torch.no_grad():
-                for batch in tqdm(valid_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} [Val]"):
-                    h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
-                    r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
-                    t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
-                    context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
-                    
-                    query_vector = model(h_batch, r_batch, context_batch)
-                    t_fused = model.encode_target(t_batch)
-                    
-                    # Compute Loss
-                    loss, scores = model.compute_loss(query_vector, t_fused)
-                    val_loss += loss.item()
-                    
-                    # Compute Metrics
-                    # scores: (B, B)
-                    # target_score: diag
-                    target_scores = scores.diag() # (B,)
-                    
-                    # Count how many are greater
-                    rankings = (scores > target_scores.unsqueeze(1)).sum(dim=1) + 1
-                    
-                    hits1 += (rankings <= 1).sum().item()
-                    hits3 += (rankings <= 3).sum().item()
-                    hits10 += (rankings <= 10).sum().item()
-                    mrr += (1.0 / rankings.float()).sum().item()
-                    total_examples += rankings.size(0)
-            
-            avg_val_loss = val_loss / len(valid_loader)
-            
-            # Compute Averages
-            val_mrr = mrr / total_examples
-            val_h1 = hits1 / total_examples
-            val_h3 = hits3 / total_examples
-            val_h10 = hits10 / total_examples
+
+            # In finetuning mode, candidate embeddings change every epoch.
+            if config.finetune_text_encoder:
+                all_chunks = []
+                with torch.no_grad():
+                    for batch in tqdm(entity_loader, desc="Encoding Validation Candidates"):
+                        batch = {k: v.to(device) for k, v in batch.items()}
+                        all_chunks.append(model.encode_target(batch).cpu())
+                all_entity_embeddings = torch.cat(all_chunks, dim=0).to(device)
+
+            val_metrics = compute_filtered_ranking_metrics(
+                model=model,
+                data_loader=valid_loader,
+                all_entity_embeddings=all_entity_embeddings,
+                hr_map=hr_map,
+                device=device
+            )
+
+            val_mrr = val_metrics['MRR']
+            val_h1 = val_metrics['Hits@1']
+            val_h3 = val_metrics['Hits@3']
+            val_h10 = val_metrics['Hits@10']
+            val_mr = val_metrics['MR']
             val_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
             
-            print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f} | MRR: {val_mrr:.4f} | Hits@10: {val_h10:.4f}")
+            print(
+                f"Epoch {epoch+1} Val (Filtered) | "
+                f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
+                f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
+            )
             if val_alpha is not None:
                 print(f"Epoch {epoch+1} Val Alpha (text weight): {val_alpha:.4f}")
             
@@ -208,8 +321,8 @@ def train(args):
             epoch_log = {
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
                 'val_mrr': val_mrr, 
+                'val_mr': val_mr,
                 'val_hits1': val_h1,
                 'val_hits3': val_h3,
                 'val_hits10': val_h10

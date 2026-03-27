@@ -70,6 +70,11 @@ def evaluate(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    # Use conservative defaults for evaluation to avoid OOM on large configs.
+    eval_batch_size = int(getattr(config, 'eval_batch_size', min(int(config.batch_size), 128)))
+    candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(eval_batch_size * 2, 256)))
+    text_cache_batch_size = int(getattr(config, 'text_cache_batch_size', 128))
+
     # 1. Load Model
     print("Loading model...")
     # Get num entities/relations
@@ -92,6 +97,23 @@ def evaluate(args):
     else:
         print("No checkpoint found. Evaluating initialized model (random).")
 
+    if not config.finetune_text_encoder:
+        print("Precomputing frozen text embeddings for evaluation...")
+        with open(os.path.join(config.data_dir, 'entity_text.json'), 'r') as f:
+            entity_text_map = json.load(f)
+        with open(os.path.join(config.data_dir, 'relation_text.json'), 'r') as f:
+            relation_text_map = json.load(f)
+
+        model.build_text_embedding_cache(
+            entity_text_map=entity_text_map,
+            relation_text_map=relation_text_map,
+            device=device,
+            batch_size=text_cache_batch_size,
+            max_entity_length=512,
+            max_relation_length=128
+        )
+        print("Frozen text cache ready for evaluation.")
+
     model.eval()
 
     # 2. Encode All Candidates (Target Embeddings)
@@ -102,8 +124,14 @@ def evaluate(args):
     tokenizer = model.tokenizer
     def entity_collate(batch):
         ids = [x['id'] for x in batch]
+
+        # In frozen-text mode, encode_target can use cached text via IDs only.
+        if model.use_text_cache and not config.finetune_text_encoder:
+            return {
+                'id': torch.tensor(ids)
+            }
+
         texts = [x['text'] for x in batch]
-        
         inputs = tokenizer(texts, padding=True, truncation=True, max_length=64, return_tensors='pt')
         return {
             'input_ids': inputs['input_ids'],
@@ -113,7 +141,7 @@ def evaluate(args):
 
     entity_loader = DataLoader(
         entity_dataset, 
-        batch_size=config.batch_size * 2, 
+        batch_size=candidate_batch_size,
         shuffle=False, 
         collate_fn=entity_collate,
         num_workers=4
@@ -142,7 +170,7 @@ def evaluate(args):
     
     test_loader = DataLoader(
         test_dataset, 
-        batch_size=config.batch_size, 
+        batch_size=eval_batch_size,
         shuffle=False, 
         collate_fn=collate_fn, 
         num_workers=4

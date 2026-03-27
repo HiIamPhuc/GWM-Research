@@ -2,7 +2,6 @@ import json
 import torch
 from pathlib import Path
 from tqdm import tqdm
-from sentence_transformers import SentenceTransformer
 import numpy as np
 
 def load_triples(file_path):
@@ -201,16 +200,32 @@ def process_dataset(data_dir, output_dir, dataset_name, embedding_model='all-Min
         json.dump(relation_text_dict, f, indent=2)
 
     # 5. Ground Truth for Filtered Eval
-    ground_truth = {}
-    all_triples_ids = torch.cat([train_tensor, valid_tensor, test_tensor])
-    for h, r, t in all_triples_ids.tolist():
-        key = f"{h},{r}"
-        if key not in ground_truth:
-            ground_truth[key] = []
-        ground_truth[key].append(t)
-        
+    # Save split-aware maps to ensure fair ranking protocols:
+    # - validation: filter with train only
+    # - test: filter with train + valid
+    def build_ground_truth(*triple_tensors):
+        gt = {}
+        for tensor in triple_tensors:
+            for h, r, t in tensor.tolist():
+                key = f"{h},{r}"
+                if key not in gt:
+                    gt[key] = set()
+                gt[key].add(t)
+        return {k: sorted(list(v)) for k, v in gt.items()}
+
+    ground_truth_train = build_ground_truth(train_tensor)
+    ground_truth_train_valid = build_ground_truth(train_tensor, valid_tensor)
+    ground_truth_all = build_ground_truth(train_tensor, valid_tensor, test_tensor)
+
+    # Backward-compatible legacy file
     with open(out_path / 'ground_truth.json', 'w') as f:
-        json.dump(ground_truth, f)
+        json.dump(ground_truth_all, f)
+
+    # Split-aware files used by train/evaluate ranking
+    with open(out_path / 'ground_truth_train.json', 'w') as f:
+        json.dump(ground_truth_train, f)
+    with open(out_path / 'ground_truth_train_valid.json', 'w') as f:
+        json.dump(ground_truth_train_valid, f)
         
     print("Data processing complete.")
 

@@ -1,8 +1,6 @@
 import os
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
+from torch.utils.data import DataLoader
 import argparse
 import yaml
 import json
@@ -13,34 +11,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.model import GWM
 from model.dataset import GWMDataset, CollateFN
-
-class EntityDataset(Dataset):
-    def __init__(self, data_dir):
-        # Load entity map
-        with open(os.path.join(data_dir, 'entity_text.json'), 'r') as f:
-            self.entity_text = json.load(f) # id_str -> text
-        
-        # Load entity2id to ensure correct ordering 0..N-1
-        with open(os.path.join(data_dir, 'entity2id.json'), 'r') as f:
-            self.entity2id = json.load(f)
-            
-        # Create list of (id, text) sorted by id
-        # The IDs in entity2id are effectively 0..N-1 based on implementation convention
-        # We trust entity2id.items() or just range(len(entity2id))
-        self.num_entities = len(self.entity2id)
-        
-        # Precompute texts list for indexing
-        # keys in entity_text matches str(id)
-        self.texts = [self.entity_text.get(str(i), "") for i in range(self.num_entities)]
-
-    def __len__(self):
-        return self.num_entities
-
-    def __getitem__(self, idx):
-        return {
-            'id': idx,
-            'text': self.texts[idx]
-        }
+from utils.eval import (
+    build_entity_loader,
+    compute_filtered_ranking_metrics,
+    encode_all_entities_as_targets,
+    load_hr_map_for_filtering,
+)
 
 def get_config(args):
     with open(args.config, 'r') as f:
@@ -53,19 +29,6 @@ def get_config(args):
             for k, v in dictionary.items():
                 setattr(self, k, v)
     return Config(config_dict)
-
-def load_triples_for_filtering(data_dir, splits=None):
-    if splits is None:
-        splits = ['train']
-    
-    all_triples = set()
-    for split in splits:
-        path = os.path.join(data_dir, f'{split}_triples.pt')
-        if os.path.exists(path):
-            triples = torch.load(path)
-            for h, r, t in triples:
-                all_triples.add((h.item(), r.item(), t.item()))
-    return all_triples
 
 def evaluate(args):
     config = get_config(args)
@@ -120,44 +83,21 @@ def evaluate(args):
 
     # 2. Encode All Candidates (Target Embeddings)
     print("Encoding all entities as targets...")
-    entity_dataset = EntityDataset(config.data_dir)
-    
-    # Custom Collate for Entities
-    tokenizer = model.tokenizer
-    def entity_collate(batch):
-        ids = [x['id'] for x in batch]
-
-        # In frozen-text mode, encode_target can use cached text via IDs only.
-        if model.use_text_cache and not config.finetune_text_encoder:
-            return {
-                'id': torch.tensor(ids)
-            }
-
-        texts = [x['text'] for x in batch]
-        inputs = tokenizer(texts, padding=True, truncation=True, max_length=64, return_tensors='pt')
-        return {
-            'input_ids': inputs['input_ids'],
-            'attention_mask': inputs['attention_mask'],
-            'id': torch.tensor(ids)
-        }
-
-    entity_loader = DataLoader(
-        entity_dataset, 
+    entity_loader = build_entity_loader(
+        model=model,
+        data_dir=config.data_dir,
         batch_size=candidate_batch_size,
-        shuffle=False, 
-        collate_fn=entity_collate,
-        num_workers=4
+        finetune_text_encoder=config.finetune_text_encoder,
+        num_workers=4,
+        max_length=64,
     )
 
-    all_entity_embeddings = []
-    with torch.no_grad():
-        for batch in tqdm(entity_loader, desc="Encoding Entities"):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            # Encode symmetrically
-            emb = model.encode_target(batch)
-            all_entity_embeddings.append(emb.cpu())
-            
-    all_entity_embeddings = torch.cat(all_entity_embeddings, dim=0).to(device) # (N, H)
+    all_entity_embeddings = encode_all_entities_as_targets(
+        model=model,
+        entity_loader=entity_loader,
+        device=device,
+        desc="Encoding Entities",
+    )
     print(f"Encoded {all_entity_embeddings.size(0)} entities.")
 
     # 3. Evaluation Loop
@@ -179,72 +119,34 @@ def evaluate(args):
     )
 
     # Filtering Setup
-    all_triples = load_triples_for_filtering(config.data_dir, splits=['train', 'valid'])
-    # Map (h, r) -> set of true tails
-    hr_map = {}
-    for h, r, t in all_triples:
-        if (h, r) not in hr_map: hr_map[(h, r)] = set()
-        hr_map[(h, r)].add(t)
+    if split == 'test':
+        # Standard test protocol: filter with train+valid
+        hr_map = load_hr_map_for_filtering(
+            config.data_dir,
+            preferred_ground_truth_file='ground_truth_train_valid.json',
+            fallback_splits=['train', 'valid']
+        )
+    else:
+        # Validation protocol: filter with train only
+        hr_map = load_hr_map_for_filtering(
+            config.data_dir,
+            preferred_ground_truth_file='ground_truth_train.json',
+            fallback_splits=['train']
+        )
 
-    hits1, hits3, hits10, mrr = 0, 0, 0, 0
-    total = 0
+    metrics = compute_filtered_ranking_metrics(
+        model=model,
+        data_loader=test_loader,
+        all_entity_embeddings=all_entity_embeddings,
+        hr_map=hr_map,
+        device=device,
+        desc="Evaluating",
+    )
 
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Evaluating"):
-            # Move to device
-            h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
-            r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
-            context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
-            
-            # Ground Truth Tails
-            t_ids = batch['t_batch']['id'].to(device)
-            h_ids = batch['h_batch']['id'].cpu().numpy()
-            r_ids = batch['r_batch']['id'].cpu().numpy()
-            
-            # Forward Query
-            query_vector = model(h_batch, r_batch, context_batch) # (B, H)
-            
-            # Score against ALL entities
-            # (B, N)
-            scores = torch.mm(query_vector, all_entity_embeddings.t())
-            
-            # Filter Scores
-            # For each sample in batch
-            for i in range(scores.size(0)):
-                h_id = h_ids[i]
-                r_id = r_ids[i]
-                true_t = t_ids[i].item()
-                
-                # Get all known true tails for this h,r
-                filter_mask_indices = list(hr_map.get((h_id, r_id), []))
-                # Remove current true tail from filter (we want to rank it!)
-                if true_t in filter_mask_indices:
-                    filter_mask_indices.remove(true_t)
-                
-                # Apply mask: Set scores of other true tails to -inf
-                if filter_mask_indices:
-                    scores[i, filter_mask_indices] = -float('inf')
-
-            # Ranking
-            # We want rank of true_t
-            # scores[i, true_t] is the score of the target
-            target_scores = scores.gather(1, t_ids.unsqueeze(1)) # (B, 1)
-            
-            # Rank: count how many have score > target_score
-            # Add 1 for 1-based rank
-            ranks = (scores > target_scores).sum(dim=1) + 1
-            
-            hits1 += (ranks <= 1).sum().item()
-            hits3 += (ranks <= 3).sum().item()
-            hits10 += (ranks <= 10).sum().item()
-            mrr += (1.0 / ranks.float()).sum().item()
-            total += ranks.size(0)
-
-    # Final Metrics
-    final_mrr = mrr / total
-    final_h1 = hits1 / total
-    final_h3 = hits3 / total
-    final_h10 = hits10 / total
+    final_mrr = metrics['MRR']
+    final_h1 = metrics['Hits@1']
+    final_h3 = metrics['Hits@3']
+    final_h10 = metrics['Hits@10']
 
     print(f"\n--- Evaluation Results ({split}) ---")
     print(f"MRR       : {final_mrr:.4f}")

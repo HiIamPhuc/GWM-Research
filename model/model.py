@@ -59,11 +59,70 @@ class GWM(nn.Module):
         
         # 5. Output Projector (Optional but good for matching embeddings)
         self.projector = nn.Linear(config.hidden_dim, config.hidden_dim)
+
+        # Optional frozen-text cache (used when finetune_text_encoder is False).
+        self.cached_entity_text_emb = None
+        self.cached_relation_text_emb = None
+        self.use_text_cache = False
         
     def _encode_text(self, input_ids, attention_mask):
         """Forward pass through BERT."""
         outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         return outputs.last_hidden_state[:, 0, :] # [CLS] token
+
+    def build_text_embedding_cache(
+        self,
+        entity_text_map,
+        relation_text_map,
+        device,
+        batch_size=128,
+        max_entity_length=512,
+        max_relation_length=128
+    ):
+        """Precompute text embeddings once for frozen text encoder mode."""
+        if self.config.finetune_text_encoder:
+            self.use_text_cache = False
+            return
+
+        self.text_encoder.eval()
+
+        def _encode_text_list(text_list, max_length):
+            all_emb = []
+            with torch.no_grad():
+                for start in range(0, len(text_list), batch_size):
+                    chunk = text_list[start:start + batch_size]
+                    enc = self.tokenizer(
+                        chunk,
+                        padding=True,
+                        truncation=True,
+                        return_tensors='pt',
+                        max_length=max_length
+                    )
+                    enc = {k: v.to(device) for k, v in enc.items()}
+                    emb = self._encode_text(enc['input_ids'], enc['attention_mask'])
+                    all_emb.append(emb)
+            return torch.cat(all_emb, dim=0)
+
+        num_entities = self.entity_embeddings.num_embeddings
+        num_relations = self.relation_embeddings.num_embeddings
+
+        entity_texts = [entity_text_map.get(str(i), f"Entity {i}") for i in range(num_entities)]
+        relation_texts = [relation_text_map.get(str(i), f"Relation {i}") for i in range(num_relations)]
+
+        self.cached_entity_text_emb = _encode_text_list(entity_texts, max_entity_length)
+        self.cached_relation_text_emb = _encode_text_list(relation_texts, max_relation_length)
+        self.use_text_cache = True
+
+    def _lookup_cached_text(self, ids, kind='entity'):
+        """Lookup cached text embeddings by integer IDs."""
+        cache = self.cached_entity_text_emb if kind == 'entity' else self.cached_relation_text_emb
+        if cache is None:
+            raise RuntimeError("Text cache is not built. Call build_text_embedding_cache first.")
+
+        original_shape = ids.shape
+        flat_ids = ids.view(-1)
+        selected = cache.index_select(0, flat_ids)
+        return selected.view(*original_shape, -1)
 
     def _project_structural(self, struct_emb):
         if self.structural_projection is not None:
@@ -108,9 +167,13 @@ class GWM(nn.Module):
           - input_ids: (B*K, L)
           - id: (B, K)
         """
-        # Encode Head & Relation Text
-        h_emb_text = self._encode_text(h_batch['input_ids'], h_batch['attention_mask'])
-        r_emb_text = self._encode_text(r_batch['input_ids'], r_batch['attention_mask'])
+        # Encode Head & Relation Text (or use cache if text encoder is frozen)
+        if self.use_text_cache and not self.config.finetune_text_encoder:
+            h_emb_text = self._lookup_cached_text(h_batch['id'], kind='entity')
+            r_emb_text = self._lookup_cached_text(r_batch['id'], kind='relation')
+        else:
+            h_emb_text = self._encode_text(h_batch['input_ids'], h_batch['attention_mask'])
+            r_emb_text = self._encode_text(r_batch['input_ids'], r_batch['attention_mask'])
         
         # Structural Embeddings
         h_struct = self.entity_embeddings(h_batch['id']) # (B, H)
@@ -121,10 +184,14 @@ class GWM(nn.Module):
         ctx_input_ids = context_batch['input_ids'] 
         ctx_mask = context_batch['attention_mask']
 
-        ctx_emb_text = self._encode_text(ctx_input_ids, ctx_mask) # (B*K, H)
+        if self.use_text_cache and not self.config.finetune_text_encoder:
+            ctx_emb_text = self._lookup_cached_text(context_ids, kind='entity') # (B, K, H)
+        else:
+            ctx_emb_text = self._encode_text(ctx_input_ids, ctx_mask) # (B*K, H)
         ctx_struct = self.entity_embeddings(context_ids) # (B, K, H)
         batch_size, k = context_ids.shape
-        ctx_emb_text = ctx_emb_text.view(batch_size, k, -1)
+        if not (self.use_text_cache and not self.config.finetune_text_encoder):
+            ctx_emb_text = ctx_emb_text.view(batch_size, k, -1)
 
         # Fuse Context (Text + Structure)
         ctx_fused = self._fuse_modalities(ctx_emb_text, ctx_struct) # (B, K, H)
@@ -156,7 +223,10 @@ class GWM(nn.Module):
         t_batch: dict {input_ids, attention_mask, id}
         Returns: (B, H) normalized fused embedding
         """
-        t_emb_text = self._encode_text(t_batch['input_ids'], t_batch['attention_mask'])
+        if self.use_text_cache and not self.config.finetune_text_encoder:
+            t_emb_text = self._lookup_cached_text(t_batch['id'], kind='entity')
+        else:
+            t_emb_text = self._encode_text(t_batch['input_ids'], t_batch['attention_mask'])
         t_struct = self.entity_embeddings(t_batch['id'])
         
         t_fused = self._fuse_modalities(t_emb_text, t_struct)

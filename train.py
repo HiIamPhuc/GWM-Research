@@ -58,6 +58,19 @@ def train(args):
     # Init Model
     print("Initializing model...")
     model = GWM(config).to(device)
+
+    if not config.finetune_text_encoder:
+        print("Precomputing frozen text embeddings (one-time cache)...")
+        cache_batch_size = int(getattr(config, 'text_cache_batch_size', 128))
+        model.build_text_embedding_cache(
+            entity_text_map=train_dataset.entity_text,
+            relation_text_map=train_dataset.relation_text,
+            device=device,
+            batch_size=cache_batch_size,
+            max_entity_length=512,
+            max_relation_length=128
+        )
+        print("Frozen text cache ready. Training will reuse cached text embeddings.")
     
     # Collater
     collate_fn = CollateFN(model.tokenizer)

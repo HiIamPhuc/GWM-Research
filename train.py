@@ -37,15 +37,18 @@ class EntityDataset(Dataset):
         }
 
 
-def load_all_triples(data_dir):
-    all_triples = set()
-    for split in ['train', 'valid', 'test']:
+def load_triples_for_filtering(data_dir, splits=None):
+    if splits is None:
+        splits = ['train']
+    
+    triples = set()
+    for split in splits:
         path = os.path.join(data_dir, f'{split}_triples.pt')
         if os.path.exists(path):
-            triples = torch.load(path)
-            for h, r, t in triples:
-                all_triples.add((h.item(), r.item(), t.item()))
-    return all_triples
+            triples_data = torch.load(path)
+            for h, r, t in triples_data:
+                triples.add((h.item(), r.item(), t.item()))
+    return triples
 
 
 def compute_filtered_ranking_metrics(model, data_loader, all_entity_embeddings, hr_map, device):
@@ -187,7 +190,7 @@ def train(args):
     all_entity_embeddings = None
     entity_loader = None
     if valid_loader is not None:
-        all_triples = load_all_triples(config.data_dir)
+        all_triples = load_triples_for_filtering(config.data_dir, splits=['train'])
         hr_map = {}
         for h, r, t in all_triples:
             if (h, r) not in hr_map:

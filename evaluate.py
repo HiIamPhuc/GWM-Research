@@ -54,10 +54,12 @@ def get_config(args):
                 setattr(self, k, v)
     return Config(config_dict)
 
-def load_all_triples(data_dir):
-    """Load all triples for filtering."""
+def load_triples_for_filtering(data_dir, splits=None):
+    if splits is None:
+        splits = ['train']
+    
     all_triples = set()
-    for split in ['train', 'valid', 'test']:
+    for split in splits:
         path = os.path.join(data_dir, f'{split}_triples.pt')
         if os.path.exists(path):
             triples = torch.load(path)
@@ -177,7 +179,7 @@ def evaluate(args):
     )
 
     # Filtering Setup
-    all_triples = load_all_triples(config.data_dir)
+    all_triples = load_triples_for_filtering(config.data_dir, splits=['train', 'valid'])
     # Map (h, r) -> set of true tails
     hr_map = {}
     for h, r, t in all_triples:

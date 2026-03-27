@@ -17,8 +17,14 @@ class GWM(nn.Module):
                 param.requires_grad = False
                 
         # 2. Structural Component (Entity/Relation Embeddings)
-        self.entity_embeddings = nn.Embedding(config.num_entities, config.hidden_dim)
-        self.relation_embeddings = nn.Embedding(config.num_relations, config.hidden_dim)
+        self.structural_dim = config.structural_dim
+        self.entity_embeddings = nn.Embedding(config.num_entities, self.structural_dim)
+        self.relation_embeddings = nn.Embedding(config.num_relations, self.structural_dim)
+
+        # Project structural embeddings to hidden_dim when needed by gating fusion.
+        self.structural_projection = None
+        if self.structural_dim != config.hidden_dim:
+            self.structural_projection = nn.Linear(self.structural_dim, config.hidden_dim)
         
         # 3. Context Processing (RNN / GWM Core)
         # Note: If fusion output is hidden_dim, LSTM input is hidden_dim.
@@ -33,7 +39,23 @@ class GWM(nn.Module):
         # 4. Fusion Layer
         # Text Encoder Dim + Structural Dim
         text_dim = self.text_encoder.config.hidden_size
-        self.fusion = nn.Linear(text_dim + config.hidden_dim, config.hidden_dim)
+        self.text_projection = nn.Linear(text_dim, config.hidden_dim)
+        self.fusion_mode = config.fusion_mode
+
+        # Legacy/default path: concat(text, struct) -> linear
+        self.fusion = nn.Linear(text_dim + self.structural_dim, config.hidden_dim)
+
+        # Dynamic gating path: learn sample-wise interpolation between text and structure.
+        if self.fusion_mode == 'gated':
+            self.gate = nn.Sequential(
+                nn.Linear(config.hidden_dim * 2, config.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(config.hidden_dim, 1),
+                nn.Sigmoid()
+            )
+
+        # Running alpha stats for lightweight diagnostics.
+        self.reset_alpha_stats()
         
         # 5. Output Projector (Optional but good for matching embeddings)
         self.projector = nn.Linear(config.hidden_dim, config.hidden_dim)
@@ -42,6 +64,40 @@ class GWM(nn.Module):
         """Forward pass through BERT."""
         outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         return outputs.last_hidden_state[:, 0, :] # [CLS] token
+
+    def _project_structural(self, struct_emb):
+        if self.structural_projection is not None:
+            return self.structural_projection(struct_emb)
+        return struct_emb
+
+    def reset_alpha_stats(self):
+        self._alpha_sum = 0.0
+        self._alpha_count = 0
+
+    def get_alpha_mean(self, reset=False):
+        if self.fusion_mode != 'gated' or self._alpha_count == 0:
+            alpha_mean = None
+        else:
+            alpha_mean = self._alpha_sum / self._alpha_count
+
+        if reset:
+            self.reset_alpha_stats()
+
+        return alpha_mean
+
+    def _fuse_modalities(self, text_emb, struct_emb):
+        if self.fusion_mode == 'gated':
+            text_proj = self.text_projection(text_emb)
+            struct_proj = self._project_structural(struct_emb)
+            gate_input = torch.cat([text_proj, struct_proj], dim=-1)
+            alpha = self.gate(gate_input)
+            alpha_detached = alpha.detach()
+            self._alpha_sum += alpha_detached.sum().item()
+            self._alpha_count += alpha_detached.numel()
+            return alpha * text_proj + (1.0 - alpha) * struct_proj
+
+        # Backward-compatible concat fusion
+        return self.fusion(torch.cat([text_emb, struct_emb], dim=-1))
         
     def forward(self, h_batch, r_batch, context_batch):
         """
@@ -71,14 +127,13 @@ class GWM(nn.Module):
         ctx_emb_text = ctx_emb_text.view(batch_size, k, -1)
 
         # Fuse Context (Text + Structure)
-        ctx_fused_input = torch.cat([ctx_emb_text, ctx_struct], dim=-1)
-        ctx_fused = self.fusion(ctx_fused_input) # (B, K, H)
+        ctx_fused = self._fuse_modalities(ctx_emb_text, ctx_struct) # (B, K, H)
         # Aggregate Context
         ctx_summary = torch.mean(ctx_fused, dim=1) # (B, H)
         
         # Main Fusion
-        h_fused = self.fusion(torch.cat([h_emb_text, h_struct], dim=-1)) # (B, H)
-        r_fused = self.fusion(torch.cat([r_emb_text, r_struct], dim=-1)) # (B, H)
+        h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
+        r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
 
         # LSTM Context Aggregation
         # Sequence: [Context, Head, Relation] -> Predict Tail
@@ -104,16 +159,7 @@ class GWM(nn.Module):
         t_emb_text = self._encode_text(t_batch['input_ids'], t_batch['attention_mask'])
         t_struct = self.entity_embeddings(t_batch['id'])
         
-        t_fused = self.fusion(torch.cat([t_emb_text, t_struct], dim=-1))
-        
-        # Apply same projection if desired, or skip. Usually targets are raw fused.
-        # But for symmetric comparison, we might want projector too?
-        # Standard SimKGC: Only Query has pooling/projection. Keys areraw.
-        # But this is GWM, let's keep it symmetric if we want "Symmetric". 
-        # Actually usually Keys are just the representation.
-        # Let's verify Projector usage. LSTM out -> Project -> Query.
-        # Tail -> Fuse -> Target.
-        # This is standard.
+        t_fused = self._fuse_modalities(t_emb_text, t_struct)
         
         return torch.nn.functional.normalize(t_fused, p=2, dim=1)
 

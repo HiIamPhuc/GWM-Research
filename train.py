@@ -98,6 +98,9 @@ def train(args):
     for epoch in range(config.num_epochs):
         model.train()
         total_loss = 0
+
+        if hasattr(model, 'reset_alpha_stats'):
+            model.reset_alpha_stats()
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} [Train]")
         for batch in pbar:
@@ -126,13 +129,19 @@ def train(args):
             pbar.set_postfix({'loss': loss.item()})
             
         avg_train_loss = total_loss / len(train_loader)
+        train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
         print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
+        if train_alpha is not None:
+            print(f"Epoch {epoch+1} Train Alpha (text weight): {train_alpha:.4f}")
         
         # Validation
         eval_every = getattr(config, 'eval_every', 1)
         if valid_loader and (epoch + 1) % eval_every == 0:
             model.eval()
             val_loss = 0
+
+            if hasattr(model, 'reset_alpha_stats'):
+                model.reset_alpha_stats()
             
             # Additional Metrics
             hits1 = 0
@@ -176,8 +185,11 @@ def train(args):
             val_h1 = hits1 / total_examples
             val_h3 = hits3 / total_examples
             val_h10 = hits10 / total_examples
+            val_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
             
             print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f} | MRR: {val_mrr:.4f} | Hits@10: {val_h10:.4f}")
+            if val_alpha is not None:
+                print(f"Epoch {epoch+1} Val Alpha (text weight): {val_alpha:.4f}")
             
             # Log metrics
             epoch_log = {
@@ -189,6 +201,10 @@ def train(args):
                 'val_hits3': val_h3,
                 'val_hits10': val_h10
             }
+            if train_alpha is not None:
+                epoch_log['train_alpha'] = train_alpha
+            if val_alpha is not None:
+                epoch_log['val_alpha'] = val_alpha
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                 json.dump(history, f, indent=2)
@@ -202,6 +218,8 @@ def train(args):
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss
             }
+            if train_alpha is not None:
+                epoch_log['train_alpha'] = train_alpha
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                   json.dump(history, f, indent=2)

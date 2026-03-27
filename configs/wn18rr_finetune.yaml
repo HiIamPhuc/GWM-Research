@@ -3,6 +3,8 @@ pretrained_model: bert-base-uncased
 finetune_text_encoder: true
 num_layers: 2
 hidden_dim: 1024
+structural_dim: 1024
+fusion_mode: gated
 dropout: 0.1
 learning_rate: 1e-4
 batch_size: 32

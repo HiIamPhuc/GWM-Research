@@ -74,8 +74,8 @@ def evaluate(args):
             relation_text_map=relation_text_map,
             device=device,
             batch_size=text_cache_batch_size,
-            max_entity_length=config.get('max_length', 512),
-            max_relation_length=config.get('max_length', 256),
+            max_entity_length=getattr(config, 'max_length', 512),
+            max_relation_length=getattr(config, 'max_length', 256),
         )
         print("Frozen text cache ready for evaluation.")
 

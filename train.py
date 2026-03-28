@@ -84,8 +84,8 @@ def train(args):
             relation_text_map=train_dataset.relation_text,
             device=device,
             batch_size=cache_batch_size,
-            max_entity_length=config.get('max_length', 512),
-            max_relation_length=config.get('max_length', 256)
+            max_entity_length=getattr(config, 'max_length', 512),
+            max_relation_length=getattr(config, 'max_length', 256)
         )
         print("Frozen text cache ready. Training will reuse cached text embeddings.")
     
@@ -124,7 +124,7 @@ def train(args):
             batch_size=candidate_batch_size,
             finetune_text_encoder=config.finetune_text_encoder,
             num_workers=2,
-            max_length=config.get('max_length', 512),
+            max_length=getattr(config, 'max_length', 512),
         )
 
         # If text encoder is frozen, candidate text embeddings are static.

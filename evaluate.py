@@ -74,8 +74,8 @@ def evaluate(args):
             relation_text_map=relation_text_map,
             device=device,
             batch_size=text_cache_batch_size,
-            max_entity_length=512,
-            max_relation_length=128
+            max_entity_length=config.get('max_length', 512),
+            max_relation_length=config.get('max_length', 256),
         )
         print("Frozen text cache ready for evaluation.")
 
@@ -89,7 +89,7 @@ def evaluate(args):
         batch_size=candidate_batch_size,
         finetune_text_encoder=config.finetune_text_encoder,
         num_workers=4,
-        max_length=64,
+        max_length=512,
     )
 
     all_entity_embeddings = encode_all_entities_as_targets(

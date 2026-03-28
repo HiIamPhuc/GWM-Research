@@ -28,3 +28,5 @@ text_cache_batch_size: 128
 
 eval_batch_size: 1024
 candidate_batch_size: 1024
+
+max_length: 512

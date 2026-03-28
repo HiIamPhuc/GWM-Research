@@ -126,14 +126,6 @@ def train(args):
             num_workers=2,
             max_length=getattr(config, 'max_length', 512),
         )
-
-        print("Encoding initial validation candidates...")
-        all_entity_embeddings = encode_all_entities_as_targets(
-            model=model,
-            entity_loader=entity_loader,
-            device=device,
-            desc="Encoding Validation Candidates",
-        )
     
     print("Starting training...")
     best_mrr = 0.0
@@ -189,9 +181,6 @@ def train(args):
             if hasattr(model, 'reset_alpha_stats'):
                 model.reset_alpha_stats()
 
-            # Candidate embeddings must be refreshed every validation pass.
-            # Even with a frozen text encoder, encode_target depends on
-            # trainable entity embeddings and fusion/gating parameters.
             all_entity_embeddings = encode_all_entities_as_targets(
                 model=model,
                 entity_loader=entity_loader,

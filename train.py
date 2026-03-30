@@ -19,6 +19,7 @@ from utils.eval import (
     encode_all_entities_as_targets,
     load_hr_map_for_filtering,
 )
+from utils.early_stopping import EarlyStopping
 
 def get_config(args):
     with open(args.config, 'r') as f:
@@ -130,6 +131,11 @@ def train(args):
     print("Starting training...")
     best_mrr = 0.0
     
+    early_stopping = EarlyStopping(
+        patience=getattr(config, 'early_stopping_patience', 10),
+        mode='max'  # Maximize MRR
+    )
+    
     # Simple JSON Logger
     log_path = os.path.join(config.output_dir, 'training_log.json')
     history = []
@@ -233,6 +239,13 @@ def train(args):
             if val_mrr > best_mrr:
                 best_mrr = val_mrr
                 torch.save(model.state_dict(), os.path.join(config.output_dir, 'best_checkpoint.pt'))
+            
+            # Check early stopping
+            if early_stopping(val_mrr):
+                print(f"\n✓ Early stopping triggered at epoch {epoch + 1}")
+                print(f"  Best MRR: {early_stopping.best_value:.4f}")
+                print(f"  No improvement for {early_stopping.patience} epochs")
+                break
         else:
              # Log train only
             epoch_log = {

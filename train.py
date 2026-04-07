@@ -198,7 +198,6 @@ def train(args):
                 model=model,
                 entity_loader=entity_loader,
                 device=device,
-                desc="Encoding Validation Candidates",
             )
 
             val_metrics = compute_filtered_ranking_metrics(
@@ -207,7 +206,7 @@ def train(args):
                 all_entity_embeddings=all_entity_embeddings,
                 hr_map=hr_map,
                 device=device,
-                desc="Filtered Validation",
+                desc="Validation",
             )
 
             val_mrr = val_metrics['MRR']
@@ -217,14 +216,16 @@ def train(args):
             val_mr = val_metrics['MR']
             val_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
             
-            print(
+            metrics = (
                 f"Epoch {epoch+1} Val (Filtered) | "
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
                 f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
             )
             if val_alpha is not None:
-                print(f"Epoch {epoch+1} Val Alpha (text weight): {val_alpha:.4f}")
+                metrics += f"Epoch {epoch+1} Val Alpha (text weight): {val_alpha:.4f}"
             
+            print(metrics)
+
             # Log metrics
             epoch_log = {
                 'epoch': epoch + 1,

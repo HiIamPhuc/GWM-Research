@@ -1,45 +1,57 @@
 import torch
 import json
-from transformers import AutoTokenizer, AutoModel
 import argparse
 from tqdm import tqdm
 import os
+from pathlib import Path
 
 class ContextProcessor:
-    def __init__(self, data_dir, model_name='bert-base-uncased', device='cuda'):
+    def __init__(self, data_dir, device='cuda'):
         self.data_dir = data_dir
         self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(device)
-        self.entity_text = json.load(open(os.path.join(data_dir, 'entity_text.json')))
         self.entity2id = json.load(open(os.path.join(data_dir, 'entity2id.json')))
         
-    def _encode_batch(self, texts):
-        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        return outputs.last_hidden_state[:, 0, :]  # CLS token
+    def _load_precomputed_embeddings(self):
+        """Load precomputed text embeddings from cache files."""
+        print("Loading precomputed text embeddings...")
+        
+        entity_emb_path = os.path.join(self.data_dir, 'entity_text_embeddings.pt')
+        if not os.path.exists(entity_emb_path):
+            raise FileNotFoundError(
+                f"entity_text_embeddings.pt not found in {self.data_dir}. "
+                "Run preprocess_data.py with text embedding precomputation first."
+            )
+        
+        # Load embedding cache (may be a dict or tensor)
+        entity_cache = torch.load(entity_emb_path, map_location='cpu')
+        if isinstance(entity_cache, dict):
+            if 'embeddings' in entity_cache:
+                embeddings = entity_cache['embeddings']
+            elif 'tensor' in entity_cache:
+                embeddings = entity_cache['tensor']
+            else:
+                raise ValueError(
+                    "entity_text_embeddings.pt dict must contain 'embeddings' or 'tensor' key."
+                )
+        else:
+            embeddings = entity_cache
+        
+        embeddings = embeddings.float().to(self.device)
+        return embeddings
         
     def _compute_embeddings(self, batch_size=32):
-        print("Computing embeddings for all entities...")
-        entities = sorted(self.entity2id.keys(), key=lambda x: self.entity2id[x])
-        # Fallback to entity ID if text is missing, but it should be there from preprocess
-        texts = [self.entity_text.get(e, e) for e in entities]
-        all_embeddings = []
-        
-        # Determine batch size dynamically or use fixed
-        for i in tqdm(range(0, len(texts), batch_size), desc="Encoding entities"):
-            batch_texts = texts[i:i+batch_size]
-            emb = self._encode_batch(batch_texts)
-            all_embeddings.append(emb.cpu())
-            
-        return torch.cat(all_embeddings, dim=0)
+        """Load precomputed embeddings for all entities."""
+        embeddings = self._load_precomputed_embeddings()
+        return embeddings
 
     def _load_adjacency(self):
         print("Loading graph structure for neighbor context...")
         triples_path = os.path.join(self.data_dir, 'train_triples.pt')
         if not os.path.exists(triples_path):
-            raise FileNotFoundError(f"train_triples.pt not found in {self.data_dir}. Run preprocess_data.py first.")
+            raise FileNotFoundError(
+                f"train_triples.pt not found in {self.data_dir}. "
+                "Run preprocess_data.py first."
+            )
             
         triples = torch.load(triples_path)
         adj = {}
@@ -194,12 +206,39 @@ class ContextProcessor:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--k', type=int, default=10, help='Number of context neighbors')
-    parser.add_argument('--algorithm', type=str, default='dense', choices=['dense', 'mmr_neighbor', 'random'], help='Algorithm for neighbor selection')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for encoding/similarity')
-    parser.add_argument('--mmr_lambda', type=float, default=0.5, help='Lambda for MMR (0.5 balances relevance and diversity)')
+    parser.add_argument('--data_dir', type=str, required=True, help='Path to preprocessed data directory')
+    parser.add_argument('--k', type=int, default=10, help='Number of context neighbors per entity')
+    parser.add_argument(
+        '--algorithm',
+        type=str,
+        default='dense',
+        choices=['dense', 'mmr_neighbor', 'random'],
+        help='Algorithm for neighbor selection'
+    )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=32,
+        help='Batch size for similarity computation'
+    )
+    parser.add_argument(
+        '--mmr_lambda',
+        type=float,
+        default=0.5,
+        help='Lambda for MMR (0.5 balances relevance and diversity)'
+    )
+    parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda',
+        help='Device to use (cuda or cpu)'
+    )
     args = parser.parse_args()
     
-    processor = ContextProcessor(args.data_dir)
-    processor.compute_context_nodes(k=args.k, algorithm=args.algorithm, batch_size=args.batch_size, mmr_lambda=args.mmr_lambda)
+    processor = ContextProcessor(args.data_dir, device=args.device)
+    processor.compute_context_nodes(
+        k=args.k,
+        algorithm=args.algorithm,
+        batch_size=args.batch_size,
+        mmr_lambda=args.mmr_lambda
+    )

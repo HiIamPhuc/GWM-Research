@@ -1,6 +1,5 @@
-# Config for GWM-RNN-Text
-pretrained_model: bert-base-uncased
-finetune_text_encoder: true
+# Config for context-aware GWM with precomputed text embeddings
+text_embedding_dim: 768
 num_layers: 2
 hidden_dim: 1024
 structural_dim: 1024
@@ -18,13 +17,13 @@ output_dir: output/wn18rr_bert_finetune
 add_inverse: true
 context_k: 15
 context_agg: mean
-early_stopping: 2000
+early_stopping_patience: 2000
 eval_every: 5
     
 device: cuda
 seed: 42
 
-text_cache_batch_size: 128
+text_cache_device: cpu
 
 eval_batch_size: 32
 candidate_batch_size: 32

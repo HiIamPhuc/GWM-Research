@@ -3,6 +3,7 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+from transformers import AutoModel, AutoTokenizer
 
 def load_triples(file_path):
     """Load triples from a text file."""
@@ -136,7 +137,76 @@ def process_text_wn18rr(data_dir, entity2id, relation2id):
             
     return entity_text, relation_text
 
-def process_dataset(data_dir, output_dir, dataset_name, embedding_model='all-MiniLM-L6-v2', add_inverse=True):
+def precompute_text_embeddings(
+    entity_text_dict,
+    relation_text_dict,
+    num_entities,
+    num_relations,
+    pretrained_model='bert-base-uncased',
+    batch_size=128,
+    max_entity_length=256,
+    max_relation_length=64,
+    device=None,
+):
+    """
+    Encode entity/relation text once and return dense embedding tensors.
+    """
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device)
+
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
+    text_encoder = AutoModel.from_pretrained(pretrained_model).to(device)
+    text_encoder.eval()
+
+    def encode_ordered_texts(text_dict, size, max_length, desc):
+        texts = [text_dict.get(str(i), f"Token {i}") for i in range(size)]
+        all_emb = []
+        with torch.no_grad():
+            for start in tqdm(range(0, size, batch_size), desc=desc, leave=False):
+                chunk = texts[start:start + batch_size]
+                encoded = tokenizer(
+                    chunk,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors='pt',
+                )
+                encoded = {k: v.to(device) for k, v in encoded.items()}
+                outputs = text_encoder(**encoded)
+                all_emb.append(outputs.last_hidden_state[:, 0, :].detach().cpu())
+        return torch.cat(all_emb, dim=0).contiguous()
+
+    entity_embeddings = encode_ordered_texts(
+        entity_text_dict,
+        num_entities,
+        max_entity_length,
+        desc='Encoding entity text',
+    )
+    relation_embeddings = encode_ordered_texts(
+        relation_text_dict,
+        num_relations,
+        max_relation_length,
+        desc='Encoding relation text',
+    )
+
+    del text_encoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return entity_embeddings, relation_embeddings
+
+def process_dataset(
+    data_dir,
+    output_dir,
+    dataset_name,
+    add_inverse=True,
+    pretrained_model='bert-base-uncased',
+    text_batch_size=128,
+    max_entity_length=256,
+    max_relation_length=64,
+    text_device=None,
+):
     """
     Process raw dataset into training files.
     1. Reads train/valid/test.txt
@@ -199,6 +269,36 @@ def process_dataset(data_dir, output_dir, dataset_name, embedding_model='all-Min
     with open(out_path / 'relation_text.json', 'w') as f:
         json.dump(relation_text_dict, f, indent=2)
 
+    print("Encoding and caching text embeddings...")
+    entity_text_embeddings, relation_text_embeddings = precompute_text_embeddings(
+        entity_text_dict=entity_text_dict,
+        relation_text_dict=relation_text_dict,
+        num_entities=len(entity2id),
+        num_relations=len(relation2id),
+        pretrained_model=pretrained_model,
+        batch_size=text_batch_size,
+        max_entity_length=max_entity_length,
+        max_relation_length=max_relation_length,
+        device=text_device,
+    )
+
+    torch.save(
+        {
+            'embeddings': entity_text_embeddings,
+            'model_name': pretrained_model,
+            'embedding_dim': int(entity_text_embeddings.size(1)),
+        },
+        out_path / 'entity_text_embeddings.pt'
+    )
+    torch.save(
+        {
+            'embeddings': relation_text_embeddings,
+            'model_name': pretrained_model,
+            'embedding_dim': int(relation_text_embeddings.size(1)),
+        },
+        out_path / 'relation_text_embeddings.pt'
+    )
+
     # 5. Ground Truth for Filtered Eval
     # Save split-aware maps to ensure fair ranking protocols:
     # - validation: filter with train only
@@ -235,6 +335,20 @@ if __name__ == '__main__':
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--dataset', type=str, required=True, help='Name of the dataset (e.g., fb15k-237, wn18rr)')
+    parser.add_argument('--pretrained_model', type=str, default='bert-base-uncased')
+    parser.add_argument('--text_batch_size', type=int, default=128)
+    parser.add_argument('--max_entity_length', type=int, default=256)
+    parser.add_argument('--max_relation_length', type=int, default=64)
+    parser.add_argument('--text_device', type=str, default=None, help='cpu or cuda; defaults to auto')
     args = parser.parse_args()
     
-    process_dataset(args.data_dir, args.output_dir, args.dataset)
+    process_dataset(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        dataset_name=args.dataset,
+        pretrained_model=args.pretrained_model,
+        text_batch_size=args.text_batch_size,
+        max_entity_length=args.max_entity_length,
+        max_relation_length=args.max_relation_length,
+        text_device=args.text_device,
+    )

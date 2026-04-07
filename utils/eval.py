@@ -7,14 +7,10 @@ from tqdm import tqdm
 
 class EntityDataset(Dataset):
     def __init__(self, data_dir):
-        with open(os.path.join(data_dir, 'entity_text.json'), 'r') as f:
-            self.entity_text = json.load(f)
-
         with open(os.path.join(data_dir, 'entity2id.json'), 'r') as f:
             self.entity2id = json.load(f)
 
         self.num_entities = len(self.entity2id)
-        self.texts = [self.entity_text.get(str(i), "") for i in range(self.num_entities)]
 
     def __len__(self):
         return self.num_entities
@@ -22,7 +18,6 @@ class EntityDataset(Dataset):
     def __getitem__(self, idx):
         return {
             'id': idx,
-            'text': self.texts[idx]
         }
 
 
@@ -65,23 +60,12 @@ def load_hr_map_for_filtering(data_dir, preferred_ground_truth_file=None, fallba
     return hr_map
 
 
-def build_entity_loader(model, data_dir, batch_size, finetune_text_encoder, num_workers=2, max_length=64):
+def build_entity_loader(data_dir, batch_size, num_workers=2):
     entity_dataset = EntityDataset(data_dir)
 
     def entity_collate(batch):
         ids = [x['id'] for x in batch]
-
-        # In frozen-text mode, encode_target can use cached text via IDs only.
-        if model.use_text_cache and not finetune_text_encoder:
-            return {
-                'id': torch.tensor(ids)
-            }
-
-        texts = [x['text'] for x in batch]
-        inputs = model.tokenizer(texts, padding=True, truncation=True, max_length=max_length, return_tensors='pt')
         return {
-            'input_ids': inputs['input_ids'],
-            'attention_mask': inputs['attention_mask'],
             'id': torch.tensor(ids)
         }
 

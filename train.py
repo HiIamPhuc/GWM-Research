@@ -1,6 +1,5 @@
 import os
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import argparse
@@ -66,7 +65,7 @@ def train(args):
     model = GWM(config).to(device)
     
     # Collater
-    collate_fn = CollateFN(model.tokenizer)
+    collate_fn = CollateFN()
     
     train_loader = DataLoader(
         train_dataset, 
@@ -74,21 +73,26 @@ def train(args):
         shuffle=True, 
         collate_fn=collate_fn,
         num_workers=4,
+        pin_memory=(device.type == 'cuda'),
         drop_last=True # Important for In-Batch Negatives stability
     )
 
-    if not config.finetune_text_encoder:
-        print("Precomputing frozen text embeddings (one-time cache)...")
-        cache_batch_size = int(getattr(config, 'text_cache_batch_size', 128))
-        model.build_text_embedding_cache(
-            entity_text_map=train_dataset.entity_text,
-            relation_text_map=train_dataset.relation_text,
-            device=device,
-            batch_size=cache_batch_size,
-            max_entity_length=getattr(config, 'max_length', 512),
-            max_relation_length=getattr(config, 'max_length', 256)
+    entity_emb_path = os.path.join(config.data_dir, 'entity_text_embeddings.pt')
+    relation_emb_path = os.path.join(config.data_dir, 'relation_text_embeddings.pt')
+    if not os.path.exists(entity_emb_path) or not os.path.exists(relation_emb_path):
+        raise FileNotFoundError(
+            "Missing precomputed text embedding cache files. "
+            "Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
         )
-        print("Frozen text cache ready. Training will reuse cached text embeddings.")
+
+    cache_device = getattr(config, 'text_cache_device', 'cpu')
+    print(f"Loading precomputed text embedding cache to {cache_device}...")
+    model.load_precomputed_text_embedding_cache(
+        entity_source=entity_emb_path,
+        relation_source=relation_emb_path,
+        cache_device=cache_device,
+    )
+    print("Text cache ready. Training uses ID-only batches with context IDs.")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.learning_rate))
     
@@ -102,6 +106,7 @@ def train(args):
             shuffle=False, 
             collate_fn=collate_fn,
             num_workers=2,
+            pin_memory=(device.type == 'cuda'),
             drop_last=False
         )
     else:
@@ -120,19 +125,16 @@ def train(args):
 
         candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(int(config.batch_size), 256)))
         entity_loader = build_entity_loader(
-            model=model,
             data_dir=config.data_dir,
             batch_size=candidate_batch_size,
-            finetune_text_encoder=config.finetune_text_encoder,
             num_workers=2,
-            max_length=getattr(config, 'max_length', 512),
         )
     
     print("Starting training...")
     best_mrr = 0.0
     
     early_stopping = EarlyStopping(
-        patience=getattr(config, 'early_stopping_patience', 10),
+        patience=getattr(config, 'early_stopping_patience', getattr(config, 'early_stopping', 10)),
         mode='max'  # Maximize MRR
     )
     

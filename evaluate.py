@@ -38,7 +38,6 @@ def evaluate(args):
     # Use conservative defaults for evaluation to avoid OOM on large configs.
     eval_batch_size = int(getattr(config, 'eval_batch_size', min(int(config.batch_size), 128)))
     candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(eval_batch_size * 2, 256)))
-    text_cache_batch_size = int(getattr(config, 'text_cache_batch_size', 128))
 
     # 1. Load Model
     print("Loading model...")
@@ -58,38 +57,40 @@ def evaluate(args):
     
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint: {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get('state_dict', checkpoint.get('model_state_dict', checkpoint))
+        else:
+            state_dict = checkpoint
+        model.load_state_dict(state_dict, strict=False)
     else:
         print("No checkpoint found. Evaluating initialized model (random).")
 
-    if not config.finetune_text_encoder:
-        print("Precomputing frozen text embeddings for evaluation...")
-        with open(os.path.join(config.data_dir, 'entity_text.json'), 'r') as f:
-            entity_text_map = json.load(f)
-        with open(os.path.join(config.data_dir, 'relation_text.json'), 'r') as f:
-            relation_text_map = json.load(f)
-
-        model.build_text_embedding_cache(
-            entity_text_map=entity_text_map,
-            relation_text_map=relation_text_map,
-            device=device,
-            batch_size=text_cache_batch_size,
-            max_entity_length=getattr(config, 'max_length', 512),
-            max_relation_length=getattr(config, 'max_length', 256),
+    entity_emb_path = os.path.join(config.data_dir, 'entity_text_embeddings.pt')
+    relation_emb_path = os.path.join(config.data_dir, 'relation_text_embeddings.pt')
+    if not os.path.exists(entity_emb_path) or not os.path.exists(relation_emb_path):
+        raise FileNotFoundError(
+            "Missing precomputed text embedding cache files. "
+            "Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
         )
-        print("Frozen text cache ready for evaluation.")
+
+    cache_device = getattr(config, 'text_cache_device', 'cpu')
+    print(f"Loading precomputed text embeddings for evaluation to {cache_device}...")
+    model.load_precomputed_text_embedding_cache(
+        entity_source=entity_emb_path,
+        relation_source=relation_emb_path,
+        cache_device=cache_device,
+    )
+    print("Text cache ready for evaluation.")
 
     model.eval()
 
     # 2. Encode All Candidates (Target Embeddings)
     print("Encoding all entities as targets...")
     entity_loader = build_entity_loader(
-        model=model,
         data_dir=config.data_dir,
         batch_size=candidate_batch_size,
-        finetune_text_encoder=config.finetune_text_encoder,
         num_workers=4,
-        max_length=512,
     )
 
     all_entity_embeddings = encode_all_entities_as_targets(
@@ -108,7 +109,7 @@ def evaluate(args):
         split = 'valid'
 
     test_dataset = GWMDataset(config.data_dir, split=split)
-    collate_fn = CollateFN(model.tokenizer)
+    collate_fn = CollateFN()
     
     test_loader = DataLoader(
         test_dataset, 

@@ -158,9 +158,14 @@ def train(args):
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
             
             optimizer.zero_grad()
-            
+
             # Forward: Query Vector (from head, relation, context)
-            query_vector = model(h_batch, r_batch, context_batch)
+            context_edges = batch.get('context_edges', None)
+            if context_edges is not None:
+                context_edges = context_edges.to(device)
+                query_vector = model(h_batch, r_batch, context_batch, context_edges)
+            else:
+                query_vector = model(h_batch, r_batch, context_batch)
             
             # Forward: Target Vector (Symmetric Fused Tail)
             t_fused = model.encode_target(t_batch)

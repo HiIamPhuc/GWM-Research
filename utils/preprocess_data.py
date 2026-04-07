@@ -326,6 +326,15 @@ def process_dataset(
         json.dump(ground_truth_train, f)
     with open(out_path / 'ground_truth_train_valid.json', 'w') as f:
         json.dump(ground_truth_train_valid, f)
+
+    # 6. Build and save adjacency matrix for GAT context aggregation
+    print("Building adjacency matrix for graph attention...")
+    num_entities = len(entity2id)
+    adjacency = torch.zeros((num_entities, num_entities), dtype=torch.bool)
+    for h, r, t in train_tensor.tolist():
+        adjacency[h, t] = True
+    torch.save(adjacency, out_path / 'adjacency_matrix.pt')
+    print(f"Adjacency matrix saved: {adjacency.shape}")
         
     print("Data processing complete.")
 

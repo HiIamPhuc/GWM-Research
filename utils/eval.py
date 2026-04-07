@@ -102,7 +102,12 @@ def compute_filtered_ranking_metrics(model, data_loader, all_entity_embeddings, 
             h_ids = batch['h_batch']['id'].cpu().numpy()
             r_ids = batch['r_batch']['id'].cpu().numpy()
 
-            query_vector = model(h_batch, r_batch, context_batch)
+            context_edges = batch.get('context_edges', None)
+            if context_edges is not None:
+                context_edges = context_edges.to(device)
+                query_vector = model(h_batch, r_batch, context_batch, context_edges)
+            else:
+                query_vector = model(h_batch, r_batch, context_batch)
             scores = torch.mm(query_vector, all_entity_embeddings.t())
 
             for i in range(scores.size(0)):

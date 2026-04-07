@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class GWM(nn.Module):
     def __init__(self, config):
@@ -48,6 +49,19 @@ class GWM(nn.Module):
         
         # 4. Output Projector (Optional but good for matching embeddings)
         self.projector = nn.Linear(config.hidden_dim, config.hidden_dim)
+
+        # 5. GAT for context aggregation
+        self.use_gat = getattr(config, 'use_gat', False)
+        if self.use_gat:
+            self.gat_num_heads = getattr(config, 'gat_num_heads', 4)
+            self.gat_dropout = getattr(config, 'gat_dropout', 0.1)
+            self.gat = nn.MultiheadAttention(
+                embed_dim=config.hidden_dim,
+                num_heads=self.gat_num_heads,
+                dropout=self.gat_dropout,
+                batch_first=True,
+                bias=True,
+            )
 
         # Precomputed text cache loaded from preprocessing artifacts.
         self.cached_entity_text_emb = None
@@ -171,14 +185,31 @@ class GWM(nn.Module):
 
         # Backward-compatible concat fusion
         return self.fusion(torch.cat([text_emb, struct_emb], dim=-1))
-        
-    def forward(self, h_batch, r_batch, context_batch):
+
+    def _aggregate_context_with_gat(self, ctx_fused, ctx_edges=None):
+        """
+        Aggregate context using graph attention.
+        ctx_fused: (B, K, H)
+        ctx_edges: optional bool adjacency (B, K, K)
+        Returns: (B, H)
+        """
+        attn_out, _ = self.gat(ctx_fused, ctx_fused, ctx_fused)
+
+        if ctx_edges is None:
+            return attn_out.mean(dim=1)
+
+        neighbor_counts = ctx_edges.float().sum(dim=2, keepdim=True)
+        neighbor_counts = torch.clamp(neighbor_counts, min=1.0)
+        weights = neighbor_counts / (neighbor_counts.sum(dim=1, keepdim=True) + 1e-8)
+        return (attn_out * weights).sum(dim=1)
+
+    def forward(self, h_batch, r_batch, context_batch, context_edges=None):
         """
         Forward pass for a batch of triples.
         h_batch: dict {id}
         r_batch: dict {id}
-        context_batch: dict {id}
-          - id: (B, K)
+        context_batch: dict {id}, where id has shape (B, K)
+        context_edges: optional bool adjacency (B, K, K)
         """
         if not self.use_text_cache:
             raise RuntimeError(
@@ -187,43 +218,38 @@ class GWM(nn.Module):
 
         h_emb_text = self._lookup_cached_text(h_batch['id'], kind='entity')
         r_emb_text = self._lookup_cached_text(r_batch['id'], kind='relation')
-        
-        # Structural Embeddings
-        h_struct = self.entity_embeddings(h_batch['id']) # (B, H)
-        r_struct = self.relation_embeddings(r_batch['id']) # (B, H)
-        
-        # Context
-        context_ids = context_batch['id'] # (B, K)
-        ctx_emb_text = self._lookup_cached_text(context_ids, kind='entity') # (B, K, H)
-        ctx_struct = self.entity_embeddings(context_ids) # (B, K, H)
 
-        # Fuse Context (Text + Structure)
-        ctx_fused = self._fuse_modalities(ctx_emb_text, ctx_struct) # (B, K, H)
-        # Aggregate Context
-        ctx_summary = torch.mean(ctx_fused, dim=1) # (B, H)
-        
-        # Main Fusion
-        h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
-        r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
+        # Structural embeddings
+        h_struct = self.entity_embeddings(h_batch['id'])
+        r_struct = self.relation_embeddings(r_batch['id'])
 
-        # LSTM Context Aggregation
+        # Context embeddings
+        context_ids = context_batch['id']
+        ctx_emb_text = self._lookup_cached_text(context_ids, kind='entity')
+        ctx_struct = self.entity_embeddings(context_ids)
+
+        # Fuse context and aggregate
+        ctx_fused = self._fuse_modalities(ctx_emb_text, ctx_struct)
+        if self.use_gat:
+            ctx_summary = self._aggregate_context_with_gat(ctx_fused, context_edges)
+        else:
+            ctx_summary = torch.mean(ctx_fused, dim=1)
+
+        # Fuse head and relation
+        h_fused = self._fuse_modalities(h_emb_text, h_struct)
+        r_fused = self._fuse_modalities(r_emb_text, r_struct)
+
         # Sequence: [Context, Head, Relation] -> Predict Tail
-        lstm_input = torch.stack([ctx_summary, h_fused, r_fused], dim=1) # (B, 3, H)
-        
+        lstm_input = torch.stack([ctx_summary, h_fused, r_fused], dim=1)
         lstm_out, _ = self.lstm(lstm_input)
-        query_vector = lstm_out[:, -1, :] # Last hidden state (B, H)
-        
-        # Project Query
+        query_vector = lstm_out[:, -1, :]
+
         query_vector = self.projector(query_vector)
-        
-        # Ensure normalization for cosine similarity / InfoNCE
-        query_vector = torch.nn.functional.normalize(query_vector, p=2, dim=1)
-        
-        return query_vector
+        return F.normalize(query_vector, p=2, dim=1)
 
     def encode_target(self, t_batch):
         """
-        Encode target/tail entities symmetrically (Fusion of Text + Structure).
+        Encode target/tail entities symmetrically.
         t_batch: dict {id}
         Returns: (B, H) normalized fused embedding
         """
@@ -234,10 +260,8 @@ class GWM(nn.Module):
 
         t_emb_text = self._lookup_cached_text(t_batch['id'], kind='entity')
         t_struct = self.entity_embeddings(t_batch['id'])
-        
         t_fused = self._fuse_modalities(t_emb_text, t_struct)
-        
-        return torch.nn.functional.normalize(t_fused, p=2, dim=1)
+        return F.normalize(t_fused, p=2, dim=1)
 
     def compute_loss(self, query_vector, t_fused):
         """

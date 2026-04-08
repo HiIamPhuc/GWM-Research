@@ -17,8 +17,8 @@ output_dir: output/wn18rr
 add_inverse: true
 context_k: 15
 context_agg: mean
-early_stopping_patience: 3
-eval_every: 3
+early_stopping_patience: 15
+eval_every: 1
 
 # GAT Context Aggregation (new)
 use_gat: true
@@ -30,5 +30,5 @@ seed: 42
 
 text_cache_device: cpu
 
-eval_batch_size: 1024
-candidate_batch_size: 1024
+eval_batch_size: 2048
+candidate_batch_size: 2048

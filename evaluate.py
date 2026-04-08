@@ -97,7 +97,6 @@ def evaluate(args):
         model=model,
         entity_loader=entity_loader,
         device=device,
-        desc="Encoding Entities",
     )
     print(f"Encoded {all_entity_embeddings.size(0)} entities.")
 

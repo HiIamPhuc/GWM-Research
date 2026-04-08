@@ -5,10 +5,10 @@ hidden_dim: 1024
 structural_dim: 384
 fusion_mode: gated
 dropout: 0.2
-learning_rate: 1e-4
+learning_rate: 1e-3
 batch_size: 2048
 loss: infonce
-num_epochs: 200
+num_epochs: 400
 temperature: 0.07
 
 data_dir: data-processed/wn18rr
@@ -17,8 +17,8 @@ output_dir: output/wn18rr
 add_inverse: true
 context_k: 15
 context_agg: mean
-early_stopping_patience: 15
-eval_every: 1
+early_stopping_patience: 3
+eval_every: 3
 
 # GAT Context Aggregation (new)
 use_gat: true

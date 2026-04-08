@@ -219,10 +219,10 @@ def train(args):
             metrics = (
                 f"Epoch {epoch+1} Val (Filtered) | "
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
-                f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
+                f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f} | "
             )
             if val_alpha is not None:
-                metrics += f"Epoch {epoch+1} Val Alpha (text weight): {val_alpha:.4f}"
+                metrics += f"Val Alpha (text weight): {val_alpha:.4f}"
             
             print(metrics)
 

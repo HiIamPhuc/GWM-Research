@@ -20,6 +20,29 @@ from utils.eval import (
 )
 from utils.early_stopping import EarlyStopping
 
+
+def _to_serializable(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _to_serializable(v) for k, v in value.items()}
+    return str(value)
+
+
+def save_training_config(config, output_dir, args=None):
+    """Persist the effective training config used for this run."""
+    config_dict = {k: _to_serializable(v) for k, v in vars(config).items()}
+    if args is not None:
+        config_dict['cli_args'] = {k: _to_serializable(v) for k, v in vars(args).items()}
+
+    config_path = os.path.join(output_dir, 'training_config.json')
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config_dict, f, indent=2)
+
+    print(f"Saved training config to: {config_path}")
+
 def get_config(args):
     with open(args.config, 'r') as f:
         config_dict = yaml.safe_load(f)
@@ -59,6 +82,9 @@ def train(args):
         
     config.num_entities = num_ent
     config.num_relations = num_rel
+
+    # Save effective config (including inferred dimensions and CLI overrides).
+    save_training_config(config, config.output_dir, args=args)
     
     # Init Model
     print("Initializing model...")

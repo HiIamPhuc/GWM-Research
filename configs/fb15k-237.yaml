@@ -1,0 +1,32 @@
+# Config for context-aware GWM with precomputed text embeddings
+text_embedding_dim: 768
+num_layers: 2
+hidden_dim: 1024
+structural_dim: 896
+fusion_mode: gated
+situated_bottleneck_dim: 512
+query_mlp_dim: 1024
+dropout: 0.2
+learning_rate: 1e-3
+batch_size: 2048
+loss: infonce
+num_epochs: 400
+temperature: 0.07
+
+data_dir: data-processed/fb15k-237
+output_dir: output/fb15k-237
+    
+add_inverse: true
+context_k: 15
+context_agg: mean
+
+early_stopping_patience: 15
+eval_every: 1
+    
+device: cuda
+seed: 42
+
+text_cache_device: cpu
+
+eval_batch_size: 2048
+candidate_batch_size: 2048

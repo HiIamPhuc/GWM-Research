@@ -6,7 +6,7 @@ structural_dim: 384
 fusion_mode: gated
 dropout: 0.2
 learning_rate: 1e-4
-batch_size: 1024
+batch_size: 2048
 loss: infonce
 num_epochs: 200
 temperature: 0.07
@@ -17,9 +17,9 @@ output_dir: output/wn18rr_bert_finetune
 add_inverse: true
 context_k: 15
 context_agg: mean
-situated_bottleneck_dim: 512
-query_mlp_dim: 1024
-early_stopping_patience: 5
+situated_bottleneck_dim: 768
+query_mlp_dim: 768
+early_stopping_patience: 15
 eval_every: 1
     
 device: cuda
@@ -27,5 +27,5 @@ seed: 42
 
 text_cache_device: cpu
 
-eval_batch_size: 1024
-candidate_batch_size: 1024
+eval_batch_size: 2048
+candidate_batch_size: 2048

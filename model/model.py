@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class GWM(nn.Module):
     def __init__(self, config):
@@ -25,6 +26,15 @@ class GWM(nn.Module):
             batch_first=True,
             dropout=config.dropout if config.num_layers > 1 else 0
         )
+
+        # Situated-head adapter: combines head and context before LSTM.
+        situated_bottleneck_dim = int(getattr(config, 'situated_bottleneck_dim', max(128, config.hidden_dim // 2)))
+        self.situated_ffn = nn.Sequential(
+            nn.Linear(config.hidden_dim * 2, situated_bottleneck_dim),
+            nn.ReLU(),
+            nn.Linear(situated_bottleneck_dim, config.hidden_dim),
+        )
+        self.situated_norm = nn.LayerNorm(config.hidden_dim)
         
         # 3. Fusion Layer
         text_dim = int(getattr(config, 'text_embedding_dim', config.hidden_dim))
@@ -46,8 +56,13 @@ class GWM(nn.Module):
         # Running alpha stats for lightweight diagnostics.
         self.reset_alpha_stats()
         
-        # 4. Output Projector (Optional but good for matching embeddings)
-        self.projector = nn.Linear(config.hidden_dim, config.hidden_dim)
+        # 4. Translator MLP projects trajectory state to candidate entity space.
+        query_mlp_dim = int(getattr(config, 'query_mlp_dim', config.hidden_dim))
+        self.query_projector = nn.Sequential(
+            nn.Linear(config.hidden_dim, query_mlp_dim),
+            nn.ReLU(),
+            nn.Linear(query_mlp_dim, config.hidden_dim),
+        )
 
         # Precomputed text cache loaded from preprocessing artifacts.
         self.cached_entity_text_emb = None
@@ -171,6 +186,14 @@ class GWM(nn.Module):
 
         # Backward-compatible concat fusion
         return self.fusion(torch.cat([text_emb, struct_emb], dim=-1))
+
+    def _build_situated_head(self, h_hybrid, ctx_summary):
+        """
+        h_situated = LayerNorm(h_hybrid + FFN([h_hybrid || ctx_summary]))
+        """
+        combined = torch.cat([h_hybrid, ctx_summary], dim=-1)
+        delta = self.situated_ffn(combined)
+        return self.situated_norm(h_hybrid + delta)
         
     def forward(self, h_batch, r_batch, context_batch):
         """
@@ -206,18 +229,21 @@ class GWM(nn.Module):
         h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
         r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
 
-        # LSTM Context Aggregation
-        # Sequence: [Context, Head, Relation] -> Predict Tail
-        lstm_input = torch.stack([ctx_summary, h_fused, r_fused], dim=1) # (B, 3, H)
+        # Phase 1: contextual grounding before transition modeling.
+        h_situated = self._build_situated_head(h_fused, ctx_summary) # (B, H)
+
+        # Phase 2: shortened transition sequence.
+        # Sequence: [Situated_Head, Relation] -> Predict Tail
+        lstm_input = torch.stack([h_situated, r_fused], dim=1) # (B, 2, H)
         
         lstm_out, _ = self.lstm(lstm_input)
         query_vector = lstm_out[:, -1, :] # Last hidden state (B, H)
         
-        # Project Query
-        query_vector = self.projector(query_vector)
+        # Phase 3: translator MLP maps trajectory state to static candidate space.
+        query_vector = self.query_projector(query_vector)
         
         # Ensure normalization for cosine similarity / InfoNCE
-        query_vector = torch.nn.functional.normalize(query_vector, p=2, dim=1)
+        query_vector = F.normalize(query_vector, p=2, dim=1)
         
         return query_vector
 
@@ -237,7 +263,7 @@ class GWM(nn.Module):
         
         t_fused = self._fuse_modalities(t_emb_text, t_struct)
         
-        return torch.nn.functional.normalize(t_fused, p=2, dim=1)
+        return F.normalize(t_fused, p=2, dim=1)
 
     def compute_loss(self, query_vector, t_fused):
         """

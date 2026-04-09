@@ -17,6 +17,8 @@ output_dir: output/wn18rr_bert_finetune
 add_inverse: true
 context_k: 15
 context_agg: mean
+situated_bottleneck_dim: 512
+query_mlp_dim: 1024
 early_stopping_patience: 5
 eval_every: 1
     

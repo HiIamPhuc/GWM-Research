@@ -1,12 +1,12 @@
 # Config for context-aware GWM with precomputed text embeddings
-text_embedding_dim: 1024
+text_embedding_dim: 768
 num_layers: 2
 hidden_dim: 1024
-structural_dim: 1024
+structural_dim: 896
 fusion_mode: gated
 dropout: 0.2
 learning_rate: 1e-4
-batch_size: 1024
+batch_size: 128
 loss: infonce
 num_epochs: 400
 temperature: 0.07

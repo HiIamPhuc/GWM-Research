@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class GWM(nn.Module):
     def __init__(self, config):
@@ -16,14 +17,33 @@ class GWM(nn.Module):
         if self.structural_dim != config.hidden_dim:
             self.structural_projection = nn.Linear(self.structural_dim, config.hidden_dim)
         
-        # 2. Context Processing (RNN / GWM Core)
-        # Note: If fusion output is hidden_dim, LSTM input is hidden_dim.
-        self.lstm = nn.LSTM(
-            input_size=config.hidden_dim, 
-            hidden_size=config.hidden_dim,
-            num_layers=config.num_layers,
+        # 2. Context Processing (Transformer Core)
+        self.sequence_len = 3  # [Context, Head, Relation]
+        self.transformer_num_heads = int(getattr(config, 'transformer_num_heads', 8))
+        if config.hidden_dim % self.transformer_num_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({config.hidden_dim}) must be divisible by transformer_num_heads ({self.transformer_num_heads})."
+            )
+
+        transformer_num_layers = int(getattr(config, 'transformer_num_layers', getattr(config, 'num_layers', 2)))
+        transformer_ffn_dim = int(getattr(config, 'transformer_ffn_dim', config.hidden_dim * 4))
+        transformer_dropout = float(getattr(config, 'transformer_dropout', config.dropout))
+        self.transformer_use_causal_mask = bool(getattr(config, 'transformer_use_causal_mask', False))
+
+        self.step_position_embedding = nn.Embedding(self.sequence_len, config.hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_dim,
+            nhead=self.transformer_num_heads,
+            dim_feedforward=transformer_ffn_dim,
+            dropout=transformer_dropout,
+            activation='gelu',
             batch_first=True,
-            dropout=config.dropout if config.num_layers > 1 else 0
+            norm_first=True,
+        )
+        self.sequence_core = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=transformer_num_layers,
+            norm=nn.LayerNorm(config.hidden_dim),
         )
         
         # 3. Fusion Layer
@@ -206,18 +226,28 @@ class GWM(nn.Module):
         h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
         r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
 
-        # LSTM Context Aggregation
+        # Transformer sequence modeling
         # Sequence: [Context, Head, Relation] -> Predict Tail
-        lstm_input = torch.stack([ctx_summary, h_fused, r_fused], dim=1) # (B, 3, H)
-        
-        lstm_out, _ = self.lstm(lstm_input)
-        query_vector = lstm_out[:, -1, :] # Last hidden state (B, H)
+        seq_input = torch.stack([ctx_summary, h_fused, r_fused], dim=1) # (B, 3, H)
+        pos_ids = torch.arange(self.sequence_len, device=seq_input.device).unsqueeze(0).expand(seq_input.size(0), -1)
+        seq_input = seq_input + self.step_position_embedding(pos_ids)
+
+        attn_mask = None
+        if self.transformer_use_causal_mask:
+            # Upper-triangular mask blocks attending to future positions.
+            attn_mask = torch.triu(
+                torch.ones(self.sequence_len, self.sequence_len, device=seq_input.device, dtype=torch.bool),
+                diagonal=1,
+            )
+
+        seq_out = self.sequence_core(seq_input, mask=attn_mask)
+        query_vector = seq_out[:, -1, :] # Relation-step representation (B, H)
         
         # Project Query
         query_vector = self.projector(query_vector)
         
         # Ensure normalization for cosine similarity / InfoNCE
-        query_vector = torch.nn.functional.normalize(query_vector, p=2, dim=1)
+        query_vector = F.normalize(query_vector, p=2, dim=1)
         
         return query_vector
 
@@ -237,7 +267,7 @@ class GWM(nn.Module):
         
         t_fused = self._fuse_modalities(t_emb_text, t_struct)
         
-        return torch.nn.functional.normalize(t_fused, p=2, dim=1)
+        return F.normalize(t_fused, p=2, dim=1)
 
     def compute_loss(self, query_vector, t_fused):
         """

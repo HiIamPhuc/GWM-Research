@@ -18,7 +18,7 @@ class GWM(nn.Module):
             self.structural_projection = nn.Linear(self.structural_dim, config.hidden_dim)
         
         # 2. Context Processing (Transformer Core)
-        self.sequence_len = 3  # [Context, Head, Relation]
+        # Bag-of-tokens layout: [CLS, Context_1..K, Head, Relation]
         self.transformer_num_heads = int(getattr(config, 'transformer_num_heads', 8))
         if config.hidden_dim % self.transformer_num_heads != 0:
             raise ValueError(
@@ -30,7 +30,8 @@ class GWM(nn.Module):
         transformer_dropout = float(getattr(config, 'transformer_dropout', config.dropout))
         self.transformer_use_causal_mask = bool(getattr(config, 'transformer_use_causal_mask', False))
 
-        self.step_position_embedding = nn.Embedding(self.sequence_len, config.hidden_dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_dim))
+        self.role_embedding = nn.Embedding(4, config.hidden_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.hidden_dim,
             nhead=self.transformer_num_heads,
@@ -220,28 +221,37 @@ class GWM(nn.Module):
         # Fuse Context (Text + Structure)
         ctx_fused = self._fuse_modalities(ctx_emb_text, ctx_struct) # (B, K, H)
         # Aggregate Context
-        ctx_summary = torch.mean(ctx_fused, dim=1) # (B, H)
+        # ctx_summary = torch.mean(ctx_fused, dim=1) # (B, H)
         
         # Main Fusion
         h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
         r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
 
-        # Transformer sequence modeling
-        # Sequence: [Context, Head, Relation] -> Predict Tail
-        seq_input = torch.stack([ctx_summary, h_fused, r_fused], dim=1) # (B, 3, H)
-        pos_ids = torch.arange(self.sequence_len, device=seq_input.device).unsqueeze(0).expand(seq_input.size(0), -1)
-        seq_input = seq_input + self.step_position_embedding(pos_ids)
+        # Transformer bag-of-tokens modeling
+        # Sequence: [CLS, Context_1..K, Head, Relation] -> Predict Tail
+        batch_size = h_batch['id'].size(0)
+        cls_token = self.cls_token.expand(batch_size, -1, -1)
+        context_tokens = ctx_fused
+        head_token = h_fused.unsqueeze(1)
+        relation_token = r_fused.unsqueeze(1)
+        seq_input = torch.cat([cls_token, context_tokens, head_token, relation_token], dim=1) # (B, K+3, H)
+
+        role_ids = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=seq_input.device),
+            torch.ones(context_tokens.size(1), dtype=torch.long, device=seq_input.device),
+            torch.full((1,), 2, dtype=torch.long, device=seq_input.device),
+            torch.full((1,), 3, dtype=torch.long, device=seq_input.device),
+        ], dim=0)
+        seq_input = seq_input + self.role_embedding(role_ids).unsqueeze(0)
 
         attn_mask = None
         if self.transformer_use_causal_mask:
-            # Upper-triangular mask blocks attending to future positions.
-            attn_mask = torch.triu(
-                torch.ones(self.sequence_len, self.sequence_len, device=seq_input.device, dtype=torch.bool),
-                diagonal=1,
+            raise ValueError(
+                "transformer_use_causal_mask is incompatible with CLS readout in bag-of-tokens mode."
             )
 
         seq_out = self.sequence_core(seq_input, mask=attn_mask)
-        query_vector = seq_out[:, -1, :] # Relation-step representation (B, H)
+        query_vector = seq_out[:, 0, :] # CLS representation (B, H)
         
         # Project Query
         query_vector = self.projector(query_vector)

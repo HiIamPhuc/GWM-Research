@@ -2,11 +2,11 @@
 text_embedding_dim: 1024
 num_layers: 2
 hidden_dim: 1024
-structural_dim: 1024
+structural_dim: 512
 fusion_mode: gated
 dropout: 0.2
 learning_rate: 1e-4
-batch_size: 1024
+batch_size: 2048
 loss: infonce
 num_epochs: 400
 temperature: 0.07
@@ -25,5 +25,5 @@ seed: 42
 
 text_cache_device: cpu
 
-eval_batch_size: 1024
-candidate_batch_size: 1024
+eval_batch_size: 2048
+candidate_batch_size: 2048

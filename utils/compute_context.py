@@ -116,6 +116,7 @@ class ContextProcessor:
     def compute_context_nodes(self, k=10, algorithm='dense', batch_size=64, mmr_lambda=0.5):
         print(f"Computing context nodes using {algorithm}...")
         num_entities = len(self.entity2id)
+        context_mask = torch.ones((num_entities, k), dtype=torch.bool)
         
         if algorithm == 'dense':
             # Global Dense Retrieval
@@ -203,6 +204,10 @@ class ContextProcessor:
         output_file = os.path.join(self.data_dir, 'context_ids.pt')
         torch.save(context_ids, output_file)
         print(f"Context nodes saved to {output_file}")
+
+        mask_output_file = os.path.join(self.data_dir, 'context_mask.pt')
+        torch.save(context_mask, mask_output_file)
+        print(f"Context mask saved to {mask_output_file}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

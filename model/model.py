@@ -215,6 +215,7 @@ class GWM(nn.Module):
         
         # Context
         context_ids = context_batch['id'] # (B, K)
+        context_mask = context_batch.get('mask', None) # (B, K), True=valid, False=padding
         ctx_emb_text = self._lookup_cached_text(context_ids, kind='entity') # (B, K, H)
         ctx_struct = self.entity_embeddings(context_ids) # (B, K, H)
 
@@ -244,13 +245,28 @@ class GWM(nn.Module):
         ], dim=0)
         seq_input = seq_input + self.role_embedding(role_ids).unsqueeze(0)
 
+        # src_key_padding_mask uses True for positions to ignore.
+        if context_mask is None:
+            context_valid = torch.ones_like(context_ids, dtype=torch.bool)
+        else:
+            context_valid = context_mask.bool()
+        context_pad = ~context_valid
+
+        cls_pad = torch.zeros((batch_size, 1), dtype=torch.bool, device=seq_input.device)
+        hr_pad = torch.zeros((batch_size, 2), dtype=torch.bool, device=seq_input.device)
+        src_key_padding_mask = torch.cat([cls_pad, context_pad, hr_pad], dim=1)
+
         attn_mask = None
         if self.transformer_use_causal_mask:
             raise ValueError(
                 "transformer_use_causal_mask is incompatible with CLS readout in bag-of-tokens mode."
             )
 
-        seq_out = self.sequence_core(seq_input, mask=attn_mask)
+        seq_out = self.sequence_core(
+            seq_input,
+            mask=attn_mask,
+            src_key_padding_mask=src_key_padding_mask,
+        )
         query_vector = seq_out[:, 0, :] # CLS representation (B, H)
         
         # Project Query

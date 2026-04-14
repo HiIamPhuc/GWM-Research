@@ -6,7 +6,7 @@ structural_dim: 896
 fusion_mode: gated
 dropout: 0.2
 learning_rate: 1e-4
-batch_size: 128
+batch_size: 1024
 loss: infonce
 num_epochs: 400
 temperature: 0.07
@@ -18,7 +18,7 @@ output_dir: output/fb15k-237
 transformer_num_layers: 2
 transformer_num_heads: 8
 transformer_ffn_dim: 4096
-transformer_dropout: 0.1
+transformer_dropout: 0.2
 transformer_use_causal_mask: false
     
 add_inverse: true

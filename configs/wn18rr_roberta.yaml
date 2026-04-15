@@ -15,7 +15,7 @@ data_dir: data-processed/wn18rr
 output_dir: output/wn18rr_bert_finetune
     
 add_inverse: true
-context_k: 15
+context_k: 5
 context_agg: mean
 early_stopping_patience: 15
 eval_every: 1

@@ -2,7 +2,7 @@
 text_embedding_dim: 1024
 num_layers: 2
 hidden_dim: 1024
-structural_dim: 896
+structural_dim: 768
 fusion_mode: gated
 dropout: 0.2
 learning_rate: 1e-4

@@ -3,7 +3,6 @@ import json
 import argparse
 from tqdm import tqdm
 import os
-from pathlib import Path
 
 class ContextProcessor:
     def __init__(self, data_dir, device='cuda'):
@@ -113,47 +112,11 @@ class ContextProcessor:
             
         return selected_indices
 
-    def compute_context_nodes(self, k=10, algorithm='dense', batch_size=64, mmr_lambda=0.5):
+    def compute_context_nodes(self, k=10, algorithm='mmr_neighbor', batch_size=64, mmr_lambda=0.5):
         print(f"Computing context nodes using {algorithm}...")
         num_entities = len(self.entity2id)
-        
-        if algorithm == 'dense':
-            # Global Dense Retrieval
-            embeddings = self._compute_embeddings(batch_size).to(self.device)
-            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-            context_ids = torch.zeros((num_entities, k), dtype=torch.long)
-            
-            print("Computing pairwise similarity...")
-            for i in tqdm(range(0, num_entities, batch_size), desc="Mining neighbors"):
-                end = min(i + batch_size, num_entities)
-                query_emb = embeddings[i:end]
-                
-                # Sim: (B, H) @ (N, H).T
-                try:
-                    sim_scores = torch.mm(query_emb, embeddings.t())
-                except RuntimeError as e:
-                    if 'out of memory' in str(e):
-                        query_emb = query_emb.cpu()
-                        embeddings = embeddings.cpu()
-                        sim_scores = torch.mm(query_emb, embeddings.t())
-                    else: raise e
 
-                top_vals, top_inds = torch.topk(sim_scores, k + 1, dim=1)
-                top_inds = top_inds.cpu()
-                
-                cleaned_indices = []
-                for b_idx in range(len(query_emb)):
-                    global_idx = i + b_idx
-                    row_inds = top_inds[b_idx]
-                    mask = row_inds != global_idx
-                    filtered = row_inds[mask]
-                    if len(filtered) > k: filtered = filtered[:k]
-                    elif len(filtered) < k: filtered = row_inds[:k]
-                    cleaned_indices.append(filtered)
-                
-                context_ids[i:end] = torch.stack(cleaned_indices)
-                
-        elif algorithm == 'mmr_neighbor':
+        if algorithm == 'mmr_neighbor':
             # 1-Hop Neighbor + MMR
             # Solves "Echo Chamber" by enforcing diversity among context nodes
             embeddings = self._compute_embeddings(batch_size) # Keep on CPU RAM mostly
@@ -167,7 +130,7 @@ class ContextProcessor:
                 eid = i
                 neighbors = adj.get(eid, [])
                 
-                # If no neighbors, use self (or random, or zero)
+                # If no neighbors, fall back to self context.
                 if not neighbors:
                     context_ids[i] = torch.tensor([eid] * k)
                     continue
@@ -191,14 +154,27 @@ class ContextProcessor:
                     context_ids[i] = selected_global_indices
         
         elif algorithm == 'random':
-            print("Generating random context...")
+            # Randomly sample only from each node's neighbors (not global entity IDs).
+            print("Generating random neighbor context...")
+            adj = self._load_adjacency()
             context_ids = torch.zeros((num_entities, k), dtype=torch.long)
             for i in tqdm(range(num_entities)):
-                 candidates = torch.randint(0, num_entities, (k,))
-                 context_ids[i] = candidates
+                neighbors = adj.get(i, [])
+                if not neighbors:
+                    context_ids[i] = torch.tensor([i] * k)
+                    continue
+
+                neighbor_indices = torch.tensor(neighbors, dtype=torch.long)
+                if len(neighbors) >= k:
+                    sampled = torch.randperm(len(neighbors))[:k]
+                    context_ids[i] = neighbor_indices[sampled]
+                else:
+                    # Sample with replacement to keep fixed context length.
+                    sampled = torch.randint(0, len(neighbors), (k,))
+                    context_ids[i] = neighbor_indices[sampled]
                  
         else:
-            raise ValueError(f"Unknown algorithm: {algorithm}. Supported: dense, mmr_neighbor, random")
+            raise ValueError(f"Unknown algorithm: {algorithm}. Supported: mmr_neighbor, random")
 
         output_file = os.path.join(self.data_dir, 'context_ids.pt')
         torch.save(context_ids, output_file)
@@ -211,8 +187,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '--algorithm',
         type=str,
-        default='dense',
-        choices=['dense', 'mmr_neighbor', 'random'],
+        default='mmr_neighbor',
+        choices=['mmr_neighbor', 'random'],
         help='Algorithm for neighbor selection'
     )
     parser.add_argument(

@@ -38,7 +38,6 @@ def evaluate(args):
     # Use conservative defaults for evaluation to avoid OOM on large configs.
     eval_batch_size = int(getattr(config, 'eval_batch_size', min(int(config.batch_size), 128)))
     candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(eval_batch_size * 2, 256)))
-    text_cache_batch_size = int(getattr(config, 'text_cache_batch_size', 128))
 
     # 1. Load Model
     print("Loading model...")
@@ -62,23 +61,6 @@ def evaluate(args):
     else:
         print("No checkpoint found. Evaluating initialized model (random).")
 
-    if not config.finetune_text_encoder:
-        print("Precomputing frozen text embeddings for evaluation...")
-        with open(os.path.join(config.data_dir, 'entity_text.json'), 'r') as f:
-            entity_text_map = json.load(f)
-        with open(os.path.join(config.data_dir, 'relation_text.json'), 'r') as f:
-            relation_text_map = json.load(f)
-
-        model.build_text_embedding_cache(
-            entity_text_map=entity_text_map,
-            relation_text_map=relation_text_map,
-            device=device,
-            batch_size=text_cache_batch_size,
-            max_entity_length=getattr(config, 'max_length', 512),
-            max_relation_length=getattr(config, 'max_length', 256),
-        )
-        print("Frozen text cache ready for evaluation.")
-
     model.eval()
 
     # 2. Encode All Candidates (Target Embeddings)
@@ -87,7 +69,6 @@ def evaluate(args):
         model=model,
         data_dir=config.data_dir,
         batch_size=candidate_batch_size,
-        finetune_text_encoder=config.finetune_text_encoder,
         num_workers=4,
         max_length=512,
     )

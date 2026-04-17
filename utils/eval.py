@@ -65,17 +65,11 @@ def load_hr_map_for_filtering(data_dir, preferred_ground_truth_file=None, fallba
     return hr_map
 
 
-def build_entity_loader(model, data_dir, batch_size, finetune_text_encoder, num_workers=2, max_length=64):
+def build_entity_loader(model, data_dir, batch_size, num_workers=2, max_length=64):
     entity_dataset = EntityDataset(data_dir)
 
     def entity_collate(batch):
         ids = [x['id'] for x in batch]
-
-        # In frozen-text mode, encode_target can use cached text via IDs only.
-        if model.use_text_cache and not finetune_text_encoder:
-            return {
-                'id': torch.tensor(ids)
-            }
 
         texts = [x['text'] for x in batch]
         inputs = model.tokenizer(texts, padding=True, truncation=True, max_length=max_length, return_tensors='pt')

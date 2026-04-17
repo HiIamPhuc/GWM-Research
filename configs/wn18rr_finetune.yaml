@@ -1,6 +1,5 @@
 # Config for GWM-RNN-Text
 pretrained_model: bert-base-uncased
-finetune_text_encoder: true
 num_layers: 2
 hidden_dim: 1024
 structural_dim: 1024
@@ -23,8 +22,6 @@ eval_every: 5
     
 device: cuda
 seed: 42
-
-text_cache_batch_size: 128
 
 eval_batch_size: 32
 candidate_batch_size: 32

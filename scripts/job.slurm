@@ -7,8 +7,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
 #SBATCH --partition=batch
-#SBATCH --output=slurm-%x-%j.out
-#SBATCH --error=slurm-%x-%j.err
+#SBATCH --output=media/vhviet03/logs/gwm/slurm-%x-%j.out
+#SBATCH --error=media/vhviet03/logs/gwm/slurm-%x-%j.err
 #SBATCH --mail-user=ngphuc222@clc.fitus.edu.vn
 #SBATCH --mail-type=fail
 #SBATCH --mail-type=end

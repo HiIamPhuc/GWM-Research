@@ -224,7 +224,7 @@ if __name__ == '__main__':
     algorithm = pick_value(args.algorithm, config, 'context_algorithm', 'mmr_neighbor')
     batch_size = int(pick_value(args.batch_size, config, 'context_batch_size', 32))
     mmr_lambda = float(pick_value(args.mmr_lambda, config, 'context_mmr_lambda', 0.5))
-    model_name = pick_value(args.model_name, config, ['context_encoder_model', 'pretrained_model'], 'bert-base-uncased')
+    model_name = pick_value(args.model_name, config, 'pretrained_model', 'bert-base-uncased')
     device = pick_value(args.device, config, 'device', 'cuda')
 
     processor = ContextProcessor(data_dir=data_dir, model_name=model_name, device=device)

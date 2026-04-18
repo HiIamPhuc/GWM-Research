@@ -4,15 +4,23 @@ from transformers import AutoTokenizer, AutoModel
 import argparse
 from tqdm import tqdm
 import os
+import yaml
 
 class ContextProcessor:
     def __init__(self, data_dir, model_name='bert-base-uncased', device='cuda'):
         self.data_dir = data_dir
-        self.device = device
+        self.device = self._resolve_device(device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(device)
+        self.model = AutoModel.from_pretrained(model_name).to(self.device)
         self.entity_text = json.load(open(os.path.join(data_dir, 'entity_text.json')))
         self.entity2id = json.load(open(os.path.join(data_dir, 'entity2id.json')))
+
+    def _resolve_device(self, device):
+        requested = str(device)
+        if requested.startswith('cuda') and not torch.cuda.is_available():
+            print("CUDA requested but not available. Falling back to CPU for context computation.")
+            return 'cpu'
+        return requested
         
     def _encode_batch(self, texts):
         inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
@@ -169,14 +177,60 @@ class ContextProcessor:
         torch.save(context_ids, output_file)
         print(f"Context nodes saved to {output_file}")
 
+
+def load_config(config_path):
+    if not config_path:
+        return {}
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Config at {config_path} must be a YAML mapping.")
+    return config
+
+
+def pick_value(cli_value, config, keys, default=None):
+    if cli_value is not None:
+        return cli_value
+
+    if isinstance(keys, (list, tuple)):
+        for key in keys:
+            if key in config and config[key] is not None:
+                return config[key]
+        return default
+
+    if keys in config and config[keys] is not None:
+        return config[keys]
+    return default
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--k', type=int, default=10, help='Number of context neighbors')
-    parser.add_argument('--algorithm', type=str, default='mmr_neighbor', choices=['mmr_neighbor', 'random'], help='Algorithm for neighbor selection')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for encoding/similarity')
-    parser.add_argument('--mmr_lambda', type=float, default=0.5, help='Lambda for MMR (0.5 balances relevance and diversity)')
+    parser.add_argument('--config', type=str, default=None, help='Optional YAML config path')
+    parser.add_argument('--data_dir', type=str, default=None, help='Processed dataset directory')
+    parser.add_argument('--k', type=int, default=None, help='Number of context neighbors')
+    parser.add_argument('--algorithm', type=str, default=None, choices=['mmr_neighbor', 'random'], help='Algorithm for neighbor selection')
+    parser.add_argument('--batch_size', type=int, default=None, help='Batch size for encoding/similarity')
+    parser.add_argument('--mmr_lambda', type=float, default=None, help='Lambda for MMR (0.5 balances relevance and diversity)')
+    parser.add_argument('--model_name', type=str, default=None, help='Text encoder model for context computation')
+    parser.add_argument('--device', type=str, default=None, help='Device for context computation (e.g., cuda, cuda:0, cpu)')
     args = parser.parse_args()
-    
-    processor = ContextProcessor(args.data_dir)
-    processor.compute_context_nodes(k=args.k, algorithm=args.algorithm, batch_size=args.batch_size, mmr_lambda=args.mmr_lambda)
+
+    config = load_config(args.config)
+
+    data_dir = pick_value(args.data_dir, config, 'data_dir')
+    if data_dir is None:
+        parser.error("data_dir must be provided via --data_dir or config[data_dir].")
+
+    k = int(pick_value(args.k, config, 'context_k', 10))
+    algorithm = pick_value(args.algorithm, config, 'context_algorithm', 'mmr_neighbor')
+    batch_size = int(pick_value(args.batch_size, config, 'context_batch_size', 32))
+    mmr_lambda = float(pick_value(args.mmr_lambda, config, 'context_mmr_lambda', 0.5))
+    model_name = pick_value(args.model_name, config, ['context_encoder_model', 'pretrained_model'], 'bert-base-uncased')
+    device = pick_value(args.device, config, 'device', 'cuda')
+
+    processor = ContextProcessor(data_dir=data_dir, model_name=model_name, device=device)
+    processor.compute_context_nodes(
+        k=k,
+        algorithm=algorithm,
+        batch_size=batch_size,
+        mmr_lambda=mmr_lambda,
+    )

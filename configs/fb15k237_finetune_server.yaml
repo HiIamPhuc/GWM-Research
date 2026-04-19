@@ -1,8 +1,8 @@
-# Config for GWM-RNN-Text
+# Config for GWM-RNN-Text (FB15k-237)
 pretrained_model: bert-base-uncased
 num_layers: 2
 hidden_dim: 1024
-structural_dim: 384
+structural_dim: 768
 fusion_mode: gated
 dropout: 0.2
 loss: infonce
@@ -18,11 +18,11 @@ candidate_batch_size: 96
 device: cuda
 seed: 42
 
-data_dir: data-processed/wn18rr
-output_dir: output/wn18rr_bert_finetune
-    
+data_dir: data-processed/fb15k-237
+output_dir: output/fb15k237_bert_finetune
+
 add_inverse: true
-context_k: 5
+context_k: 15
 context_algorithm: random
 context_batch_size: 256
 context_mmr_lambda: 0.5

@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from torch_geometric.nn import GATConv
+from torch_geometric.data import Data
 
 class GWM(nn.Module):
     def __init__(self, config):
@@ -16,8 +18,19 @@ class GWM(nn.Module):
         if self.structural_dim != config.hidden_dim:
             self.structural_projection = nn.Linear(self.structural_dim, config.hidden_dim)
         
-        # 2. Context Processing (RNN / GWM Core)
+        # 2. Spatial Encoder (GAT for subgraph context)
+        # This encodes the K-node subgraph around the head entity into a mental state.
+        # The GAT takes fused node embeddings (text + structure) and outputs hidden_dim.
+        text_dim = int(getattr(config, 'text_embedding_dim', config.hidden_dim))
+        self.gat = GATConv(in_channels=config.hidden_dim, out_channels=config.hidden_dim, heads=1, concat=False)
+        
+        # State Projectors: Project GAT output to LSTM initial states
+        self.h0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.c0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
+        
+        # 3. Context Processing (RNN / GWM Core)
         # Note: If fusion output is hidden_dim, LSTM input is hidden_dim.
+        # NEW: LSTM now receives only [Head_Fused, Relation_Fused] (2 steps instead of 3)
         self.lstm = nn.LSTM(
             input_size=config.hidden_dim, 
             hidden_size=config.hidden_dim,
@@ -26,8 +39,7 @@ class GWM(nn.Module):
             dropout=config.dropout if config.num_layers > 1 else 0
         )
         
-        # 3. Fusion Layer
-        text_dim = int(getattr(config, 'text_embedding_dim', config.hidden_dim))
+        # 4. Fusion Layer
         self.text_projection = nn.Linear(text_dim, config.hidden_dim)
         self.fusion_mode = config.fusion_mode
 
@@ -46,13 +58,55 @@ class GWM(nn.Module):
         # Running alpha stats for lightweight diagnostics.
         self.reset_alpha_stats()
         
-        # 4. Output Projector (Optional but good for matching embeddings)
+        # 5. Output Projector (Optional but good for matching embeddings)
         self.projector = nn.Linear(config.hidden_dim, config.hidden_dim)
 
         # Precomputed text cache loaded from preprocessing artifacts.
         self.cached_entity_text_emb = None
         self.cached_relation_text_emb = None
         self.use_text_cache = False
+
+    def _encode_subgraph_with_gat(self, context_ids, ctx_fused):
+        """
+        Encode subgraph context using Graph Attention Network.
+        
+        Args:
+            context_ids: (B, K) tensor of context node IDs
+            ctx_fused: (B, K, H) fused context embeddings
+        
+        Returns:
+            gat_output: (B, H) aggregated subgraph representation
+        """
+        B, K, H = ctx_fused.shape
+        
+        # Create fully connected subgraph (all K nodes connect to each other)
+        # This treats the K-node subgraph as a complete graph
+        edge_index = []
+        for i in range(K):
+            for j in range(K):
+                if i != j:
+                    edge_index.append([i, j])
+        
+        if len(edge_index) == 0:
+            # If K=1, no edges; just aggregate the single node
+            return torch.mean(ctx_fused, dim=1)  # (B, H)
+        
+        edge_index = torch.tensor(edge_index, dtype=torch.long, device=ctx_fused.device).t().contiguous()
+        
+        # Process each batch item separately
+        gat_outputs = []
+        for b in range(B):
+            # Create a graph data object for this batch item
+            graph = Data(x=ctx_fused[b], edge_index=edge_index)  # (K, H) nodes
+            
+            # Forward through GAT
+            node_out = self.gat(graph.x, graph.edge_index)  # (K, H)
+            
+            # Global mean pooling over nodes to get graph-level representation
+            graph_rep = torch.mean(node_out, dim=0)  # (H,)
+            gat_outputs.append(graph_rep)
+        
+        return torch.stack(gat_outputs, dim=0)  # (B, H)
  
     def _load_embedding_tensor(self, source, expected_rows, name):
         if isinstance(source, str):
@@ -179,6 +233,12 @@ class GWM(nn.Module):
         r_batch: dict {id}
         context_batch: dict {id}
           - id: (B, K)
+        
+        Ha & Schmidhuber Paradigm:
+        - Encode subgraph context with GAT -> (B, H)
+        - Project GAT output to LSTM initial states (h_0, c_0)
+        - Run LSTM on [Head_Fused, Relation_Fused] with those initial states
+        - Use final LSTM hidden state as query vector
         """
         if not self.use_text_cache:
             raise RuntimeError(
@@ -199,18 +259,30 @@ class GWM(nn.Module):
 
         # Fuse Context (Text + Structure)
         ctx_fused = self._fuse_modalities(ctx_emb_text, ctx_struct) # (B, K, H)
-        # Aggregate Context
-        ctx_summary = torch.mean(ctx_fused, dim=1) # (B, H)
+        
+        # SPATIAL ENCODER: Encode subgraph using GAT
+        subgraph_rep = self._encode_subgraph_with_gat(context_ids, ctx_fused)  # (B, H)
+        
+        # Project to LSTM initial states
+        h_0_init = torch.tanh(self.h0_projection(subgraph_rep))  # (B, H)
+        c_0_init = torch.tanh(self.c0_projection(subgraph_rep))  # (B, H)
+        # For multi-layer LSTM, replicate states across layers
+        if self.config.num_layers > 1:
+            h_0 = h_0_init.unsqueeze(0).repeat(self.config.num_layers, 1, 1)  # (num_layers, B, H)
+            c_0 = c_0_init.unsqueeze(0).repeat(self.config.num_layers, 1, 1)  # (num_layers, B, H)
+        else:
+            h_0 = h_0_init.unsqueeze(0)  # (1, B, H)
+            c_0 = c_0_init.unsqueeze(0)  # (1, B, H)
         
         # Main Fusion
         h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
         r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
 
-        # LSTM Context Aggregation
-        # Sequence: [Context, Head, Relation] -> Predict Tail
-        lstm_input = torch.stack([ctx_summary, h_fused, r_fused], dim=1) # (B, 3, H)
+        # TRAJECTORY: Run LSTM with initial state from GAT-encoded subgraph
+        # Sequence: [Head_Fused, Relation_Fused] initialized with (h_0, c_0) from subgraph
+        lstm_input = torch.stack([h_fused, r_fused], dim=1) # (B, 2, H)
         
-        lstm_out, _ = self.lstm(lstm_input)
+        lstm_out, (h_n, c_n) = self.lstm(lstm_input, (h_0, c_0))
         query_vector = lstm_out[:, -1, :] # Last hidden state (B, H)
         
         # Project Query

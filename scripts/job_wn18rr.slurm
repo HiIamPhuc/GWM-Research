@@ -7,8 +7,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=2-00:00:00
 #SBATCH --partition=batch
-#SBATCH --output=media/vhviet03/logs/gwm/wn18rr/slurm-%x-%j.out
-#SBATCH --error=media/vhviet03/logs/gwm/wn18rr/slurm-%x-%j.err
+#SBATCH --output=/media/vhviet03/logs/gwm/wn18rr/slurm-%x-%j.out
+#SBATCH --error=/media/vhviet03/logs/gwm/wn18rr/slurm-%x-%j.err
 #SBATCH --mail-user=ngphuc222@clc.fitus.edu.vn
 #SBATCH --mail-type=fail
 #SBATCH --mail-type=end
@@ -21,8 +21,8 @@ spack load cuda@11.8.0
 
 # Configure these for your school cluster.
 export PROJECT_ROOT="GWM-Research"
-export CONFIG_PATH="GWM-Research/configs/wn18rr_finetune_server.yaml"
-export RAW_DATA_DIR="GWM-Research/data/WN18RR"
+export CONFIG_PATH="configs/wn18rr_finetune_server.yaml"
+export RAW_DATA_DIR="data/WN18RR"
 export DATASET_NAME="wn18rr"
 export CONDA_ENV_NAME="gwm"
 

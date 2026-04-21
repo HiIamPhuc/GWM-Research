@@ -1,5 +1,5 @@
 # Config for context-aware GWM with precomputed text embeddings
-text_embedding_dim: 1024
+text_embedding_dim: 768
 num_layers: 2
 hidden_dim: 1024
 structural_dim: 768

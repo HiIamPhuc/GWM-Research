@@ -32,6 +32,8 @@ export RUN_CONTEXT=1
 export RUN_TRAIN=1
 export RUN_EVAL=1
 
+export CACHE_ROOT="/media/vhviet03/.cache/gwm"
+
 # Conda activation.
 source /media/vhviet03/miniconda/bin/activate
 conda activate "$CONDA_ENV_NAME"

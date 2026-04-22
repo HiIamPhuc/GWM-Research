@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 from types import SimpleNamespace
 
@@ -119,10 +120,46 @@ def infer_vocab_sizes(data_dir):
 	return num_entities, num_relations
 
 
+def resolve_checkpoint_dir(args):
+	src_checkpoint_dir = os.path.abspath(args.checkpoint_dir)
+	if not os.path.isdir(src_checkpoint_dir):
+		raise NotADirectoryError(f"Checkpoint directory does not exist: {src_checkpoint_dir}")
+
+	src_normalized = src_checkpoint_dir.replace('\\', '/')
+	from_kaggle_input = src_normalized.startswith('/kaggle/input/')
+
+	if args.copy_checkpoint_to:
+		dst_checkpoint_dir = os.path.abspath(args.copy_checkpoint_to)
+		should_copy = True
+	elif from_kaggle_input:
+		repo_root = os.path.dirname(os.path.abspath(__file__))
+		dst_checkpoint_dir = os.path.join(repo_root, 'checkpoint_runs', os.path.basename(src_checkpoint_dir.rstrip('/\\')))
+		should_copy = True
+	else:
+		return src_checkpoint_dir
+
+	if os.path.normpath(src_checkpoint_dir) == os.path.normpath(dst_checkpoint_dir):
+		return src_checkpoint_dir
+
+	if os.path.exists(dst_checkpoint_dir):
+		if args.overwrite_copy:
+			if os.path.isfile(dst_checkpoint_dir):
+				os.remove(dst_checkpoint_dir)
+			else:
+				shutil.rmtree(dst_checkpoint_dir)
+		else:
+			print(f"Using existing copied checkpoint directory: {dst_checkpoint_dir}")
+			return dst_checkpoint_dir
+
+	print(f"Copying checkpoint directory to writable path:\n  from: {src_checkpoint_dir}\n  to  : {dst_checkpoint_dir}")
+	shutil.copytree(src_checkpoint_dir, dst_checkpoint_dir)
+	print("Checkpoint copy complete.")
+
+	return dst_checkpoint_dir
+
+
 def resume_training(args):
-	checkpoint_dir = os.path.abspath(args.checkpoint_dir)
-	if not os.path.isdir(checkpoint_dir):
-		raise NotADirectoryError(f"Checkpoint directory does not exist: {checkpoint_dir}")
+	checkpoint_dir = resolve_checkpoint_dir(args)
 
 	config = load_training_config(
 		checkpoint_dir=checkpoint_dir,
@@ -364,6 +401,17 @@ if __name__ == '__main__':
 	)
 	parser.add_argument('--data_dir', type=str, default=None, help='Override processed data directory if needed')
 	parser.add_argument('--output_dir', type=str, default=None, help='Override output directory; defaults to checkpoint_dir')
+	parser.add_argument(
+		'--copy_checkpoint_to',
+		type=str,
+		default=None,
+		help='Optional writable destination to copy checkpoint_dir before resuming (useful for /kaggle/input read-only data).',
+	)
+	parser.add_argument(
+		'--overwrite_copy',
+		action='store_true',
+		help='If set, overwrite existing --copy_checkpoint_to directory before copying.',
+	)
 	parser.add_argument('--num_epochs', type=int, default=None, help='Optional new total number of epochs to train to')
 	parser.add_argument(
 		'--checkpoint_name',

@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GATConv
-from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
 
 class GWM(nn.Module):
     def __init__(self, config):
@@ -18,13 +17,13 @@ class GWM(nn.Module):
         if self.structural_dim != config.hidden_dim:
             self.structural_projection = nn.Linear(self.structural_dim, config.hidden_dim)
         
-        # 2. Spatial Encoder (GAT for subgraph context)
+        # 2. Spatial Encoder (GCN for subgraph context)
         # This encodes the K-node subgraph around the head entity into a mental state.
-        # The GAT takes fused node embeddings (text + structure) and outputs hidden_dim.
+        # The GCN takes fused node embeddings (text + structure) and outputs hidden_dim.
         text_dim = int(getattr(config, 'text_embedding_dim', config.hidden_dim))
-        self.gat = GATConv(in_channels=config.hidden_dim, out_channels=config.hidden_dim, heads=1, concat=False)
+        self.gcn = GCNConv(in_channels=config.hidden_dim, out_channels=config.hidden_dim)
         
-        # State Projectors: Project GAT output to LSTM initial states
+        # State Projectors: Project GCN output to LSTM initial states
         self.h0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.c0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
         
@@ -66,16 +65,16 @@ class GWM(nn.Module):
         self.cached_relation_text_emb = None
         self.use_text_cache = False
 
-    def _encode_subgraph_with_gat(self, context_ids, ctx_fused):
+    def _encode_subgraph_with_gcn(self, context_ids, ctx_fused):
         """
-        Encode subgraph context using Graph Attention Network.
+        Encode subgraph context using Graph Convolution Network.
         
         Args:
             context_ids: (B, K) tensor of context node IDs
             ctx_fused: (B, K, H) fused context embeddings
         
         Returns:
-            gat_output: (B, H) aggregated subgraph representation
+            gcn_output: (B, H) aggregated subgraph representation
         """
         B, K, H = ctx_fused.shape
         
@@ -94,19 +93,16 @@ class GWM(nn.Module):
         edge_index = torch.tensor(edge_index, dtype=torch.long, device=ctx_fused.device).t().contiguous()
         
         # Process each batch item separately
-        gat_outputs = []
+        gcn_outputs = []
         for b in range(B):
-            # Create a graph data object for this batch item
-            graph = Data(x=ctx_fused[b], edge_index=edge_index)  # (K, H) nodes
-            
-            # Forward through GAT
-            node_out = self.gat(graph.x, graph.edge_index)  # (K, H)
+            # Forward through GCN
+            node_out = self.gcn(ctx_fused[b], edge_index)  # (K, H)
             
             # Global mean pooling over nodes to get graph-level representation
             graph_rep = torch.mean(node_out, dim=0)  # (H,)
-            gat_outputs.append(graph_rep)
+            gcn_outputs.append(graph_rep)
         
-        return torch.stack(gat_outputs, dim=0)  # (B, H)
+        return torch.stack(gcn_outputs, dim=0)  # (B, H)
  
     def _load_embedding_tensor(self, source, expected_rows, name):
         if isinstance(source, str):
@@ -235,8 +231,8 @@ class GWM(nn.Module):
           - id: (B, K)
         
         Ha & Schmidhuber Paradigm:
-        - Encode subgraph context with GAT -> (B, H)
-        - Project GAT output to LSTM initial states (h_0, c_0)
+        - Encode subgraph context with GCN -> (B, H)
+        - Project GCN output to LSTM initial states (h_0, c_0)
         - Run LSTM on [Head_Fused, Relation_Fused] with those initial states
         - Use final LSTM hidden state as query vector
         """
@@ -260,8 +256,8 @@ class GWM(nn.Module):
         # Fuse Context (Text + Structure)
         ctx_fused = self._fuse_modalities(ctx_emb_text, ctx_struct) # (B, K, H)
         
-        # SPATIAL ENCODER: Encode subgraph using GAT
-        subgraph_rep = self._encode_subgraph_with_gat(context_ids, ctx_fused)  # (B, H)
+        # SPATIAL ENCODER: Encode subgraph using GCN
+        subgraph_rep = self._encode_subgraph_with_gcn(context_ids, ctx_fused)  # (B, H)
         
         # Project to LSTM initial states
         h_0_init = torch.tanh(self.h0_projection(subgraph_rep))  # (B, H)
@@ -278,7 +274,7 @@ class GWM(nn.Module):
         h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
         r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
 
-        # TRAJECTORY: Run LSTM with initial state from GAT-encoded subgraph
+        # TRAJECTORY: Run LSTM with initial state from GCN-encoded subgraph
         # Sequence: [Head_Fused, Relation_Fused] initialized with (h_0, c_0) from subgraph
         lstm_input = torch.stack([h_fused, r_fused], dim=1) # (B, 2, H)
         

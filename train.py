@@ -153,9 +153,11 @@ def train(args):
 
         candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(int(config.batch_size), 256)))
         entity_loader = build_entity_loader(
+            model=model,
             data_dir=config.data_dir,
             batch_size=candidate_batch_size,
             num_workers=2,
+            max_length=getattr(config, 'max_length', 512),
         )
     
     print("Starting training...")

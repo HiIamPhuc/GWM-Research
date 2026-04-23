@@ -33,3 +33,5 @@ context_k: 15
 context_algorithm: random
 context_batch_size: 256
 context_mmr_lambda: 0.5
+
+max_length: 512

@@ -5,6 +5,7 @@ from tqdm import tqdm
 import argparse
 import yaml
 import json
+from transformers import get_linear_schedule_with_warmup
 
 # Need to set PYTHONPATH or import relatively if structure is respected
 import sys
@@ -75,8 +76,54 @@ def train(args):
         num_workers=4,
         drop_last=True # Important for In-Batch Negatives stability
     )
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.learning_rate))
+
+    # Use separate learning rates for encoder/non-encoder params to stabilize finetuning.
+    base_lr = float(config.learning_rate)
+    text_encoder_lr = float(getattr(config, 'text_encoder_lr', base_lr * 0.1))
+    weight_decay = float(getattr(config, 'weight_decay', 0.01))
+    max_grad_norm = float(getattr(config, 'max_grad_norm', 1.0))
+
+    text_encoder_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith('text_encoder.'):
+            text_encoder_params.append(param)
+        else:
+            other_params.append(param)
+
+    param_groups = []
+    if text_encoder_params:
+        param_groups.append({
+            'params': text_encoder_params,
+            'lr': text_encoder_lr,
+            'weight_decay': weight_decay,
+        })
+    if other_params:
+        param_groups.append({
+            'params': other_params,
+            'lr': base_lr,
+            'weight_decay': weight_decay,
+        })
+
+    optimizer = torch.optim.AdamW(param_groups)
+
+    total_training_steps = max(1, len(train_loader) * int(config.num_epochs))
+    warmup_steps = getattr(config, 'warmup_steps', None)
+    if warmup_steps is None:
+        warmup_ratio = float(getattr(config, 'warmup_ratio', 0.1))
+        warmup_steps = int(total_training_steps * warmup_ratio)
+    warmup_steps = max(0, min(int(warmup_steps), total_training_steps - 1))
+
+    use_scheduler = bool(getattr(config, 'use_scheduler', True))
+    scheduler = None
+    if use_scheduler:
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps,
+        )
     
     # Validation Loader
     if os.path.exists(os.path.join(config.data_dir, 'valid_triples.pt')):
@@ -106,11 +153,9 @@ def train(args):
 
         candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(int(config.batch_size), 256)))
         entity_loader = build_entity_loader(
-            model=model,
             data_dir=config.data_dir,
             batch_size=candidate_batch_size,
             num_workers=2,
-            max_length=getattr(config, 'max_length', 512),
         )
     
     print("Starting training...")
@@ -152,11 +197,19 @@ def train(args):
             loss, _ = model.compute_loss(query_vector, t_fused)
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             
             total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            current_non_encoder_lr = optimizer.param_groups[-1]['lr']
+            current_text_encoder_lr = optimizer.param_groups[0]['lr'] if text_encoder_params else current_non_encoder_lr
+            pbar.set_postfix({
+                'loss': loss.item(),
+                'lr': f"{current_non_encoder_lr:.2e}",
+                'text_lr': f"{current_text_encoder_lr:.2e}",
+            })
             
         avg_train_loss = total_loss / len(train_loader)
         train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None

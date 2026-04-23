@@ -49,6 +49,15 @@ class GWM(nn.Module):
                 nn.Sigmoid()
             )
 
+            # Optional alpha bounds to avoid abrupt gate saturation/collapse.
+            self.gate_alpha_min = float(getattr(config, 'gate_alpha_min', 0.0))
+            self.gate_alpha_max = float(getattr(config, 'gate_alpha_max', 1.0))
+            if self.gate_alpha_min < 0.0 or self.gate_alpha_max > 1.0 or self.gate_alpha_min >= self.gate_alpha_max:
+                raise ValueError(
+                    f"Invalid gate alpha bounds: min={self.gate_alpha_min}, max={self.gate_alpha_max}. "
+                    "Expected 0 <= min < max <= 1."
+                )
+
         # Running alpha stats for lightweight diagnostics.
         self.reset_alpha_stats()
         
@@ -86,6 +95,7 @@ class GWM(nn.Module):
             struct_proj = self._project_structural(struct_emb)
             gate_input = torch.cat([text_proj, struct_proj], dim=-1)
             alpha = self.gate(gate_input)
+            alpha = torch.clamp(alpha, min=self.gate_alpha_min, max=self.gate_alpha_max)
             alpha_detached = alpha.detach()
             self._alpha_sum += alpha_detached.sum().item()
             self._alpha_count += alpha_detached.numel()

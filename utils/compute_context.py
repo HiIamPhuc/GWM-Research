@@ -9,6 +9,7 @@ class ContextProcessor:
         self.data_dir = data_dir
         self.device = device
         self.entity2id = json.load(open(os.path.join(data_dir, 'entity2id.json')))
+        self.relation2id = json.load(open(os.path.join(data_dir, 'relation2id.json')))
         
     def _load_precomputed_embeddings(self):
         """Load precomputed text embeddings from cache files."""
@@ -44,7 +45,6 @@ class ContextProcessor:
         return embeddings
 
     def _load_adjacency(self):
-        print("Loading graph structure for neighbor context...")
         triples_path = os.path.join(self.data_dir, 'train_triples.pt')
         if not os.path.exists(triples_path):
             raise FileNotFoundError(
@@ -55,12 +55,12 @@ class ContextProcessor:
         triples = torch.load(triples_path)
         adj = {}
         
-        # Convert to list for iteration
         for h, r, t in triples.tolist():
-            if h not in adj: adj[h] = []
-            adj[h].append(t)
+            if h not in adj:
+                adj[h] = []
+            adj[h].append((r, t))
             
-        # Deduplicate neighbors
+        # Deduplicate relation-tail edges while preserving tuple info.
         for h in adj:
             adj[h] = list(set(adj[h]))
             
@@ -115,6 +115,20 @@ class ContextProcessor:
     def compute_context_nodes(self, k=10, algorithm='mmr_neighbor', batch_size=64, mmr_lambda=0.5):
         print(f"Computing context nodes using {algorithm}...")
         num_entities = len(self.entity2id)
+        pad_value = -1
+        limit = int(k)
+        use_all_neighbors = limit <= 0
+        adj = self._load_adjacency()
+
+        if use_all_neighbors:
+            max_k = max((len(adj.get(i, [])) for i in range(num_entities)), default=0)
+        else:
+            max_k = max(limit, 0)
+
+        # Store fixed-width tensors with a sentinel mask value.
+        context_entity_ids = torch.full((num_entities, max_k), pad_value, dtype=torch.long)
+        context_relation_ids = torch.full((num_entities, max_k), pad_value, dtype=torch.long)
+        context_mask = torch.zeros((num_entities, max_k), dtype=torch.bool)
 
         if algorithm == 'mmr_neighbor':
             # 1-Hop Neighbor + MMR
@@ -122,68 +136,97 @@ class ContextProcessor:
             embeddings = self._compute_embeddings(batch_size) # Keep on CPU RAM mostly
             embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
             
-            adj = self._load_adjacency()
-            context_ids = torch.zeros((num_entities, k), dtype=torch.long)
-            
             print("Running MMR selection on neighbors...")
             for i in tqdm(range(num_entities), desc="MMR Selection"):
                 eid = i
-                neighbors = adj.get(eid, [])
-                
-                # If no neighbors, fall back to self context.
+                neighbors = adj.get(eid, [])  # list[(r, t)]
+
+                # If no real neighbors, keep this row fully masked.
                 if not neighbors:
-                    context_ids[i] = torch.tensor([eid] * k)
-                    continue
-                    
-                neighbor_indices = torch.tensor(neighbors, dtype=torch.long)
-                
-                # If neighbors <= k, take all and pad with self
-                if len(neighbors) <= k:
-                    # Pad
-                    needed = k - len(neighbors)
-                    padded = torch.cat([neighbor_indices, torch.tensor([eid] * needed)])
-                    context_ids[i] = padded
-                else:
-                    # Perform MMR
-                    query_emb = embeddings[eid] # (H)
-                    cand_embs = embeddings[neighbor_indices] # (Num_N, H)
-                    
-                    selected_local_indices = self._mmr(query_emb, cand_embs, k, lambda_param=mmr_lambda)
-                    selected_global_indices = neighbor_indices[selected_local_indices]
-                    
-                    context_ids[i] = selected_global_indices
-        
-        elif algorithm == 'random':
-            # Randomly sample only from each node's neighbors (not global entity IDs).
-            print("Generating random neighbor context...")
-            adj = self._load_adjacency()
-            context_ids = torch.zeros((num_entities, k), dtype=torch.long)
-            for i in tqdm(range(num_entities)):
-                neighbors = adj.get(i, [])
-                if not neighbors:
-                    context_ids[i] = torch.tensor([i] * k)
                     continue
 
-                neighbor_indices = torch.tensor(neighbors, dtype=torch.long)
-                if len(neighbors) >= k:
-                    sampled = torch.randperm(len(neighbors))[:k]
-                    context_ids[i] = neighbor_indices[sampled]
+                neighbor_rel_ids = torch.tensor([r for r, _ in neighbors], dtype=torch.long)
+                neighbor_ent_ids = torch.tensor([t for _, t in neighbors], dtype=torch.long)
+
+                if use_all_neighbors:
+                    selected_ent_ids = neighbor_ent_ids
+                    selected_rel_ids = neighbor_rel_ids
+                elif len(neighbors) <= limit:
+                    selected_ent_ids = neighbor_ent_ids
+                    selected_rel_ids = neighbor_rel_ids
                 else:
-                    # Sample with replacement to keep fixed context length.
-                    sampled = torch.randint(0, len(neighbors), (k,))
-                    context_ids[i] = neighbor_indices[sampled]
+                    query_emb = embeddings[eid] # (H)
+                    cand_embs = embeddings[neighbor_ent_ids] # (Num_N, H)
+
+                    selected_local_indices = self._mmr(query_emb, cand_embs, limit, lambda_param=mmr_lambda)
+                    selected_local_indices = torch.tensor(selected_local_indices, dtype=torch.long)
+                    selected_ent_ids = neighbor_ent_ids[selected_local_indices]
+                    selected_rel_ids = neighbor_rel_ids[selected_local_indices]
+
+                count = min(selected_ent_ids.numel(), max_k)
+                if count > 0:
+                    context_entity_ids[i, :count] = selected_ent_ids[:count]
+                    context_relation_ids[i, :count] = selected_rel_ids[:count]
+                    context_mask[i, :count] = True
+
+        elif algorithm == 'random':
+            # Randomly sample only from each node's relation-aware neighbors.
+            print("Generating random neighbor context...")
+            for i in tqdm(range(num_entities)):
+                neighbors = adj.get(i, [])  # list[(r, t)]
+                if not neighbors:
+                    continue
+
+                neighbor_rel_ids = torch.tensor([r for r, _ in neighbors], dtype=torch.long)
+                neighbor_ent_ids = torch.tensor([t for _, t in neighbors], dtype=torch.long)
+
+                if use_all_neighbors:
+                    selected_ent_ids = neighbor_ent_ids
+                    selected_rel_ids = neighbor_rel_ids
+                elif len(neighbors) >= limit:
+                    sampled = torch.randperm(len(neighbors))[:limit]
+                    selected_ent_ids = neighbor_ent_ids[sampled]
+                    selected_rel_ids = neighbor_rel_ids[sampled]
+                else:
+                    selected_ent_ids = neighbor_ent_ids
+                    selected_rel_ids = neighbor_rel_ids
+
+                count = min(selected_ent_ids.numel(), max_k)
+                if count > 0:
+                    context_entity_ids[i, :count] = selected_ent_ids[:count]
+                    context_relation_ids[i, :count] = selected_rel_ids[:count]
+                    context_mask[i, :count] = True
                  
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}. Supported: mmr_neighbor, random")
 
-        output_file = os.path.join(self.data_dir, 'context_ids.pt')
-        torch.save(context_ids, output_file)
-        print(f"Context nodes saved to {output_file}")
+        # Save one compact artifact.
+        output_file = os.path.join(self.data_dir, 'context_neighbors.pt')
+        torch.save(
+            {
+                'entity_ids': context_entity_ids,
+                'relation_ids': context_relation_ids,
+                'mask': context_mask,
+                'pad_value': pad_value,
+                'k_requested': limit,
+                'k_effective': max_k,
+                'algorithm': algorithm,
+            },
+            output_file,
+        )
+
+        print(f"Context neighbors saved to {output_file}")
+        print(f"  pad_value={pad_value}, k_effective={max_k}, algorithm={algorithm}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, required=True, help='Path to preprocessed data directory')
-    parser.add_argument('--k', type=int, default=10, help='Number of context neighbors per entity')
+    parser.add_argument(
+        '--k',
+        type=int,
+        default=10,
+        help='Max number of context neighbors per entity. Use k<=0 to keep all real neighbors (variable count).',
+    )
     parser.add_argument(
         '--algorithm',
         type=str,

@@ -27,3 +27,5 @@ text_cache_device: cpu
 
 eval_batch_size: 1024
 candidate_batch_size: 1024
+
+compgcn_op: mult

@@ -1,6 +1,49 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GCNConv
+
+
+class CompGCNLayer(nn.Module):
+    """A lightweight CompGCN-style layer for head-centric aggregation."""
+
+    def __init__(self, hidden_dim, comp_op='sub'):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.comp_op = comp_op
+        self.lin_self = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.lin_msg = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.lin_out = nn.Linear(hidden_dim, hidden_dim)
+
+    def _compose(self, entity_feat, relation_feat):
+        if self.comp_op == 'sub':
+            return entity_feat - relation_feat
+        if self.comp_op == 'mult':
+            return entity_feat * relation_feat
+        raise ValueError(f"Unsupported compgcn_op: {self.comp_op}. Use 'sub' or 'mult'.")
+
+    def forward(self, head_feat, nbr_entity_feat, nbr_relation_feat, nbr_batch_index):
+        """
+        head_feat: (B, H)
+        nbr_entity_feat: (E, H)
+        nbr_relation_feat: (E, H)
+        nbr_batch_index: (E,) long, edge -> head index in batch
+        """
+        B = head_feat.size(0)
+        composed = self._compose(nbr_entity_feat, nbr_relation_feat)  # (E, H)
+        msg = self.lin_msg(composed)  # (E, H)
+
+        agg = torch.zeros_like(head_feat)
+        if msg.numel() > 0:
+            agg.index_add_(0, nbr_batch_index, msg)
+
+        denom = torch.zeros(B, 1, device=head_feat.device, dtype=head_feat.dtype)
+        if msg.numel() > 0:
+            ones = torch.ones(msg.size(0), 1, device=head_feat.device, dtype=head_feat.dtype)
+            denom.index_add_(0, nbr_batch_index, ones)
+        denom = denom.clamp(min=1.0)
+        agg = agg / denom
+
+        out = self.lin_self(head_feat) + agg
+        return torch.tanh(self.lin_out(out))
 
 class GWM(nn.Module):
     def __init__(self, config):
@@ -17,13 +60,16 @@ class GWM(nn.Module):
         if self.structural_dim != config.hidden_dim:
             self.structural_projection = nn.Linear(self.structural_dim, config.hidden_dim)
         
-        # 2. Spatial Encoder (GCN for subgraph context)
-        # This encodes the K-node subgraph around the head entity into a mental state.
-        # The GCN takes fused node embeddings (text + structure) and outputs hidden_dim.
+        # 2. Spatial Encoder (Ego-centric CompGCN for subgraph context)
+        # The head node is the anchor, and messages are composed from
+        # (context entity, context relation) pairs.
         text_dim = int(getattr(config, 'text_embedding_dim', config.hidden_dim))
-        self.gcn = GCNConv(in_channels=config.hidden_dim, out_channels=config.hidden_dim)
+        self.compgcn = CompGCNLayer(
+            hidden_dim=config.hidden_dim,
+            comp_op=getattr(config, 'compgcn_op', 'sub'),
+        )
         
-        # State Projectors: Project GCN output to LSTM initial states
+        # State Projectors: Project CompGCN output to LSTM initial states
         self.h0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.c0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
         
@@ -65,44 +111,25 @@ class GWM(nn.Module):
         self.cached_relation_text_emb = None
         self.use_text_cache = False
 
-    def _encode_subgraph_with_gcn(self, context_ids, ctx_fused):
+    def _encode_subgraph_with_compgcn(self, h_fused, ctx_entity_fused, ctx_relation_fused, ctx_batch_index):
         """
-        Encode subgraph context using Graph Convolution Network.
+        Encode ego-centric subgraph context using CompGCN-style composition.
         
         Args:
-            context_ids: (B, K) tensor of context node IDs
-            ctx_fused: (B, K, H) fused context embeddings
+            h_fused: (B, H) fused head embedding (anchor node)
+            ctx_entity_fused: (E, H) fused context entity embeddings
+            ctx_relation_fused: (E, H) fused context relation embeddings
+            ctx_batch_index: (E,) long, edge -> head index in batch
         
         Returns:
-            gcn_output: (B, H) aggregated subgraph representation
+            compgcn_output: (B, H) updated head representation
         """
-        B, K, H = ctx_fused.shape
-        
-        # Create fully connected subgraph (all K nodes connect to each other)
-        # This treats the K-node subgraph as a complete graph
-        edge_index = []
-        for i in range(K):
-            for j in range(K):
-                if i != j:
-                    edge_index.append([i, j])
-        
-        if len(edge_index) == 0:
-            # If K=1, no edges; just aggregate the single node
-            return torch.mean(ctx_fused, dim=1)  # (B, H)
-        
-        edge_index = torch.tensor(edge_index, dtype=torch.long, device=ctx_fused.device).t().contiguous()
-        
-        # Process each batch item separately
-        gcn_outputs = []
-        for b in range(B):
-            # Forward through GCN
-            node_out = self.gcn(ctx_fused[b], edge_index)  # (K, H)
-            
-            # Global mean pooling over nodes to get graph-level representation
-            graph_rep = torch.mean(node_out, dim=0)  # (H,)
-            gcn_outputs.append(graph_rep)
-        
-        return torch.stack(gcn_outputs, dim=0)  # (B, H)
+        return self.compgcn(
+            head_feat=h_fused,
+            nbr_entity_feat=ctx_entity_fused,
+            nbr_relation_feat=ctx_relation_fused,
+            nbr_batch_index=ctx_batch_index,
+        )
  
     def _load_embedding_tensor(self, source, expected_rows, name):
         if isinstance(source, str):
@@ -231,8 +258,8 @@ class GWM(nn.Module):
           - id: (B, K)
         
         Ha & Schmidhuber Paradigm:
-        - Encode subgraph context with GCN -> (B, H)
-        - Project GCN output to LSTM initial states (h_0, c_0)
+        - Encode ego-centric subgraph context with CompGCN -> (B, H)
+        - Project CompGCN output to LSTM initial states (h_0, c_0)
         - Run LSTM on [Head_Fused, Relation_Fused] with those initial states
         - Use final LSTM hidden state as query vector
         """
@@ -247,17 +274,62 @@ class GWM(nn.Module):
         # Structural Embeddings
         h_struct = self.entity_embeddings(h_batch['id']) # (B, H)
         r_struct = self.relation_embeddings(r_batch['id']) # (B, H)
-        
-        # Context
-        context_ids = context_batch['id'] # (B, K)
-        ctx_emb_text = self._lookup_cached_text(context_ids, kind='entity') # (B, K, H)
-        ctx_struct = self.entity_embeddings(context_ids) # (B, K, H)
 
-        # Fuse Context (Text + Structure)
-        ctx_fused = self._fuse_modalities(ctx_emb_text, ctx_struct) # (B, K, H)
+        # Main Fusion
+        h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
+        r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
         
-        # SPATIAL ENCODER: Encode subgraph using GCN
-        subgraph_rep = self._encode_subgraph_with_gcn(context_ids, ctx_fused)  # (B, H)
+        # Context (entity+relation neighbor edges around head)
+        # Ragged format: flattened edges with batch index (no padding).
+        context_entity_ids = context_batch['id']  # (E,) or legacy (B, K)
+        context_relation_ids = context_batch.get('rel_id')
+        context_batch_index = context_batch.get('batch_index')
+        context_mask = context_batch.get('mask')
+
+        if context_entity_ids.dim() == 2:
+            # Legacy padded format fallback.
+            B, K = context_entity_ids.shape
+            if context_relation_ids is None:
+                context_relation_ids = torch.zeros_like(context_entity_ids)
+            if context_mask is None:
+                context_mask = torch.ones_like(context_entity_ids, dtype=torch.bool)
+            else:
+                context_mask = context_mask.bool()
+
+            valid_idx = context_mask.nonzero(as_tuple=False)
+            if valid_idx.numel() == 0:
+                flat_context_entity_ids = context_entity_ids.new_zeros((0,))
+                flat_context_relation_ids = context_relation_ids.new_zeros((0,))
+                context_batch_index = context_entity_ids.new_zeros((0,))
+            else:
+                context_batch_index = valid_idx[:, 0]
+                flat_context_entity_ids = context_entity_ids[context_mask]
+                flat_context_relation_ids = context_relation_ids[context_mask]
+        else:
+            flat_context_entity_ids = context_entity_ids
+            if context_relation_ids is None:
+                flat_context_relation_ids = torch.zeros_like(flat_context_entity_ids)
+            else:
+                flat_context_relation_ids = context_relation_ids
+            if context_batch_index is None:
+                raise ValueError("context_batch['batch_index'] is required for ragged context format.")
+
+        ctx_ent_text = self._lookup_cached_text(flat_context_entity_ids, kind='entity') # (E, H)
+        ctx_ent_struct = self.entity_embeddings(flat_context_entity_ids) # (E, H)
+        ctx_rel_text = self._lookup_cached_text(flat_context_relation_ids, kind='relation') # (E, H)
+        ctx_rel_struct = self.relation_embeddings(flat_context_relation_ids) # (E, H)
+
+        # Fuse Context Entity/Relation modalities
+        ctx_entity_fused = self._fuse_modalities(ctx_ent_text, ctx_ent_struct) # (E, H)
+        ctx_relation_fused = self._fuse_modalities(ctx_rel_text, ctx_rel_struct) # (E, H)
+
+        # SPATIAL ENCODER: Ego-centric CompGCN update of the head state.
+        subgraph_rep = self._encode_subgraph_with_compgcn(
+            h_fused=h_fused,
+            ctx_entity_fused=ctx_entity_fused,
+            ctx_relation_fused=ctx_relation_fused,
+            ctx_batch_index=context_batch_index,
+        )  # (B, H)
         
         # Project to LSTM initial states
         h_0_init = torch.tanh(self.h0_projection(subgraph_rep))  # (B, H)
@@ -270,11 +342,7 @@ class GWM(nn.Module):
             h_0 = h_0_init.unsqueeze(0)  # (1, B, H)
             c_0 = c_0_init.unsqueeze(0)  # (1, B, H)
         
-        # Main Fusion
-        h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
-        r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
-
-        # TRAJECTORY: Run LSTM with initial state from GCN-encoded subgraph
+        # TRAJECTORY: Run LSTM with initial state from CompGCN-encoded subgraph
         # Sequence: [Head_Fused, Relation_Fused] initialized with (h_0, c_0) from subgraph
         lstm_input = torch.stack([h_fused, r_fused], dim=1) # (B, 2, H)
         

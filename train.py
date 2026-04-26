@@ -21,6 +21,48 @@ from utils.eval import (
 )
 from utils.early_stopping import EarlyStopping
 
+
+def _format_param_count(count):
+    if count >= 1_000_000_000:
+        return f"{count / 1_000_000_000:.2f}B"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.2f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.2f}K"
+    return str(count)
+
+
+def print_model_parameter_info(model):
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    frozen_params = total_params - trainable_params
+
+    module_stats = {}
+    for name, param in model.named_parameters():
+        module_name = name.split('.')[0]
+        stats = module_stats.setdefault(module_name, {'total': 0, 'trainable': 0})
+        count = param.numel()
+        stats['total'] += count
+        if param.requires_grad:
+            stats['trainable'] += count
+
+    print("Model parameter summary:")
+    print(f"  Total params     : {_format_param_count(total_params)} ({total_params:,})")
+    print(f"  Trainable params : {_format_param_count(trainable_params)} ({trainable_params:,})")
+    print(f"  Frozen params    : {_format_param_count(frozen_params)} ({frozen_params:,})")
+
+    print("  By top-level module:")
+    for module_name in sorted(module_stats.keys()):
+        module_total = module_stats[module_name]['total']
+        module_trainable = module_stats[module_name]['trainable']
+        module_frozen = module_total - module_trainable
+        print(
+            f"    - {module_name:<22} "
+            f"total={_format_param_count(module_total):>8} ({module_total:,}) | "
+            f"trainable={_format_param_count(module_trainable):>8} ({module_trainable:,}) | "
+            f"frozen={_format_param_count(module_frozen):>8} ({module_frozen:,})"
+        )
+
 def get_config(args):
     with open(args.config, 'r') as f:
         config_dict = yaml.safe_load(f)
@@ -64,6 +106,7 @@ def train(args):
     # Init Model
     print("Initializing model...")
     model = GWM(config).to(device)
+    print_model_parameter_info(model)
     
     # Collater
     collate_fn = CollateFN(model.tokenizer)
@@ -108,6 +151,14 @@ def train(args):
         })
 
     optimizer = torch.optim.AdamW(param_groups)
+
+    text_encoder_param_count = sum(param.numel() for param in text_encoder_params)
+    other_param_count = sum(param.numel() for param in other_params)
+    print(
+        "Optimizer parameter groups: "
+        f"text_encoder={_format_param_count(text_encoder_param_count)} ({text_encoder_param_count:,}), "
+        f"others={_format_param_count(other_param_count)} ({other_param_count:,})"
+    )
 
     total_training_steps = max(1, len(train_loader) * int(config.num_epochs))
     warmup_steps = getattr(config, 'warmup_steps', None)

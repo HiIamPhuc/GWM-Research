@@ -10,7 +10,7 @@ temperature: 0.07
 
 num_epochs: 400
 learning_rate: 1e-4
-text_encoder_lr: 1e-5
+text_encoder_lr: 5e-5
 weight_decay: 0.01
 use_scheduler: true
 warmup_ratio: 0.1
@@ -30,8 +30,8 @@ output_dir: output/wn18rr_bert_finetune
     
 add_inverse: true
 context_k: 5
-context_algorithm: random
+context_algorithm: mmr_neighbor
 context_batch_size: 256
 context_mmr_lambda: 0.5
 
-max_length: 512
+max_length: 128

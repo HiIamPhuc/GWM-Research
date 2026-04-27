@@ -2,6 +2,58 @@ import torch
 import torch.nn as nn
 
 
+class FactorizedHyperLSTMCell(nn.Module):
+    """Single-step Hyper-LSTM with factorized relation-conditioned gate scaling."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # Shared static dynamics.
+        self.W_ih = nn.Linear(hidden_dim, 4 * hidden_dim)
+        self.W_hh = nn.Linear(hidden_dim, 4 * hidden_dim)
+
+        # Hypernetwork generates relation-conditioned gate scalars.
+        self.hyper_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+        )
+
+    def forward(self, step_x, relation_emb, h_prev=None, c_prev=None):
+        """
+        step_x: (B, H) single input step (head vector).
+        relation_emb: (B, H) relation/action embedding.
+        h_prev: (B, H) initial hidden state.
+        c_prev: (B, H) initial cell state.
+        """
+        if h_prev is None:
+            h_prev = torch.zeros_like(step_x)
+        if c_prev is None:
+            c_prev = torch.zeros_like(step_x)
+
+        # Relation-specific dynamic modulation.
+        r_scales = self.hyper_mlp(relation_emb)  # (B, 4H)
+
+        # Shared transformations.
+        gates = self.W_ih(step_x) + self.W_hh(h_prev)
+
+        # Inject dynamic physics.
+        gates = gates * r_scales
+
+        i_gate, f_gate, o_gate, g_gate = gates.chunk(4, dim=1)
+
+        i = torch.sigmoid(i_gate)
+        f = torch.sigmoid(f_gate)
+        o = torch.sigmoid(o_gate)
+        g = torch.tanh(g_gate)
+
+        c_next = (f * c_prev) + (i * g)
+        h_next = o * torch.tanh(c_next)
+
+        return h_next
+
+
 class CompGCNLayer(nn.Module):
     """A lightweight CompGCN-style layer for head-centric aggregation."""
 
@@ -42,8 +94,8 @@ class CompGCNLayer(nn.Module):
         denom = denom.clamp(min=1.0)
         agg = agg / denom
 
-        out = self.lin_self(head_feat) + agg
-        return torch.tanh(self.lin_out(out))
+        # Pure residual fix: preserve anchor head state, add learned neighbor delta.
+        return head_feat + self.lin_out(agg)
 
 class GWM(nn.Module):
     def __init__(self, config):
@@ -69,20 +121,10 @@ class GWM(nn.Module):
             comp_op=getattr(config, 'compgcn_op', 'sub'),
         )
         
-        # State Projectors: Project CompGCN output to LSTM initial states
+        # 3. Transition Dynamics (Hyper-LSTM, sequence length = 1)
+        self.hyper_lstm = FactorizedHyperLSTMCell(config.hidden_dim)
         self.h0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.c0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
-        
-        # 3. Context Processing (RNN / GWM Core)
-        # Note: If fusion output is hidden_dim, LSTM input is hidden_dim.
-        # NEW: LSTM now receives only [Head_Fused, Relation_Fused] (2 steps instead of 3)
-        self.lstm = nn.LSTM(
-            input_size=config.hidden_dim, 
-            hidden_size=config.hidden_dim,
-            num_layers=config.num_layers,
-            batch_first=True,
-            dropout=config.dropout if config.num_layers > 1 else 0
-        )
         
         # 4. Fusion Layer
         self.text_projection = nn.Linear(text_dim, config.hidden_dim)
@@ -102,7 +144,7 @@ class GWM(nn.Module):
 
         # Running alpha stats for lightweight diagnostics.
         self.reset_alpha_stats()
-        
+
         # 5. Output Projector (Optional but good for matching embeddings)
         self.projector = nn.Linear(config.hidden_dim, config.hidden_dim)
 
@@ -257,10 +299,10 @@ class GWM(nn.Module):
         context_batch: dict {id}
           - id: (B, K)
         
-        Ha & Schmidhuber Paradigm:
+        World-Model Hyper-Dynamics Paradigm:
         - Encode ego-centric subgraph context with CompGCN -> (B, H)
-        - Project CompGCN output to LSTM initial states (h_0, c_0)
-        - Run LSTM on [Head_Fused, Relation_Fused] with those initial states
+        - Use relation embedding as dynamic program via Hyper-LSTM
+        - Run one transition step from world_state
         - Use final LSTM hidden state as query vector
         """
         if not self.use_text_cache:
@@ -324,30 +366,25 @@ class GWM(nn.Module):
         ctx_relation_fused = self._fuse_modalities(ctx_rel_text, ctx_rel_struct) # (E, H)
 
         # SPATIAL ENCODER: Ego-centric CompGCN update of the head state.
-        subgraph_rep = self._encode_subgraph_with_compgcn(
+        world_state = self._encode_subgraph_with_compgcn(
             h_fused=h_fused,
             ctx_entity_fused=ctx_entity_fused,
             ctx_relation_fused=ctx_relation_fused,
             ctx_batch_index=context_batch_index,
         )  # (B, H)
-        
-        # Project to LSTM initial states
-        h_0_init = torch.tanh(self.h0_projection(subgraph_rep))  # (B, H)
-        c_0_init = torch.tanh(self.c0_projection(subgraph_rep))  # (B, H)
-        # For multi-layer LSTM, replicate states across layers
-        if self.config.num_layers > 1:
-            h_0 = h_0_init.unsqueeze(0).repeat(self.config.num_layers, 1, 1)  # (num_layers, B, H)
-            c_0 = c_0_init.unsqueeze(0).repeat(self.config.num_layers, 1, 1)  # (num_layers, B, H)
-        else:
-            h_0 = h_0_init.unsqueeze(0)  # (1, B, H)
-            c_0 = c_0_init.unsqueeze(0)  # (1, B, H)
-        
-        # TRAJECTORY: Run LSTM with initial state from CompGCN-encoded subgraph
-        # Sequence: [Head_Fused, Relation_Fused] initialized with (h_0, c_0) from subgraph
-        lstm_input = torch.stack([h_fused, r_fused], dim=1) # (B, 2, H)
-        
-        lstm_out, (h_n, c_n) = self.lstm(lstm_input, (h_0, c_0))
-        query_vector = lstm_out[:, -1, :] # Last hidden state (B, H)
+
+        # TRANSITION DYNAMICS:
+        # - world_state initializes recurrent memory
+        # - head_fused is the first (and only) input step
+        h_0 = torch.tanh(self.h0_projection(world_state))
+        # c_0 = torch.tanh(self.c0_projection(world_state))
+        c_0 = self.c0_projection(world_state)
+        query_vector = self.hyper_lstm(
+            step_x=h_fused,
+            relation_emb=r_fused,
+            h_prev=h_0,
+            c_prev=c_0,
+        )
         
         # Project Query
         query_vector = self.projector(query_vector)

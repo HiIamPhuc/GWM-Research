@@ -4,7 +4,7 @@ structural_dim: 384
 fusion_dim: 896
 compgcn_dim: 896
 compgcn_layers: 1
-fusion_mode: gated
+fusion_mode: fusion
 dropout: 0.25
 recurrent_dropout: 0.1
 learning_rate: 1e-4

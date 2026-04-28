@@ -5,9 +5,10 @@ import torch.nn as nn
 class FactorizedHyperLSTMCell(nn.Module):
     """Single-step Hyper-LSTM with factorized relation-conditioned gate scaling."""
 
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, hyper_hidden_dim=None, recurrent_dropout=0.0):
         super().__init__()
         self.hidden_dim = hidden_dim
+        hyper_hidden_dim = hidden_dim if hyper_hidden_dim is None else hyper_hidden_dim
 
         # Shared static dynamics.
         self.W_ih = nn.Linear(hidden_dim, 4 * hidden_dim)
@@ -15,10 +16,11 @@ class FactorizedHyperLSTMCell(nn.Module):
 
         # Hypernetwork generates relation-conditioned gate scalars.
         self.hyper_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hyper_hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.Linear(hyper_hidden_dim, 4 * hidden_dim),
         )
+        self.recurrent_dropout = nn.Dropout(recurrent_dropout) if recurrent_dropout and recurrent_dropout > 0 else nn.Identity()
 
     def forward(self, step_x, relation_emb, h_prev=None, c_prev=None):
         """
@@ -51,7 +53,7 @@ class FactorizedHyperLSTMCell(nn.Module):
         c_next = (f * c_prev) + (i * g)
         h_next = o * torch.tanh(c_next)
 
-        return h_next
+        return self.recurrent_dropout(h_next)
 
 
 class CompGCNLayer(nn.Module):
@@ -102,51 +104,75 @@ class GWM(nn.Module):
         super().__init__()
         self.config = config
 
+        legacy_hidden_dim = int(getattr(config, 'hidden_dim', getattr(config, 'text_embedding_dim', 768)))
+        self.text_embedding_dim = int(getattr(config, 'text_embedding_dim', legacy_hidden_dim))
+
         # 1. Structural Component (Entity/Relation Embeddings)
-        self.structural_dim = config.structural_dim
+        self.structural_dim = int(getattr(config, 'structural_dim', legacy_hidden_dim))
         self.entity_embeddings = nn.Embedding(config.num_entities, self.structural_dim)
         self.relation_embeddings = nn.Embedding(config.num_relations, self.structural_dim)
 
-        # Project structural embeddings to hidden_dim when needed by gating fusion.
-        self.structural_projection = None
-        if self.structural_dim != config.hidden_dim:
-            self.structural_projection = nn.Linear(self.structural_dim, config.hidden_dim)
+        # Shared latent spaces separated by module role.
+        self.fusion_dim = int(getattr(config, 'fusion_dim', legacy_hidden_dim))
+        self.compgcn_dim = int(getattr(config, 'compgcn_dim', self.fusion_dim))
+        self.dynamics_dim = int(getattr(config, 'dynamics_dim', self.fusion_dim))
+        self.hyper_mlp_dim = int(getattr(config, 'hyper_mlp_dim', self.dynamics_dim))
+        self.dropout_rate = float(getattr(config, 'dropout', 0.0))
+        self.recurrent_dropout = float(getattr(config, 'recurrent_dropout', 0.0))
+
+        self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
+        self.spatial_projection = nn.Identity()
+        if self.fusion_dim != self.compgcn_dim:
+            self.spatial_projection = nn.Linear(self.fusion_dim, self.compgcn_dim)
+
+        self.dynamics_projection = nn.Identity()
+        if self.fusion_dim != self.dynamics_dim:
+            self.dynamics_projection = nn.Linear(self.fusion_dim, self.dynamics_dim)
+
+        self.query_projection = nn.Identity()
+        if self.dynamics_dim != self.fusion_dim:
+            self.query_projection = nn.Linear(self.dynamics_dim, self.fusion_dim)
         
         # 2. Spatial Encoder (Ego-centric CompGCN for subgraph context)
         # The head node is the anchor, and messages are composed from
         # (context entity, context relation) pairs.
-        text_dim = int(getattr(config, 'text_embedding_dim', config.hidden_dim))
-        self.compgcn = CompGCNLayer(
-            hidden_dim=config.hidden_dim,
-            comp_op=getattr(config, 'compgcn_op', 'sub'),
+        compgcn_layers = int(getattr(config, 'compgcn_layers', 1))
+        self.compgcn_stack = nn.ModuleList(
+            [
+                CompGCNLayer(
+                    hidden_dim=self.compgcn_dim,
+                    comp_op=getattr(config, 'compgcn_op', 'sub'),
+                )
+                for _ in range(max(compgcn_layers, 1))
+            ]
         )
         
         # 3. Transition Dynamics (Hyper-LSTM, sequence length = 1)
-        self.hyper_lstm = FactorizedHyperLSTMCell(config.hidden_dim)
-        self.h0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
-        self.c0_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.hyper_lstm = FactorizedHyperLSTMCell(
+            self.dynamics_dim,
+            hyper_hidden_dim=self.hyper_mlp_dim,
+            recurrent_dropout=self.recurrent_dropout,
+        )
+        self.h0_projection = nn.Linear(self.compgcn_dim, self.dynamics_dim)
+        self.c0_projection = nn.Linear(self.compgcn_dim, self.dynamics_dim)
         
         # 4. Fusion Layer
-        self.text_projection = nn.Linear(text_dim, config.hidden_dim)
         self.fusion_mode = config.fusion_mode
 
         # Legacy/default path: concat(text, struct) -> linear
-        self.fusion = nn.Linear(text_dim + self.structural_dim, config.hidden_dim)
+        self.fusion = nn.Linear(self.text_embedding_dim + self.structural_dim, self.fusion_dim)
 
         # Dynamic gating path: learn sample-wise interpolation between text and structure.
         if self.fusion_mode == 'gated':
             self.gate = nn.Sequential(
-                nn.Linear(config.hidden_dim * 2, config.hidden_dim),
+                nn.Linear(self.fusion_dim * 2, self.fusion_dim),
                 nn.ReLU(),
-                nn.Linear(config.hidden_dim, 1),
+                nn.Linear(self.fusion_dim, 1),
                 nn.Sigmoid()
             )
 
         # Running alpha stats for lightweight diagnostics.
         self.reset_alpha_stats()
-
-        # 5. Output Projector (Optional but good for matching embeddings)
-        self.projector = nn.Linear(config.hidden_dim, config.hidden_dim)
 
         # Precomputed text cache loaded from preprocessing artifacts.
         self.cached_entity_text_emb = None
@@ -166,12 +192,15 @@ class GWM(nn.Module):
         Returns:
             compgcn_output: (B, H) updated head representation
         """
-        return self.compgcn(
-            head_feat=h_fused,
-            nbr_entity_feat=ctx_entity_fused,
-            nbr_relation_feat=ctx_relation_fused,
-            nbr_batch_index=ctx_batch_index,
-        )
+        h_state = h_fused
+        for layer in self.compgcn_stack:
+            h_state = layer(
+                head_feat=h_state,
+                nbr_entity_feat=ctx_entity_fused,
+                nbr_relation_feat=ctx_relation_fused,
+                nbr_batch_index=ctx_batch_index,
+            )
+        return h_state
  
     def _load_embedding_tensor(self, source, expected_rows, name):
         if isinstance(source, str):
@@ -225,7 +254,7 @@ class GWM(nn.Module):
                 f"Got {entity_cache.size(1)} and {relation_cache.size(1)}"
             )
 
-        expected_text_dim = self.text_projection.in_features
+        expected_text_dim = self.text_embedding_dim
         if entity_cache.size(1) != expected_text_dim:
             raise ValueError(
                 "Text embedding dimension mismatch with model config. "
@@ -257,11 +286,6 @@ class GWM(nn.Module):
             selected = selected.to(ids.device)
         return selected.reshape(*original_shape, -1)
 
-    def _project_structural(self, struct_emb):
-        if self.structural_projection is not None:
-            return self.structural_projection(struct_emb)
-        return struct_emb
-
     def reset_alpha_stats(self):
         self._alpha_sum = 0.0
         self._alpha_count = 0
@@ -278,15 +302,16 @@ class GWM(nn.Module):
         return alpha_mean
 
     def _fuse_modalities(self, text_emb, struct_emb):
+        text_emb = self.input_dropout(text_emb)
+        struct_emb = self.input_dropout(struct_emb)
+
         if self.fusion_mode == 'gated':
-            text_proj = self.text_projection(text_emb)
-            struct_proj = self._project_structural(struct_emb)
-            gate_input = torch.cat([text_proj, struct_proj], dim=-1)
+            gate_input = torch.cat([text_emb, struct_emb], dim=-1)
             alpha = self.gate(gate_input)
             alpha_detached = alpha.detach()
             self._alpha_sum += alpha_detached.sum().item()
             self._alpha_count += alpha_detached.numel()
-            return alpha * text_proj + (1.0 - alpha) * struct_proj
+            return alpha * text_emb + (1.0 - alpha) * struct_emb
 
         # Backward-compatible concat fusion
         return self.fusion(torch.cat([text_emb, struct_emb], dim=-1))
@@ -320,6 +345,8 @@ class GWM(nn.Module):
         # Main Fusion
         h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
         r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
+        h_fused = self.input_dropout(h_fused)
+        r_fused = self.input_dropout(r_fused)
         
         # Context (entity+relation neighbor edges around head)
         # Ragged format: flattened edges with batch index (no padding).
@@ -365,29 +392,33 @@ class GWM(nn.Module):
         ctx_entity_fused = self._fuse_modalities(ctx_ent_text, ctx_ent_struct) # (E, H)
         ctx_relation_fused = self._fuse_modalities(ctx_rel_text, ctx_rel_struct) # (E, H)
 
+        h_spatial = self.spatial_projection(h_fused)
+        ctx_entity_spatial = self.spatial_projection(ctx_entity_fused)
+        ctx_relation_spatial = self.spatial_projection(ctx_relation_fused)
+
         # SPATIAL ENCODER: Ego-centric CompGCN update of the head state.
         world_state = self._encode_subgraph_with_compgcn(
-            h_fused=h_fused,
-            ctx_entity_fused=ctx_entity_fused,
-            ctx_relation_fused=ctx_relation_fused,
+            h_fused=h_spatial,
+            ctx_entity_fused=ctx_entity_spatial,
+            ctx_relation_fused=ctx_relation_spatial,
             ctx_batch_index=context_batch_index,
         )  # (B, H)
+        world_state = self.input_dropout(world_state)
 
         # TRANSITION DYNAMICS:
         # - world_state initializes recurrent memory
         # - head_fused is the first (and only) input step
         h_0 = torch.tanh(self.h0_projection(world_state))
-        # c_0 = torch.tanh(self.c0_projection(world_state))
-        c_0 = self.c0_projection(world_state)
+        c_0 = torch.tanh(self.c0_projection(world_state))
         query_vector = self.hyper_lstm(
-            step_x=h_fused,
-            relation_emb=r_fused,
+            step_x=self.dynamics_projection(h_fused),
+            relation_emb=self.dynamics_projection(r_fused),
             h_prev=h_0,
             c_prev=c_0,
         )
         
-        # Project Query
-        query_vector = self.projector(query_vector)
+        # Project back to the fused comparison space only when the spaces differ.
+        query_vector = self.query_projection(query_vector)
         
         # Ensure normalization for cosine similarity / InfoNCE
         query_vector = torch.nn.functional.normalize(query_vector, p=2, dim=1)

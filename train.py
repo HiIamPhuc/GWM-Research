@@ -1,10 +1,12 @@
 import os
+import math
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import argparse
 import yaml
 import json
+from torch.optim.lr_scheduler import LambdaLR
 
 # Need to set PYTHONPATH or import relatively if structure is respected
 import sys
@@ -119,7 +121,29 @@ def train(args):
     )
     print("Text cache ready. Training uses ID-only batches with context IDs.")
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.learning_rate))
+    base_lr = float(config.learning_rate)
+    weight_decay = float(getattr(config, 'weight_decay', 0.0))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+    total_steps = max(1, config.num_epochs * len(train_loader))
+    warmup_ratio = float(getattr(config, 'warmup_ratio', 0.0))
+    warmup_steps = min(int(total_steps * warmup_ratio), total_steps)
+    min_lr = float(getattr(config, 'min_lr', 0.0))
+    min_lr_ratio = 0.0 if base_lr <= 0 else max(min_lr / base_lr, 0.0)
+
+    def lr_lambda(step_index):
+        if total_steps <= 1:
+            return 1.0
+        if warmup_steps > 0 and step_index < warmup_steps:
+            return float(step_index + 1) / float(max(1, warmup_steps))
+
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(max((step_index - warmup_steps) / decay_steps, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    grad_clip_norm = float(getattr(config, 'grad_clip_norm', 1.0))
     
     # Validation Loader
     if os.path.exists(os.path.join(config.data_dir, 'valid_triples.pt')):
@@ -194,8 +218,9 @@ def train(args):
             loss, _ = model.compute_loss(query_vector, t_fused)
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
+            scheduler.step()
             
             total_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})

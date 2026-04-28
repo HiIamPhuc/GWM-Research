@@ -3,10 +3,12 @@ import json
 import os
 import shutil
 import sys
+import math
 from types import SimpleNamespace
 
 import torch
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -263,7 +265,29 @@ def resume_training(args):
 			num_workers=2,
 		)
 
-	optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.learning_rate))
+	base_lr = float(config.learning_rate)
+	weight_decay = float(getattr(config, 'weight_decay', 0.0))
+	optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+	total_steps = max(1, int(config.num_epochs) * len(train_loader))
+	warmup_ratio = float(getattr(config, 'warmup_ratio', 0.0))
+	warmup_steps = min(int(total_steps * warmup_ratio), total_steps)
+	min_lr = float(getattr(config, 'min_lr', 0.0))
+	min_lr_ratio = 0.0 if base_lr <= 0 else max(min_lr / base_lr, 0.0)
+
+	def lr_lambda(step_index):
+		if total_steps <= 1:
+			return 1.0
+		if warmup_steps > 0 and step_index < warmup_steps:
+			return float(step_index + 1) / float(max(1, warmup_steps))
+
+		decay_steps = max(1, total_steps - warmup_steps)
+		progress = min(max((step_index - warmup_steps) / decay_steps, 0.0), 1.0)
+		cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+		return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+	scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+	grad_clip_norm = float(getattr(config, 'grad_clip_norm', 1.0))
 	if isinstance(checkpoint, dict) and 'optimizer_state_dict' in checkpoint:
 		try:
 			optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -303,8 +327,9 @@ def resume_training(args):
 			t_fused = model.encode_target(t_batch)
 			loss, _ = model.compute_loss(query_vector, t_fused)
 			loss.backward()
-			torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+			torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 			optimizer.step()
+			scheduler.step()
 
 			total_loss += loss.item()
 			pbar.set_postfix({'loss': loss.item()})

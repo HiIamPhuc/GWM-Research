@@ -1,21 +1,36 @@
 # Config for context-aware GWM with precomputed text embeddings
 text_embedding_dim: 768
 structural_dim: 384
-fusion_dim: 896
-compgcn_dim: 896
+
+fusion_dim: 768
+fusion_mode: gated
+
+compgcn_dim: 768
 compgcn_layers: 1
-fusion_mode: fusion
-dropout: 0.25
+compgcn_op: mult
+
+dynamics_dim: 768
+h0c0_dim: 768
+hyper_mlp_dim: 512
+
+dropout: 0.2
 recurrent_dropout: 0.1
+
 learning_rate: 1e-4
 weight_decay: 0.01
 min_lr: 1e-6
 warmup_ratio: 0.05
 grad_clip_norm: 1.0
-batch_size: 1024
-loss: infonce
 num_epochs: 400
-temperature: 0.07
+early_stopping_patience: 15
+eval_every: 1
+
+batch_size: 1024
+eval_batch_size: 1024
+candidate_batch_size: 1024
+
+loss: infonce
+temperature: 0.09
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr
@@ -23,18 +38,8 @@ output_dir: output/wn18rr
 add_inverse: true
 context_k: 5
 context_agg: mean
-early_stopping_patience: 15
-eval_every: 1
-
-dynamics_dim: 896
-hyper_mlp_dim: 768
     
 device: cuda
 seed: 42
 
 text_cache_device: cpu
-
-eval_batch_size: 1024
-candidate_batch_size: 1024
-
-compgcn_op: mult

@@ -162,14 +162,17 @@ class GWM(nn.Module):
         # Legacy/default path: concat(text, struct) -> linear
         self.fusion = nn.Linear(self.text_embedding_dim + self.structural_dim, self.fusion_dim)
 
-        # Dynamic gating path: learn sample-wise interpolation between text and structure.
+        # Dynamic gating path: learn sample-wise interpolation between raw text and structure vectors.
         if self.fusion_mode == 'gated':
+            # gate reads original unprojected dimensions to compute scalar alpha
             self.gate = nn.Sequential(
-                nn.Linear(self.fusion_dim * 2, self.fusion_dim),
+                nn.Linear(self.text_embedding_dim + self.structural_dim, 128),
                 nn.ReLU(),
-                nn.Linear(self.fusion_dim, 1),
+                nn.Linear(128, 1),
                 nn.Sigmoid()
             )
+            # After weighted concatenation, project to fusion_dim
+            self.fusion_projection = nn.Linear(self.text_embedding_dim + self.structural_dim, self.fusion_dim)
 
         # Running alpha stats for lightweight diagnostics.
         self.reset_alpha_stats()
@@ -306,12 +309,16 @@ class GWM(nn.Module):
         struct_emb = self.input_dropout(struct_emb)
 
         if self.fusion_mode == 'gated':
+            # Compute scalar gate on concatenated original (unprojected) vectors
             gate_input = torch.cat([text_emb, struct_emb], dim=-1)
             alpha = self.gate(gate_input)
             alpha_detached = alpha.detach()
             self._alpha_sum += alpha_detached.sum().item()
             self._alpha_count += alpha_detached.numel()
-            return alpha * text_emb + (1.0 - alpha) * struct_emb
+            # Preserve raw text/structure by weighting and concatenating
+            weighted_concat = torch.cat([alpha * text_emb, (1.0 - alpha) * struct_emb], dim=-1)
+            # Project the weighted concat to fusion_dim
+            return self.fusion_projection(weighted_concat)
 
         # Backward-compatible concat fusion
         return self.fusion(torch.cat([text_emb, struct_emb], dim=-1))

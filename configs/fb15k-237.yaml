@@ -6,15 +6,15 @@ fusion_dim: 1024
 fusion_mode: gated
 
 compgcn_dim: 1024
-compgcn_layers: 1
+compgcn_layers: 2
 compgcn_op: mult
 
 dynamics_dim: 1024
 h0c0_dim: 1024
-hyper_mlp_dim: 2048 
+hyper_mlp_dim: 3096 
 
 dropout: 0.2
-recurrent_dropout: 0.1
+recurrent_dropout: 0.2
 
 learning_rate: 1e-4
 weight_decay: 0.01
@@ -30,13 +30,13 @@ eval_batch_size: 1024
 candidate_batch_size: 1024
 
 loss: infonce
-temperature: 0.09
+temperature: 0.07
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237
     
 add_inverse: true
-context_k: 10
+context_k: 15
 context_agg: mean
     
 device: cuda

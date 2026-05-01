@@ -2,19 +2,19 @@
 text_embedding_dim: 768
 structural_dim: 384
 
-fusion_dim: 768
+fusion_dim: 1024
 fusion_mode: gated
 
-compgcn_dim: 768
+compgcn_dim: 1024
 compgcn_layers: 1
 compgcn_op: mult
 
-dynamics_dim: 768
-h0c0_dim: 768
-hyper_mlp_dim: 512
+dynamics_dim: 1024
+h0c0_dim: 1024
+hyper_mlp_dim: 1024
 
 dropout: 0.2
-recurrent_dropout: 0.1
+recurrent_dropout: 0.2
 
 learning_rate: 1e-4
 weight_decay: 0.01
@@ -30,7 +30,7 @@ eval_batch_size: 1024
 candidate_batch_size: 1024
 
 loss: infonce
-temperature: 0.09
+temperature: 0.07
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr

@@ -97,6 +97,7 @@ class GWM(nn.Module):
         self.lstm = nn.LSTM(
             input_size=self.dynamics_dim * 2,
             hidden_size=self.dynamics_dim,
+            num_layers=int(getattr(config, 'dynamics_layers', 1)),
             batch_first=True
         )
         self.recurrent_dropout_layer = nn.Dropout(self.recurrent_dropout) if self.recurrent_dropout > 0 else nn.Identity()

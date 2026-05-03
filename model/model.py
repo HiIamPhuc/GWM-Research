@@ -2,60 +2,6 @@ import torch
 import torch.nn as nn
 
 
-class FactorizedHyperLSTMCell(nn.Module):
-    """Single-step Hyper-LSTM with factorized relation-conditioned gate scaling."""
-
-    def __init__(self, hidden_dim, hyper_hidden_dim=None, recurrent_dropout=0.0):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        hyper_hidden_dim = hidden_dim if hyper_hidden_dim is None else hyper_hidden_dim
-
-        # Shared static dynamics.
-        self.W_ih = nn.Linear(hidden_dim, 4 * hidden_dim)
-        self.W_hh = nn.Linear(hidden_dim, 4 * hidden_dim)
-
-        # Hypernetwork generates relation-conditioned gate scalars.
-        self.hyper_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hyper_hidden_dim),
-            nn.GELU(),
-            nn.Linear(hyper_hidden_dim, 4 * hidden_dim),
-        )
-        self.recurrent_dropout = nn.Dropout(recurrent_dropout) if recurrent_dropout and recurrent_dropout > 0 else nn.Identity()
-
-    def forward(self, step_x, relation_emb, h_prev=None, c_prev=None):
-        """
-        step_x: (B, H) single input step (head vector).
-        relation_emb: (B, H) relation/action embedding.
-        h_prev: (B, H) initial hidden state.
-        c_prev: (B, H) initial cell state.
-        """
-        if h_prev is None:
-            h_prev = torch.zeros_like(step_x)
-        if c_prev is None:
-            c_prev = torch.zeros_like(step_x)
-
-        # Relation-specific dynamic modulation.
-        r_scales = self.hyper_mlp(relation_emb)  # (B, 4H)
-
-        # Shared transformations.
-        gates = self.W_ih(step_x) + self.W_hh(h_prev)
-
-        # Inject dynamic physics.
-        gates = gates * r_scales
-
-        i_gate, f_gate, o_gate, g_gate = gates.chunk(4, dim=1)
-
-        i = torch.sigmoid(i_gate)
-        f = torch.sigmoid(f_gate)
-        o = torch.sigmoid(o_gate)
-        g = torch.tanh(g_gate)
-
-        c_next = (f * c_prev) + (i * g)
-        h_next = o * torch.tanh(c_next)
-
-        return self.recurrent_dropout(h_next)
-
-
 class CompGCNLayer(nn.Module):
     """A lightweight CompGCN-style layer for head-centric aggregation."""
 
@@ -147,12 +93,14 @@ class GWM(nn.Module):
             ]
         )
         
-        # 3. Transition Dynamics (Hyper-LSTM, sequence length = 1)
-        self.hyper_lstm = FactorizedHyperLSTMCell(
-            self.dynamics_dim,
-            hyper_hidden_dim=self.hyper_mlp_dim,
-            recurrent_dropout=self.recurrent_dropout,
+        # 3. Transition Dynamics (Standard PyTorch LSTM)
+        self.lstm = nn.LSTM(
+            input_size=self.dynamics_dim * 2,
+            hidden_size=self.dynamics_dim,
+            batch_first=True
         )
+        self.recurrent_dropout_layer = nn.Dropout(self.recurrent_dropout) if self.recurrent_dropout > 0 else nn.Identity()
+        
         self.h0_projection = nn.Linear(self.compgcn_dim, self.dynamics_dim)
         self.c0_projection = nn.Linear(self.compgcn_dim, self.dynamics_dim)
         
@@ -417,12 +365,17 @@ class GWM(nn.Module):
         # - head_fused is the first (and only) input step
         h_0 = torch.tanh(self.h0_projection(world_state))
         c_0 = torch.tanh(self.c0_projection(world_state))
-        query_vector = self.hyper_lstm(
-            step_x=self.dynamics_projection(h_fused),
-            relation_emb=self.dynamics_projection(r_fused),
-            h_prev=h_0,
-            c_prev=c_0,
-        )
+        
+        step_x = self.dynamics_projection(h_fused)
+        relation_emb = self.dynamics_projection(r_fused)
+        
+        lstm_input = torch.cat([step_x, relation_emb], dim=-1).unsqueeze(1) # (B, 1, 2H)
+        h_0_lstm = h_0.unsqueeze(0) # (1, B, H)
+        c_0_lstm = c_0.unsqueeze(0) # (1, B, H)
+        
+        lstm_out, (h_n, c_n) = self.lstm(lstm_input, (h_0_lstm, c_0_lstm))
+        query_vector = h_n.squeeze(0) # (B, H)
+        query_vector = self.recurrent_dropout_layer(query_vector)
         
         # Project back to the fused comparison space only when the spaces differ.
         query_vector = self.query_projection(query_vector)

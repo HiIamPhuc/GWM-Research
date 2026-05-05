@@ -371,11 +371,16 @@ class GWM(nn.Module):
         relation_emb = self.dynamics_projection(r_fused)
         
         lstm_input = torch.cat([step_x, relation_emb], dim=-1).unsqueeze(1) # (B, 1, 2H)
-        h_0_lstm = h_0.unsqueeze(0) # (1, B, H)
-        c_0_lstm = c_0.unsqueeze(0) # (1, B, H)
+        
+        # LSTM expects hidden state shapes: (num_layers, B, H).
+        # We broadcast the initialized h_0 and c_0 across all LSTM layers.
+        num_layers = self.lstm.num_layers
+        h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous() # (num_layers, B, H)
+        c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous() # (num_layers, B, H)
         
         lstm_out, (h_n, c_n) = self.lstm(lstm_input, (h_0_lstm, c_0_lstm))
-        query_vector = h_n.squeeze(0) # (B, H)
+        # Extract the hidden state from the last LSTM layer
+        query_vector = h_n[-1] # (B, H)
         query_vector = self.recurrent_dropout_layer(query_vector)
         
         # Project back to the fused comparison space only when the spaces differ.

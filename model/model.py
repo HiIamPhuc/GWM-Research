@@ -94,8 +94,14 @@ class GWM(nn.Module):
         )
         
         # 3. Transition Dynamics (Standard PyTorch LSTM)
+        self.dynamics_mixer = nn.Sequential(
+            nn.Linear(self.dynamics_dim * 2, self.dynamics_dim * 2),
+            nn.GELU(),
+            nn.Linear(self.dynamics_dim * 2, self.dynamics_dim)
+        )
+        
         self.lstm = nn.LSTM(
-            input_size=self.dynamics_dim * 2,
+            input_size=self.dynamics_dim,
             hidden_size=self.dynamics_dim,
             num_layers=int(getattr(config, 'dynamics_layers', 1)),
             batch_first=True
@@ -370,7 +376,9 @@ class GWM(nn.Module):
         step_x = self.dynamics_projection(h_fused)
         relation_emb = self.dynamics_projection(r_fused)
         
-        lstm_input = torch.cat([step_x, relation_emb], dim=-1).unsqueeze(1) # (B, 1, 2H)
+        concat_input = torch.cat([step_x, relation_emb], dim=-1) # (B, 2H)
+        mixed_input = self.dynamics_mixer(concat_input)          # (B, H)
+        lstm_input = mixed_input.unsqueeze(1)                    # (B, 1, H)
         
         # LSTM expects hidden state shapes: (num_layers, B, H).
         # We broadcast the initialized h_0 and c_0 across all LSTM layers.

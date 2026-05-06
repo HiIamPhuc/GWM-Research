@@ -188,6 +188,33 @@ class GWM(nn.Module):
             )
         return loaded
 
+    def load_precomputed_structural_cache(self, entity_source, relation_source, freeze=False):
+        """Loads precomputed structural embeddings (e.g., from RotatE or ComplEx) into the embedding tables."""
+        entity_cache = self._load_embedding_tensor(
+            source=entity_source,
+            expected_rows=self.entity_embeddings.num_embeddings,
+            name='structural_entity',
+        )
+        
+        relation_cache = self._load_embedding_tensor(
+            source=relation_source,
+            expected_rows=self.relation_embeddings.num_embeddings,
+            name='structural_relation',
+        )
+
+        expected_struct_dim = self.structural_dim
+        if entity_cache.size(1) != expected_struct_dim:
+            raise ValueError(
+                f"Structural embedding dim mismatch. Config expects {expected_struct_dim}, got {entity_cache.size(1)}"
+            )
+
+        self.entity_embeddings.weight.data.copy_(entity_cache)
+        self.relation_embeddings.weight.data.copy_(relation_cache)
+
+        if freeze:
+            self.entity_embeddings.weight.requires_grad = False
+            self.relation_embeddings.weight.requires_grad = False
+
     def load_precomputed_text_embedding_cache(self, entity_source, relation_source, cache_device='cpu'):
         if self.use_text_cache and self.cached_entity_text_emb is not None and self.cached_relation_text_emb is not None:
             return

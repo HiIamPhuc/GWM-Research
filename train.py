@@ -120,6 +120,20 @@ def train(args):
         cache_device=cache_device,
     )
     print("Text cache ready. Training uses ID-only batches with context IDs.")
+
+    # Load Structural Prior Caches (if specified in config)
+    structural_entity_source = os.path.join(config.data_dir, 'structural_entities.pt')
+    structural_relation_source = os.path.join(config.data_dir, 'structural_relations.pt')
+    if structural_entity_source and structural_relation_source:
+        print("Loading precomputed structural priors (e.g. RotatE)...")
+        if os.path.exists(structural_entity_source) and os.path.exists(structural_relation_source):
+            model.load_precomputed_structural_cache(
+                entity_source=structural_entity_source,
+                relation_source=structural_relation_source,
+                freeze=getattr(config, 'freeze_structural_priors', False)
+            )
+        else:
+            print(f"Warning: Structural priors not found at {structural_entity_source} or {structural_relation_source}")
     
     base_lr = float(config.learning_rate)
     weight_decay = float(getattr(config, 'weight_decay', 0.0))

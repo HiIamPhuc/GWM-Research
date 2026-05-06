@@ -110,9 +110,9 @@ def main():
     
     metrics = pipeline_result.metric_results
     mrr = metrics.get_metric('mrr')
-    hits_at_1 = metrics.get_metric('hits_at_k', k=1)
-    hits_at_3 = metrics.get_metric('hits_at_k', k=3)
-    hits_at_10 = metrics.get_metric('hits_at_k', k=10)
+    hits_at_1 = metrics.get_metric('hits_at_1')
+    hits_at_3 = metrics.get_metric('hits_at_3')
+    hits_at_10 = metrics.get_metric('hits_at_10')
     
     print(f"\nFinal {args.model} Metrics:")
     print(f"  MRR:        {mrr:.4f}")

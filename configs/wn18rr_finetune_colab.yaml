@@ -1,10 +1,14 @@
 # Config for GWM-RNN-Text
 pretrained_model: bert-base-uncased
 num_layers: 2
+dynamics_layers: 2
 hidden_dim: 1024
 structural_dim: 384
 fusion_mode: gated
 dropout: 0.2
+recurrent_dropout: 0.2
+compgcn_layers: 1
+compgcn_op: sub
 loss: infonce
 temperature: 0.07
 
@@ -33,3 +37,5 @@ context_k: 5
 context_algorithm: random
 context_batch_size: 256
 context_mmr_lambda: 0.5
+
+max_length: 128

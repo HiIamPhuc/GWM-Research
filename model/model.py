@@ -48,22 +48,17 @@ class GWM(nn.Module):
         self.text_embedding_dim = self.text_encoder.config.hidden_size
 
         # 1. Structural Component
-        legacy_hidden_dim = int(getattr(config, 'hidden_dim', 768))
-        self.structural_dim = int(getattr(config, 'structural_dim', legacy_hidden_dim))
+        self.hidden_dim = int(getattr(config, 'hidden_dim', 768))
+        self.structural_dim = int(getattr(config, 'structural_dim'))
         self.entity_embeddings = nn.Embedding(config.num_entities, self.structural_dim)
         self.relation_embeddings = nn.Embedding(config.num_relations, self.structural_dim)
 
-        # Latent spaces
-        self.fusion_dim = int(getattr(config, 'fusion_dim', legacy_hidden_dim))
-        self.compgcn_dim = int(getattr(config, 'compgcn_dim', self.fusion_dim))
-        self.dynamics_dim = int(getattr(config, 'dynamics_dim', self.fusion_dim))
         self.dropout_rate = float(getattr(config, 'dropout', 0.0))
         self.recurrent_dropout = float(getattr(config, 'recurrent_dropout', 0.0))
 
         self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
-        self.spatial_projection = nn.Identity() if self.fusion_dim == self.compgcn_dim else nn.Linear(self.fusion_dim, self.compgcn_dim)
-        self.dynamics_projection = nn.Identity() if self.fusion_dim == self.dynamics_dim else nn.Linear(self.fusion_dim, self.dynamics_dim)
-        self.query_projection = nn.Identity() if self.dynamics_dim == self.fusion_dim else nn.Linear(self.dynamics_dim, self.fusion_dim)
+        self.dynamics_projection = nn.Identity()
+        self.query_projection = nn.Identity()
         
         # 2. Spatial Encoder (CompGCN)
         compgcn_layers = int(getattr(config, 'compgcn_layers', 1))
@@ -73,10 +68,11 @@ class GWM(nn.Module):
         ])
         
         # 3. Transition Dynamics (Standard single-step LSTM)
+        dynamics_layers = int(getattr(config, 'dynamics_layers', getattr(config, 'num_layers', 1)))
         self.lstm = nn.LSTM(
             input_size=self.dynamics_dim * 2,
             hidden_size=self.dynamics_dim,
-            num_layers=int(getattr(config, 'dynamics_layers', 1)),
+            num_layers=dynamics_layers,
             batch_first=True
         )
         self.recurrent_dropout_layer = nn.Dropout(self.recurrent_dropout) if self.recurrent_dropout > 0 else nn.Identity()
@@ -86,7 +82,7 @@ class GWM(nn.Module):
         
         # 4. Fusion Layer (Raw Preservation - Option A)
         self.fusion_mode = getattr(config, 'fusion_mode', 'concat')
-        self.fusion = nn.Linear(self.text_embedding_dim + self.structural_dim, self.fusion_dim)
+        self.fusion = nn.Linear(self.text_embedding_dim + self.structural_dim, self.hidden_dim)
 
         if self.fusion_mode == 'gated':
             self.gate = nn.Sequential(
@@ -95,7 +91,7 @@ class GWM(nn.Module):
                 nn.Linear(128, 1),
                 nn.Sigmoid()
             )
-            self.fusion_projection = nn.Linear(self.text_embedding_dim + self.structural_dim, self.fusion_dim)
+            self.fusion_projection = nn.Linear(self.text_embedding_dim + self.structural_dim, self.hidden_dim)
 
         self.reset_alpha_stats()
 
@@ -119,8 +115,19 @@ class GWM(nn.Module):
         if self.fusion_mode == 'gated':
             gate_input = torch.cat([text_emb, struct_emb], dim=-1)
             alpha = self.gate(gate_input)
+            # record raw alpha stats
             self._alpha_sum += alpha.detach().sum().item()
             self._alpha_count += alpha.numel()
+
+            # If the config provides a narrower permitted alpha range, map sigmoid output [0,1]
+            # into [gate_alpha_min, gate_alpha_max]. This keeps configs like
+            # `gate_alpha_min`/`gate_alpha_max` effective even when the gate is a Sigmoid.
+            if hasattr(self.config, 'gate_alpha_min') and hasattr(self.config, 'gate_alpha_max'):
+                amin = float(getattr(self.config, 'gate_alpha_min'))
+                amax = float(getattr(self.config, 'gate_alpha_max'))
+                if amax > amin:
+                    alpha = alpha * (amax - amin) + amin
+
             weighted_concat = torch.cat([alpha * text_emb, (1.0 - alpha) * struct_emb], dim=-1)
             return self.fusion_projection(weighted_concat)
 
@@ -190,23 +197,16 @@ class GWM(nn.Module):
         ctx_entity_fused = self._fuse_modalities(ctx_ent_text, ctx_ent_struct)
         ctx_relation_fused = self._fuse_modalities(ctx_rel_text, ctx_rel_struct)
 
-        h_spatial = self.spatial_projection(h_fused)
-        ctx_entity_spatial = self.spatial_projection(ctx_entity_fused)
-        ctx_relation_spatial = self.spatial_projection(ctx_relation_fused)
-
         # 4. Spatial Encoder
         world_state = self.input_dropout(self._encode_subgraph_with_compgcn(
-            h_spatial, ctx_entity_spatial, ctx_relation_spatial, context_batch_index
+            h_fused, ctx_entity_fused, ctx_relation_fused, context_batch_index
         ))
 
         # 5. Dynamics Single-step LSTM
         h_0 = torch.tanh(self.h0_projection(world_state))
         c_0 = torch.tanh(self.c0_projection(world_state))
         
-        step_x = self.dynamics_projection(h_fused)
-        rel_proj = self.dynamics_projection(r_fused)
-        
-        lstm_input = torch.cat([step_x, rel_proj], dim=-1).unsqueeze(1)
+        lstm_input = torch.cat([h_fused, r_fused], dim=-1).unsqueeze(1)
         h_0_lstm = h_0.unsqueeze(0).contiguous()
         c_0_lstm = c_0.unsqueeze(0).contiguous()
         

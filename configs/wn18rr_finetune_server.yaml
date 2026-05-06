@@ -1,16 +1,20 @@
 # Config for GWM-RNN-Text
 pretrained_model: sentence-transformers/all-MiniLM-L6-v2
 num_layers: 2
-hidden_dim: 1024
+dynamics_layers: 2
+hidden_dim: 768
 structural_dim: 384
 fusion_mode: gated
 dropout: 0.2
+recurrent_dropout: 0.2
 loss: infonce
 temperature: 0.07
+compgcn_layers: 1
+compgcn_op: mult
 
 num_epochs: 400
-learning_rate: 1e-4
-text_encoder_lr: 5e-5
+learning_rate: 5e-4
+text_encoder_lr: 1e-4
 weight_decay: 0.01
 use_scheduler: true
 warmup_ratio: 0.1
@@ -26,11 +30,11 @@ gate_alpha_min: 0.05
 gate_alpha_max: 0.95
 
 data_dir: data-processed/wn18rr
-output_dir: output/wn18rr_bert_finetune
+output_dir: output/wn18rr
     
 add_inverse: true
 context_k: 5
-context_algorithm: mmr_neighbor
+context_algorithm: random
 context_batch_size: 256
 context_mmr_lambda: 0.5
 

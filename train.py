@@ -260,6 +260,15 @@ def train(args):
                 desc="Encoding Validation Candidates",
             )
 
+            save_eval_predictions = bool(getattr(config, 'save_eval_predictions', False))
+            eval_topk = int(getattr(config, 'eval_topk', 50))
+            predictions_dir = getattr(config, 'eval_predictions_dir', None)
+            predictions_path = None
+            if save_eval_predictions:
+                if predictions_dir is None:
+                    predictions_dir = os.path.join(config.output_dir, 'predictions')
+                predictions_path = os.path.join(predictions_dir, f'val_epoch_{epoch + 1}.jsonl')
+
             val_metrics = compute_filtered_ranking_metrics(
                 model=model,
                 data_loader=valid_loader,
@@ -267,6 +276,8 @@ def train(args):
                 hr_map=hr_map,
                 device=device,
                 desc="Filtered Validation",
+                save_predictions_path=predictions_path,
+                topk=eval_topk,
             )
 
             val_mrr = val_metrics['MRR']

@@ -58,108 +58,116 @@ class GWM(nn.Module):
         self.entity_embeddings = nn.Embedding(config.num_entities, self.structural_dim)
         self.relation_embeddings = nn.Embedding(config.num_relations, self.structural_dim)
 
-        # Shared latent spaces separated by module role.
-        self.fusion_dim = int(getattr(config, 'fusion_dim', legacy_hidden_dim))
-        self.compgcn_dim = int(getattr(config, 'compgcn_dim', self.fusion_dim))
-        self.dynamics_dim = int(getattr(config, 'dynamics_dim', self.fusion_dim))
-        self.hyper_mlp_dim = int(getattr(config, 'hyper_mlp_dim', self.dynamics_dim))
+        # Keep each path in its native dimensionality unless explicitly overridden.
+        self.text_compgcn_dim = int(
+            getattr(config, 'text_compgcn_dim', getattr(config, 'compgcn_dim', self.text_embedding_dim))
+        )
+        self.struct_compgcn_dim = int(
+            getattr(config, 'struct_compgcn_dim', getattr(config, 'compgcn_dim', self.structural_dim))
+        )
+        self.text_dynamics_dim = int(
+            getattr(config, 'text_dynamics_dim', getattr(config, 'dynamics_dim', self.text_compgcn_dim))
+        )
+        self.struct_dynamics_dim = int(
+            getattr(config, 'struct_dynamics_dim', getattr(config, 'dynamics_dim', self.struct_compgcn_dim))
+        )
         self.dropout_rate = float(getattr(config, 'dropout', 0.0))
         self.recurrent_dropout = float(getattr(config, 'recurrent_dropout', 0.0))
 
         self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
-        self.spatial_projection = nn.Identity()
-        if self.fusion_dim != self.compgcn_dim:
-            self.spatial_projection = nn.Linear(self.fusion_dim, self.compgcn_dim)
 
-        self.dynamics_projection = nn.Identity()
-        if self.fusion_dim != self.dynamics_dim:
-            self.dynamics_projection = nn.Linear(self.fusion_dim, self.dynamics_dim)
+        # Learnable score-level fusion scalar
+        self.score_lambda = nn.Parameter(torch.tensor(0.5))
 
-        self.query_projection = nn.Identity()
-        if self.dynamics_dim != self.fusion_dim:
-            self.query_projection = nn.Linear(self.dynamics_dim, self.fusion_dim)
+        def _build_projection(in_dim, out_dim):
+            if in_dim == out_dim:
+                return nn.Identity()
+            return nn.Linear(in_dim, out_dim)
+
+        # Text Path Projections
+        self.text_spatial_projection = _build_projection(self.text_embedding_dim, self.text_compgcn_dim)
+        self.text_dynamics_projection = _build_projection(self.text_embedding_dim, self.text_dynamics_dim)
         
-        # 2. Spatial Encoder (Ego-centric CompGCN for subgraph context)
-        # The head node is the anchor, and messages are composed from
-        # (context entity, context relation) pairs.
+        # Struct Path Projections
+        self.struct_spatial_projection = _build_projection(self.structural_dim, self.struct_compgcn_dim)
+        self.struct_dynamics_projection = _build_projection(self.structural_dim, self.struct_dynamics_dim)
+
         compgcn_layers = int(getattr(config, 'compgcn_layers', 1))
-        self.compgcn_stack = nn.ModuleList(
-            [
-                CompGCNLayer(
-                    hidden_dim=self.compgcn_dim,
-                    comp_op=getattr(config, 'compgcn_op', 'sub'),
-                )
-                for _ in range(max(compgcn_layers, 1))
-            ]
-        )
         
-        # 3. Transition Dynamics (Standard PyTorch LSTM)
-        self.dynamics_mixer = nn.Sequential(
-            nn.Linear(self.dynamics_dim * 2, self.dynamics_dim * 2),
+        # 2. Text Spatial Encoder
+        self.text_compgcn_stack = nn.ModuleList([
+            CompGCNLayer(hidden_dim=self.text_compgcn_dim, comp_op=getattr(config, 'compgcn_op', 'sub'))
+            for _ in range(max(compgcn_layers, 1))
+        ])
+
+        # 3. Struct Spatial Encoder
+        self.struct_compgcn_stack = nn.ModuleList([
+            CompGCNLayer(hidden_dim=self.struct_compgcn_dim, comp_op=getattr(config, 'compgcn_op', 'sub'))
+            for _ in range(max(compgcn_layers, 1))
+        ])
+        
+        # 4. Text Transition Dynamics
+        self.text_dynamics_mixer = nn.Sequential(
+            nn.Linear(self.text_dynamics_dim * 2, self.text_dynamics_dim * 2),
             nn.GELU(),
-            nn.Linear(self.dynamics_dim * 2, self.dynamics_dim)
+            nn.Linear(self.text_dynamics_dim * 2, self.text_dynamics_dim)
         )
-        
-        self.lstm = nn.LSTM(
-            input_size=self.dynamics_dim,
-            hidden_size=self.dynamics_dim,
-            num_layers=int(getattr(config, 'dynamics_layers', 1)),
-            batch_first=True
+        self.text_lstm = nn.LSTM(
+            input_size=self.text_dynamics_dim, hidden_size=self.text_dynamics_dim,
+            num_layers=int(getattr(config, 'dynamics_layers', 1)), batch_first=True
         )
+        self.text_h0_projection = _build_projection(self.text_compgcn_dim, self.text_dynamics_dim)
+        self.text_c0_projection = _build_projection(self.text_compgcn_dim, self.text_dynamics_dim)
+
+        # 5. Struct Transition Dynamics
+        self.struct_dynamics_mixer = nn.Sequential(
+            nn.Linear(self.struct_dynamics_dim * 2, self.struct_dynamics_dim * 2),
+            nn.GELU(),
+            nn.Linear(self.struct_dynamics_dim * 2, self.struct_dynamics_dim)
+        )
+        self.struct_lstm = nn.LSTM(
+            input_size=self.struct_dynamics_dim, hidden_size=self.struct_dynamics_dim,
+            num_layers=int(getattr(config, 'dynamics_layers', 1)), batch_first=True
+        )
+        self.struct_h0_projection = _build_projection(self.struct_compgcn_dim, self.struct_dynamics_dim)
+        self.struct_c0_projection = _build_projection(self.struct_compgcn_dim, self.struct_dynamics_dim)
+
         self.recurrent_dropout_layer = nn.Dropout(self.recurrent_dropout) if self.recurrent_dropout > 0 else nn.Identity()
-        
-        self.h0_projection = nn.Linear(self.compgcn_dim, self.dynamics_dim)
-        self.c0_projection = nn.Linear(self.compgcn_dim, self.dynamics_dim)
-        
-        # 4. Fusion Layer
-        self.fusion_mode = config.fusion_mode
-
-        # Legacy/default path: concat(text, struct) -> linear
-        self.fusion = nn.Linear(self.text_embedding_dim + self.structural_dim, self.fusion_dim)
-
-        # Dynamic gating path: learn sample-wise interpolation between raw text and structure vectors.
-        if self.fusion_mode == 'gated':
-            # gate reads original unprojected dimensions to compute scalar alpha
-            self.gate = nn.Sequential(
-                nn.Linear(self.text_embedding_dim + self.structural_dim, 128),
-                nn.ReLU(),
-                nn.Linear(128, 1),
-                nn.Sigmoid()
-            )
-            # After weighted concatenation, project to fusion_dim
-            self.fusion_projection = nn.Linear(self.text_embedding_dim + self.structural_dim, self.fusion_dim)
-
-        # Running alpha stats for lightweight diagnostics.
-        self.reset_alpha_stats()
 
         # Precomputed text cache loaded from preprocessing artifacts.
         self.cached_entity_text_emb = None
         self.cached_relation_text_emb = None
         self.use_text_cache = False
 
-    def _encode_subgraph_with_compgcn(self, h_fused, ctx_entity_fused, ctx_relation_fused, ctx_batch_index):
-        """
-        Encode ego-centric subgraph context using CompGCN-style composition.
-        
-        Args:
-            h_fused: (B, H) fused head embedding (anchor node)
-            ctx_entity_fused: (E, H) fused context entity embeddings
-            ctx_relation_fused: (E, H) fused context relation embeddings
-            ctx_batch_index: (E,) long, edge -> head index in batch
-        
-        Returns:
-            compgcn_output: (B, H) updated head representation
-        """
-        h_state = h_fused
-        for layer in self.compgcn_stack:
+    def _encode_subgraph_with_compgcn(self, h_emb, ctx_entity_emb, ctx_relation_emb, ctx_batch_index, compgcn_stack):
+        h_state = h_emb
+        for layer in compgcn_stack:
             h_state = layer(
                 head_feat=h_state,
-                nbr_entity_feat=ctx_entity_fused,
-                nbr_relation_feat=ctx_relation_fused,
+                nbr_entity_feat=ctx_entity_emb,
+                nbr_relation_feat=ctx_relation_emb,
                 nbr_batch_index=ctx_batch_index,
             )
         return h_state
- 
+
+    def _run_dynamics(self, world_state, step_x, relation_emb, mixer, lstm, h0_proj, c0_proj):
+        h_0 = torch.tanh(h0_proj(world_state))
+        c_0 = torch.tanh(c0_proj(world_state))
+        
+        concat_input = torch.cat([step_x, relation_emb], dim=-1)
+        mixed_input = mixer(concat_input)
+        lstm_input = mixed_input.unsqueeze(1)
+        
+        num_layers = lstm.num_layers
+        h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
+        c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
+        
+        lstm_out, (h_n, c_n) = lstm(lstm_input, (h_0_lstm, c_0_lstm))
+        query_vector = h_n[-1]
+        query_vector = self.recurrent_dropout_layer(query_vector)
+        
+        return torch.nn.functional.normalize(query_vector, p=2, dim=1)
+
     def _load_embedding_tensor(self, source, expected_rows, name):
         if isinstance(source, str):
             loaded = torch.load(source, map_location='cpu')
@@ -271,81 +279,31 @@ class GWM(nn.Module):
             selected = selected.to(ids.device)
         return selected.reshape(*original_shape, -1)
 
-    def reset_alpha_stats(self):
-        self._alpha_sum = 0.0
-        self._alpha_count = 0
-
     def get_alpha_mean(self, reset=False):
-        if self.fusion_mode != 'gated' or self._alpha_count == 0:
-            alpha_mean = None
-        else:
-            alpha_mean = self._alpha_sum / self._alpha_count
+        return torch.sigmoid(self.score_lambda).item()
 
-        if reset:
-            self.reset_alpha_stats()
-
-        return alpha_mean
-
-    def _fuse_modalities(self, text_emb, struct_emb):
-        text_emb = self.input_dropout(text_emb)
-        struct_emb = self.input_dropout(struct_emb)
-
-        if self.fusion_mode == 'gated':
-            # Compute scalar gate on concatenated original (unprojected) vectors
-            gate_input = torch.cat([text_emb, struct_emb], dim=-1)
-            alpha = self.gate(gate_input)
-            alpha_detached = alpha.detach()
-            self._alpha_sum += alpha_detached.sum().item()
-            self._alpha_count += alpha_detached.numel()
-            # Preserve raw text/structure by weighting and concatenating
-            weighted_concat = torch.cat([alpha * text_emb, (1.0 - alpha) * struct_emb], dim=-1)
-            # Project the weighted concat to fusion_dim
-            return self.fusion_projection(weighted_concat)
-
-        # Backward-compatible concat fusion
-        return self.fusion(torch.cat([text_emb, struct_emb], dim=-1))
-        
     def forward(self, h_batch, r_batch, context_batch):
-        """
-        Forward pass for a batch of triples.
-        h_batch: dict {id}
-        r_batch: dict {id}
-        context_batch: dict {id}
-          - id: (B, K)
-        
-        World-Model Hyper-Dynamics Paradigm:
-        - Encode ego-centric subgraph context with CompGCN -> (B, H)
-        - Use relation embedding as dynamic program via Hyper-LSTM
-        - Run one transition step from world_state
-        - Use final LSTM hidden state as query vector
-        """
         if not self.use_text_cache:
-            raise RuntimeError(
-                "Text cache is not built. Call load_precomputed_text_embedding_cache before training/inference."
-            )
+            raise RuntimeError('Text cache is not built. Call load_precomputed_text_embedding_cache before training/inference.')
 
         h_emb_text = self._lookup_cached_text(h_batch['id'], kind='entity')
         r_emb_text = self._lookup_cached_text(r_batch['id'], kind='relation')
         
         # Structural Embeddings
-        h_struct = self.entity_embeddings(h_batch['id']) # (B, H)
-        r_struct = self.relation_embeddings(r_batch['id']) # (B, H)
+        h_struct = self.entity_embeddings(h_batch['id'])
+        r_struct = self.relation_embeddings(r_batch['id'])
 
-        # Main Fusion
-        h_fused = self._fuse_modalities(h_emb_text, h_struct) # (B, H)
-        r_fused = self._fuse_modalities(r_emb_text, r_struct) # (B, H)
-        h_fused = self.input_dropout(h_fused)
-        r_fused = self.input_dropout(r_fused)
+        h_emb_text = self.input_dropout(h_emb_text)
+        r_emb_text = self.input_dropout(r_emb_text)
+        h_struct = self.input_dropout(h_struct)
+        r_struct = self.input_dropout(r_struct)
         
-        # Context (entity+relation neighbor edges around head)
-        # Ragged format: flattened edges with batch index (no padding).
-        context_entity_ids = context_batch['id']  # (E,) or legacy (B, K)
+        context_entity_ids = context_batch['id']
         context_relation_ids = context_batch.get('rel_id')
         context_batch_index = context_batch.get('batch_index')
         context_mask = context_batch.get('mask')
 
         if context_entity_ids.dim() == 2:
-            # Legacy padded format fallback.
             B, K = context_entity_ids.shape
             if context_relation_ids is None:
                 context_relation_ids = torch.zeros_like(context_entity_ids)
@@ -372,96 +330,79 @@ class GWM(nn.Module):
             if context_batch_index is None:
                 raise ValueError("context_batch['batch_index'] is required for ragged context format.")
 
-        ctx_ent_text = self._lookup_cached_text(flat_context_entity_ids, kind='entity') # (E, H)
-        ctx_ent_struct = self.entity_embeddings(flat_context_entity_ids) # (E, H)
-        ctx_rel_text = self._lookup_cached_text(flat_context_relation_ids, kind='relation') # (E, H)
-        ctx_rel_struct = self.relation_embeddings(flat_context_relation_ids) # (E, H)
+        ctx_ent_text = self._lookup_cached_text(flat_context_entity_ids, kind='entity')
+        ctx_ent_struct = self.entity_embeddings(flat_context_entity_ids)
+        ctx_rel_text = self._lookup_cached_text(flat_context_relation_ids, kind='relation')
+        ctx_rel_struct = self.relation_embeddings(flat_context_relation_ids)
 
-        # Fuse Context Entity/Relation modalities
-        ctx_entity_fused = self._fuse_modalities(ctx_ent_text, ctx_ent_struct) # (E, H)
-        ctx_relation_fused = self._fuse_modalities(ctx_rel_text, ctx_rel_struct) # (E, H)
+        h_spatial_text = self.text_spatial_projection(h_emb_text)
+        ctx_entity_spatial_text = self.text_spatial_projection(ctx_ent_text)
+        ctx_relation_spatial_text = self.text_spatial_projection(ctx_rel_text)
 
-        h_spatial = self.spatial_projection(h_fused)
-        ctx_entity_spatial = self.spatial_projection(ctx_entity_fused)
-        ctx_relation_spatial = self.spatial_projection(ctx_relation_fused)
+        h_spatial_struct = self.struct_spatial_projection(h_struct)
+        ctx_entity_spatial_struct = self.struct_spatial_projection(ctx_ent_struct)
+        ctx_relation_spatial_struct = self.struct_spatial_projection(ctx_rel_struct)
 
-        # SPATIAL ENCODER: Ego-centric CompGCN update of the head state.
-        world_state = self._encode_subgraph_with_compgcn(
-            h_fused=h_spatial,
-            ctx_entity_fused=ctx_entity_spatial,
-            ctx_relation_fused=ctx_relation_spatial,
-            ctx_batch_index=context_batch_index,
-        )  # (B, H)
-        world_state = self.input_dropout(world_state)
+        # -- Text Pathway --
+        world_state_text = self._encode_subgraph_with_compgcn(
+            h_spatial_text, ctx_entity_spatial_text, ctx_relation_spatial_text,
+            context_batch_index, self.text_compgcn_stack
+        )
+        world_state_text = self.input_dropout(world_state_text)
+        
+        step_x_text = self.text_dynamics_projection(h_emb_text)
+        relation_emb_text = self.text_dynamics_projection(r_emb_text)
+        
+        query_text = self._run_dynamics(
+            world_state_text, step_x_text, relation_emb_text,
+            self.text_dynamics_mixer, self.text_lstm, self.text_h0_projection, self.text_c0_projection
+        )
 
-        # TRANSITION DYNAMICS:
-        # - world_state initializes recurrent memory
-        # - head_fused is the first (and only) input step
-        h_0 = torch.tanh(self.h0_projection(world_state))
-        c_0 = torch.tanh(self.c0_projection(world_state))
+        # -- Struct Pathway --
+        world_state_struct = self._encode_subgraph_with_compgcn(
+            h_spatial_struct, ctx_entity_spatial_struct, ctx_relation_spatial_struct,
+            context_batch_index, self.struct_compgcn_stack
+        )
+        world_state_struct = self.input_dropout(world_state_struct)
         
-        step_x = self.dynamics_projection(h_fused)
-        relation_emb = self.dynamics_projection(r_fused)
+        step_x_struct = self.struct_dynamics_projection(h_struct)
+        relation_emb_struct = self.struct_dynamics_projection(r_struct)
         
-        concat_input = torch.cat([step_x, relation_emb], dim=-1) # (B, 2H)
-        mixed_input = self.dynamics_mixer(concat_input)          # (B, H)
-        lstm_input = mixed_input.unsqueeze(1)                    # (B, 1, H)
-        
-        # LSTM expects hidden state shapes: (num_layers, B, H).
-        # We broadcast the initialized h_0 and c_0 across all LSTM layers.
-        num_layers = self.lstm.num_layers
-        h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous() # (num_layers, B, H)
-        c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous() # (num_layers, B, H)
-        
-        lstm_out, (h_n, c_n) = self.lstm(lstm_input, (h_0_lstm, c_0_lstm))
-        # Extract the hidden state from the last LSTM layer
-        query_vector = h_n[-1] # (B, H)
-        query_vector = self.recurrent_dropout_layer(query_vector)
-        
-        # Project back to the fused comparison space only when the spaces differ.
-        query_vector = self.query_projection(query_vector)
-        
-        # Ensure normalization for cosine similarity / InfoNCE
-        query_vector = torch.nn.functional.normalize(query_vector, p=2, dim=1)
-        
-        return query_vector
+        query_struct = self._run_dynamics(
+            world_state_struct, step_x_struct, relation_emb_struct,
+            self.struct_dynamics_mixer, self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection
+        )
+
+        return query_text, query_struct
 
     def encode_target(self, t_batch):
-        """
-        Encode target/tail entities symmetrically (Fusion of Text + Structure).
-        t_batch: dict {id}
-        Returns: (B, H) normalized fused embedding
-        """
         if not self.use_text_cache:
-            raise RuntimeError(
-                "Text cache is not built. Call load_precomputed_text_embedding_cache before training/inference."
-            )
+            raise RuntimeError('Text cache is not built. Call load_precomputed_text_embedding_cache before training/inference.')
 
         t_emb_text = self._lookup_cached_text(t_batch['id'], kind='entity')
         t_struct = self.entity_embeddings(t_batch['id'])
         
-        t_fused = self._fuse_modalities(t_emb_text, t_struct)
+        t_text_proj = self.text_dynamics_projection(t_emb_text)
+        t_struct_proj = self.struct_dynamics_projection(t_struct)
         
-        return torch.nn.functional.normalize(t_fused, p=2, dim=1)
+        t_text_norm = torch.nn.functional.normalize(t_text_proj, p=2, dim=1)
+        t_struct_norm = torch.nn.functional.normalize(t_struct_proj, p=2, dim=1)
+        return t_text_norm, t_struct_norm
 
-    def compute_loss(self, query_vector, t_fused):
-        """
-        InfoNCE Loss with In-Batch Negatives.
-        query_vector: (B, H) - Normalized query embeddings
-        t_fused: (B, H) - Normalized target/tail embeddings (Symmetric Fusion)
-        """
-        # Cosine Similarity
-        # (B, B)
-        # score[i, j] = sim(query[i], tail[j])
-        scores = torch.mm(query_vector, t_fused.t())
+    def compute_loss(self, query_vectors, target_vectors):
+        query_text, query_struct = query_vectors
+        target_text, target_struct = target_vectors
+
+        scores_text = torch.mm(query_text, target_text.t())
+        scores_struct = torch.mm(query_struct, target_struct.t())
         
-        # Temperature
-        if hasattr(self.config, 'temperature'):
-            scores /= self.config.temperature
-        else:
-            scores /= 0.07
+        temp = getattr(self.config, 'temperature', 0.07)
+        scores_text /= temp
+        scores_struct /= temp
         
-        # Labels: diagonal are positives
+        # Score Level Fusion
+        alpha = torch.sigmoid(self.score_lambda)
+        scores = alpha * scores_text + (1.0 - alpha) * scores_struct
+        
         labels = torch.arange(scores.size(0), device=scores.device)
-        
         return nn.CrossEntropyLoss()(scores, labels), scores

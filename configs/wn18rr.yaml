@@ -2,16 +2,14 @@
 text_embedding_dim: 768
 structural_dim: 384
 
-fusion_dim: 1024
-fusion_mode: gated
-
-compgcn_dim: 1024
+text_compgcn_dim: 768
+struct_compgcn_dim: 384
 compgcn_layers: 1
 compgcn_op: mult
 
-dynamics_dim: 1024
+text_dynamics_dim: 768
+struct_dynamics_dim: 384
 dynamics_layers: 2
-h0c0_dim: 1024
 
 dropout: 0.2
 recurrent_dropout: 0.2
@@ -44,3 +42,7 @@ device: cuda
 seed: 42
 
 text_cache_device: cpu
+
+save_eval_predictions: true
+eval_topk: 10
+eval_predictions_dir: output/wn18rr/predictions

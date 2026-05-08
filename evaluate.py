@@ -99,7 +99,7 @@ def evaluate(args):
         device=device,
         desc="Encoding Entities",
     )
-    print(f"Encoded {all_entity_embeddings.size(0)} entities.")
+    print(f"Encoded {all_entity_embeddings[0].size(0)} entities.")
 
     # 3. Evaluation Loop
     split = 'test'

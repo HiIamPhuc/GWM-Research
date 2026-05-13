@@ -26,11 +26,11 @@ max_grad_norm: 1.0
 
 # Training
 num_epochs: 200
-batch_size: 32
+batch_size: 128
 early_stopping_patience: 10
 eval_every: 1
-eval_batch_size: 32
-candidate_batch_size: 32
+eval_batch_size: 128
+candidate_batch_size: 128
 
 # Data + output
 data_dir: data-processed/wn18rr

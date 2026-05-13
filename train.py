@@ -106,6 +106,23 @@ def train(args):
     # Init Model
     print("Initializing model...")
     model = GWM(config).to(device)
+
+    structural_entity_source = os.path.join(config.data_dir, 'structural_entities.pt')
+    structural_relation_source = os.path.join(config.data_dir, 'structural_relations.pt')
+
+    if os.path.exists(structural_entity_source) and os.path.exists(structural_relation_source):
+        freeze_structural = bool(getattr(config, 'freeze_structural_priors', False))
+        print("Loading precomputed structural priors...")
+        model.load_precomputed_structural_cache(
+            entity_source=structural_entity_source,
+            relation_source=structural_relation_source,
+            freeze=freeze_structural,
+        )
+    else:
+        print(
+            "Warning: Structural priors not found; using randomly initialized structural embeddings."
+        )
+
     print_model_parameter_info(model)
     
     # Collater
@@ -120,16 +137,22 @@ def train(args):
         drop_last=True # Important for In-Batch Negatives stability
     )
 
-    # Use separate learning rates for encoder/non-encoder params to stabilize finetuning.
+    # Use separate learning rates for LoRA/text encoder, structural embeddings, and the rest.
     base_lr = float(config.learning_rate)
     text_encoder_lr = float(getattr(config, 'text_encoder_lr', base_lr * 0.1))
+    structural_lr = float(getattr(config, 'structural_lr', base_lr * 0.1))
     weight_decay = float(getattr(config, 'weight_decay', 0.01))
     max_grad_norm = float(getattr(config, 'max_grad_norm', 1.0))
+
+    structural_params = [model.entity_embeddings.weight, model.relation_embeddings.weight]
+    structural_param_ids = {id(p) for p in structural_params}
 
     text_encoder_params = []
     other_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
+            continue
+        if id(param) in structural_param_ids:
             continue
         if name.startswith('text_encoder.'):
             text_encoder_params.append(param)
@@ -142,21 +165,32 @@ def train(args):
             'params': text_encoder_params,
             'lr': text_encoder_lr,
             'weight_decay': weight_decay,
+            'name': 'text_encoder',
+        })
+    if structural_params:
+        param_groups.append({
+            'params': structural_params,
+            'lr': structural_lr,
+            'weight_decay': weight_decay,
+            'name': 'structural',
         })
     if other_params:
         param_groups.append({
             'params': other_params,
             'lr': base_lr,
             'weight_decay': weight_decay,
+            'name': 'base',
         })
 
     optimizer = torch.optim.AdamW(param_groups)
 
     text_encoder_param_count = sum(param.numel() for param in text_encoder_params)
+    structural_param_count = sum(param.numel() for param in structural_params)
     other_param_count = sum(param.numel() for param in other_params)
     print(
         "Optimizer parameter groups: "
         f"text_encoder={_format_param_count(text_encoder_param_count)} ({text_encoder_param_count:,}), "
+        f"structural={_format_param_count(structural_param_count)} ({structural_param_count:,}), "
         f"others={_format_param_count(other_param_count)} ({other_param_count:,})"
     )
 
@@ -256,12 +290,14 @@ def train(args):
                 scheduler.step()
             
             total_loss += loss.item()
-            current_non_encoder_lr = optimizer.param_groups[-1]['lr']
-            current_text_encoder_lr = optimizer.param_groups[0]['lr'] if text_encoder_params else current_non_encoder_lr
+            lr_report = {}
+            for group in optimizer.param_groups:
+                name = group.get('name', 'group')
+                lr_report[name] = f"{group['lr']:.2e}"
+
             pbar.set_postfix({
                 'loss': loss.item(),
-                'lr': f"{current_non_encoder_lr:.2e}",
-                'text_lr': f"{current_text_encoder_lr:.2e}",
+                **lr_report,
             })
             
         avg_train_loss = total_loss / len(train_loader)

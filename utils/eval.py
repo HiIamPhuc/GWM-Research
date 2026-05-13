@@ -89,18 +89,27 @@ def build_entity_loader(model, data_dir, batch_size, num_workers=2, max_length=6
 
 
 def encode_all_entities_as_targets(model, entity_loader, device, desc="Encoding Entities"):
-    all_chunks = []
+    all_text_chunks = []
+    all_struct_chunks = []
     model.eval()
     with torch.no_grad():
         for batch in tqdm(entity_loader, desc=desc):
             batch = {k: v.to(device) for k, v in batch.items()}
-            all_chunks.append(model.encode_target(batch).cpu())
-    return torch.cat(all_chunks, dim=0).to(device)
+            text_emb, struct_emb = model.encode_target(batch)
+            all_text_chunks.append(text_emb.cpu())
+            all_struct_chunks.append(struct_emb.cpu())
+    return (
+        torch.cat(all_text_chunks, dim=0).to(device),
+        torch.cat(all_struct_chunks, dim=0).to(device)
+    )
 
 
 def compute_filtered_ranking_metrics(model, data_loader, all_entity_embeddings, hr_map, device, desc="Filtered Ranking"):
     hits1, hits3, hits10, mrr, mr = 0, 0, 0, 0.0, 0.0
     total = 0
+
+    all_text, all_struct = all_entity_embeddings
+    alpha = torch.sigmoid(model.score_lambda).item()
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc=desc):
@@ -112,8 +121,10 @@ def compute_filtered_ranking_metrics(model, data_loader, all_entity_embeddings, 
             h_ids = batch['h_batch']['id'].cpu().numpy()
             r_ids = batch['r_batch']['id'].cpu().numpy()
 
-            query_vector = model(h_batch, r_batch, context_batch)
-            scores = torch.mm(query_vector, all_entity_embeddings.t())
+            q_text, q_struct = model(h_batch, r_batch, context_batch)
+            scores_text = torch.mm(q_text, all_text.t())
+            scores_struct = torch.mm(q_struct, all_struct.t())
+            scores = alpha * scores_text + (1.0 - alpha) * scores_struct
 
             for i in range(scores.size(0)):
                 h_id = h_ids[i]

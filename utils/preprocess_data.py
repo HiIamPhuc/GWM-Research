@@ -3,7 +3,14 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
-from transformers import AutoModel, AutoTokenizer
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForMaskedLM, AutoTokenizer
+
+try:
+    from peft import LoraConfig, get_peft_model
+except ImportError:
+    LoraConfig = None
+    get_peft_model = None
 
 def load_triples(file_path):
     """Load triples from a text file."""
@@ -137,6 +144,70 @@ def process_text_wn18rr(data_dir, entity2id, relation2id):
             
     return entity_text, relation_text
 
+class _TextDataset(Dataset):
+    def __init__(self, texts):
+        self.texts = texts
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        return self.texts[idx]
+
+
+def _get_base_model(model):
+    if hasattr(model, 'base_model'):
+        return model.base_model
+    base_prefix = getattr(model, 'base_model_prefix', None)
+    if base_prefix and hasattr(model, base_prefix):
+        return getattr(model, base_prefix)
+    return model
+
+
+def _train_lora_adapter(
+    model,
+    tokenizer,
+    texts,
+    device,
+    max_length,
+    batch_size,
+    epochs,
+    lr,
+    mlm_probability,
+):
+    from transformers import DataCollatorForLanguageModeling
+
+    dataset = _TextDataset(texts)
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=True,
+        mlm_probability=mlm_probability,
+    )
+
+    def _collate(batch):
+        encoded = tokenizer(
+            batch,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors='pt',
+        )
+        return collator(encoded)
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=_collate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    model.train()
+    for epoch in range(epochs):
+        for batch in tqdm(loader, desc=f"LoRA MLM epoch {epoch + 1}/{epochs}", leave=False):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+
 def precompute_text_embeddings(
     entity_text_dict,
     relation_text_dict,
@@ -147,6 +218,15 @@ def precompute_text_embeddings(
     max_entity_length=256,
     max_relation_length=64,
     device=None,
+    lora_pretrain=False,
+    lora_rank=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    lora_target_modules=None,
+    lora_epochs=1,
+    lora_lr=5e-5,
+    lora_mlm_probability=0.15,
+    lora_output_dir=None,
 ):
     """
     Encode entity/relation text once and return dense embedding tensors.
@@ -155,8 +235,46 @@ def precompute_text_embeddings(
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
 
+    if lora_pretrain and (LoraConfig is None or get_peft_model is None):
+        raise RuntimeError(
+            "peft is required for LoRA. Install with: pip install peft"
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
-    text_encoder = AutoModel.from_pretrained(pretrained_model).to(device)
+    text_encoder = AutoModelForMaskedLM.from_pretrained(pretrained_model).to(device)
+
+    if lora_target_modules is None:
+        lora_target_modules = ["query", "value"]
+
+    if lora_pretrain:
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=lora_target_modules,
+            bias="none",
+            task_type="FEATURE_EXTRACTION",
+        )
+        text_encoder = get_peft_model(text_encoder, lora_config)
+
+        all_texts = list(entity_text_dict.values()) + list(relation_text_dict.values())
+        max_length = max(max_entity_length, max_relation_length)
+        _train_lora_adapter(
+            model=text_encoder,
+            tokenizer=tokenizer,
+            texts=all_texts,
+            device=device,
+            max_length=max_length,
+            batch_size=batch_size,
+            epochs=lora_epochs,
+            lr=lora_lr,
+            mlm_probability=lora_mlm_probability,
+        )
+
+        if lora_output_dir is not None:
+            Path(lora_output_dir).mkdir(parents=True, exist_ok=True)
+            text_encoder.save_pretrained(lora_output_dir)
+
     text_encoder.eval()
 
     def encode_ordered_texts(text_dict, size, max_length, desc):
@@ -173,7 +291,8 @@ def precompute_text_embeddings(
                     return_tensors='pt',
                 )
                 encoded = {k: v.to(device) for k, v in encoded.items()}
-                outputs = text_encoder(**encoded)
+                base_model = _get_base_model(text_encoder)
+                outputs = base_model(**encoded)
                 all_emb.append(outputs.last_hidden_state[:, 0, :].detach().cpu())
         return torch.cat(all_emb, dim=0).contiguous()
 
@@ -206,6 +325,14 @@ def process_dataset(
     max_entity_length=256,
     max_relation_length=64,
     text_device=None,
+    lora_pretrain=False,
+    lora_rank=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    lora_target_modules=None,
+    lora_epochs=1,
+    lora_lr=5e-5,
+    lora_mlm_probability=0.15,
 ):
     """
     Process raw dataset into training files.
@@ -280,6 +407,15 @@ def process_dataset(
         max_entity_length=max_entity_length,
         max_relation_length=max_relation_length,
         device=text_device,
+        lora_pretrain=lora_pretrain,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        lora_target_modules=lora_target_modules,
+        lora_epochs=lora_epochs,
+        lora_lr=lora_lr,
+        lora_mlm_probability=lora_mlm_probability,
+        lora_output_dir=str(Path(output_dir) / "lora_adapter") if lora_pretrain else None,
     )
 
     torch.save(
@@ -340,7 +476,19 @@ if __name__ == '__main__':
     parser.add_argument('--max_entity_length', type=int, default=256)
     parser.add_argument('--max_relation_length', type=int, default=64)
     parser.add_argument('--text_device', type=str, default=None, help='cpu or cuda; defaults to auto')
+    parser.add_argument('--lora_pretrain', action='store_true')
+    parser.add_argument('--lora_rank', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_dropout', type=float, default=0.05)
+    parser.add_argument('--lora_target_modules', type=str, default=None, help='Comma-separated module names')
+    parser.add_argument('--lora_epochs', type=int, default=1)
+    parser.add_argument('--lora_lr', type=float, default=5e-5)
+    parser.add_argument('--lora_mlm_probability', type=float, default=0.15)
     args = parser.parse_args()
+
+    target_modules = None
+    if args.lora_target_modules:
+        target_modules = [m.strip() for m in args.lora_target_modules.split(',') if m.strip()]
     
     process_dataset(
         data_dir=args.data_dir,
@@ -351,4 +499,12 @@ if __name__ == '__main__':
         max_entity_length=args.max_entity_length,
         max_relation_length=args.max_relation_length,
         text_device=args.text_device,
+        lora_pretrain=args.lora_pretrain,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=target_modules,
+        lora_epochs=args.lora_epochs,
+        lora_lr=args.lora_lr,
+        lora_mlm_probability=args.lora_mlm_probability,
     )

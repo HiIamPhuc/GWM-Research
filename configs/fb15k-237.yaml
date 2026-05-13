@@ -22,6 +22,7 @@ grad_clip_norm: 1.0
 num_epochs: 400
 early_stopping_patience: 15
 eval_every: 1
+structural_lr_scale: 0.2
 
 batch_size: 2048
 eval_batch_size: 2048

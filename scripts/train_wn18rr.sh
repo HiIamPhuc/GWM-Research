@@ -1,13 +1,20 @@
 #!/bin/bash
-# Train GWM-RNN with Text Finetuning
+#!/bin/bash
+set -euo pipefail
 
-python ../utils/preprocess_data.py \
-    --data_dir d:/NLP research/Code/graph-world-models/GWM-Research/data/WN18RR \
-    --output_dir d:/NLP research/Code/graph-world-models/GWM-Research/data/processed/wn18rr
-    
-python ../utils/compute_context.py \
-    --data_dir d:/NLP research/Code/graph-world-models/GWM-Research/data/processed/wn18rr \
-    --k 10
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PROJECT_ROOT
+export CONFIG_PATH="configs/wn18rr_finetune_server.yaml"
+export RAW_DATA_DIR="data/WN18RR"
+export DATASET_NAME="wn18rr"
 
-python ../train.py \
-    --config d:/NLP research/Code/graph-world-models/GWM-Research/configs/wn18rr_finetune.yaml
+export RUN_PREPROCESS=1
+export RUN_CONTEXT=1
+export RUN_STRUCTURAL=1
+export RUN_TRAIN=1
+export RUN_EVAL=1
+
+export STRUCT_MODEL="RotatE"
+export STRUCT_EPOCHS=50
+
+bash "$PROJECT_ROOT/scripts/run.sh"

@@ -29,8 +29,13 @@ export CONDA_ENV_NAME="gwm"
 # Optional stage toggles: set to 0 to skip a stage.
 export RUN_PREPROCESS=1
 export RUN_CONTEXT=1
+export RUN_STRUCTURAL=1
 export RUN_TRAIN=1
 export RUN_EVAL=1
+
+# Structural prior training parameters (override as needed).
+export STRUCT_MODEL="RotatE"
+export STRUCT_EPOCHS=200
 
 export CACHE_ROOT="/media/vhviet03/.cache/gwm"
 

@@ -264,6 +264,10 @@ class GWM(nn.Module):
         context_mask = context_batch.get('mask')
 
         if context_entity_ids.dim() == 2:
+            batch_size, context_size = context_entity_ids.shape
+            seq_len = ctx_input_ids.size(-1)
+            ctx_input_ids = ctx_input_ids.reshape(batch_size, context_size, seq_len)
+            ctx_attention_mask = ctx_attention_mask.reshape(batch_size, context_size, seq_len)
             if context_mask is None:
                 context_mask = torch.ones_like(context_entity_ids, dtype=torch.bool)
             else:

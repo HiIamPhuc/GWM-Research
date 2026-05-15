@@ -109,8 +109,6 @@ def compute_filtered_ranking_metrics(model, data_loader, all_entity_embeddings, 
     total = 0
 
     all_text, all_struct = all_entity_embeddings
-    alpha = torch.sigmoid(model.score_lambda).item()
-
     with torch.no_grad():
         for batch in tqdm(data_loader, desc=desc):
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
@@ -124,6 +122,8 @@ def compute_filtered_ranking_metrics(model, data_loader, all_entity_embeddings, 
             q_text, q_struct = model(h_batch, r_batch, context_batch)
             scores_text = torch.mm(q_text, all_text.t())
             scores_struct = torch.mm(q_struct, all_struct.t())
+            head_combined = torch.cat([q_text, q_struct], dim=-1)
+            alpha = model.alpha_mlp(head_combined)
             scores = alpha * scores_text + (1.0 - alpha) * scores_struct
 
             for i in range(scores.size(0)):

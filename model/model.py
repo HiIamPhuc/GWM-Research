@@ -79,7 +79,14 @@ class GWM(nn.Module):
         self.recurrent_dropout = float(getattr(config, 'recurrent_dropout', 0.0))
         self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
 
-        self.score_lambda = nn.Parameter(torch.tensor(0.5))
+        self.alpha_mlp = nn.Sequential(
+            nn.Linear(self.text_dynamics_dim + self.struct_dynamics_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+        self._alpha_sum = 0.0
+        self._alpha_count = 0
 
         self.text_spatial_projection = self._build_projection(self.text_embedding_dim, self.text_compgcn_dim)
         self.struct_spatial_projection = self._build_projection(self.structural_dim, self.struct_compgcn_dim)
@@ -227,7 +234,7 @@ class GWM(nn.Module):
 
     def _run_dynamics(self, world_state, step_x, relation_emb, mixer, lstm, h0_proj, c0_proj):
         h_0 = torch.tanh(h0_proj(world_state))
-        c_0 = torch.tanh(c0_proj(world_state))
+        c_0 = c0_proj(world_state)
 
         concat_input = torch.cat([step_x, relation_emb], dim=-1)
         mixed_input = mixer(concat_input)
@@ -243,8 +250,21 @@ class GWM(nn.Module):
 
         return torch.nn.functional.normalize(query_vector, p=2, dim=1)
 
+    def reset_alpha_stats(self):
+        self._alpha_sum = 0.0
+        self._alpha_count = 0
+
+    def _record_alpha(self, alpha):
+        self._alpha_sum += alpha.sum().item()
+        self._alpha_count += alpha.numel()
+
     def get_alpha_mean(self, reset=False):
-        return torch.sigmoid(self.score_lambda).item()
+        if self._alpha_count == 0:
+            return None
+        mean = self._alpha_sum / self._alpha_count
+        if reset:
+            self.reset_alpha_stats()
+        return mean
 
     def forward(self, h_batch, r_batch, context_batch):
         h_emb_text = self._encode_text(h_batch['input_ids'], h_batch['attention_mask'])
@@ -261,6 +281,8 @@ class GWM(nn.Module):
         context_entity_ids = context_batch['id']
         ctx_input_ids = context_batch['input_ids']
         ctx_attention_mask = context_batch['attention_mask']
+        ctx_rel_input_ids = context_batch.get('rel_input_ids')
+        ctx_rel_attention_mask = context_batch.get('rel_attention_mask')
         context_mask = context_batch.get('mask')
 
         if context_entity_ids.dim() == 2:
@@ -268,6 +290,10 @@ class GWM(nn.Module):
             seq_len = ctx_input_ids.size(-1)
             ctx_input_ids = ctx_input_ids.reshape(batch_size, context_size, seq_len)
             ctx_attention_mask = ctx_attention_mask.reshape(batch_size, context_size, seq_len)
+            if ctx_rel_input_ids is not None:
+                rel_seq_len = ctx_rel_input_ids.size(-1)
+                ctx_rel_input_ids = ctx_rel_input_ids.reshape(batch_size, context_size, rel_seq_len)
+                ctx_rel_attention_mask = ctx_rel_attention_mask.reshape(batch_size, context_size, rel_seq_len)
             if context_mask is None:
                 context_mask = torch.ones_like(context_entity_ids, dtype=torch.bool)
             else:
@@ -280,23 +306,40 @@ class GWM(nn.Module):
                 flat_context_entity_ids = context_entity_ids.new_zeros((0,))
                 flat_context_relation_ids = context_entity_ids.new_zeros((0,))
                 context_batch_index = context_entity_ids.new_zeros((0,))
+                flat_ctx_rel_input_ids = None
+                flat_ctx_rel_attn = None
             else:
                 context_batch_index = valid_idx[:, 0]
                 flat_ctx_input_ids = ctx_input_ids[context_mask]
                 flat_ctx_attn = ctx_attention_mask[context_mask]
                 flat_context_entity_ids = context_entity_ids[context_mask]
                 flat_context_relation_ids = context_batch.get('rel_id', torch.zeros_like(context_entity_ids))[context_mask]
+                if ctx_rel_input_ids is not None:
+                    flat_ctx_rel_input_ids = ctx_rel_input_ids[context_mask]
+                    flat_ctx_rel_attn = ctx_rel_attention_mask[context_mask]
+                else:
+                    flat_ctx_rel_input_ids = None
+                    flat_ctx_rel_attn = None
         else:
             flat_ctx_input_ids = ctx_input_ids
             flat_ctx_attn = ctx_attention_mask
             flat_context_entity_ids = context_entity_ids
             flat_context_relation_ids = context_batch.get('rel_id', torch.zeros_like(context_entity_ids))
             context_batch_index = context_batch['batch_index']
+            flat_ctx_rel_input_ids = ctx_rel_input_ids
+            flat_ctx_rel_attn = ctx_rel_attention_mask
 
         ctx_ent_text = self._encode_text(flat_ctx_input_ids, flat_ctx_attn)
         ctx_ent_struct = self.entity_embeddings(flat_context_entity_ids)
 
-        ctx_rel_text = torch.zeros(ctx_ent_text.size(0), self.text_embedding_dim, device=ctx_ent_text.device)
+        if flat_ctx_rel_input_ids is None:
+            ctx_rel_text = torch.zeros(
+                ctx_ent_text.size(0),
+                self.text_embedding_dim,
+                device=ctx_ent_text.device,
+            )
+        else:
+            ctx_rel_text = self._encode_text(flat_ctx_rel_input_ids, flat_ctx_rel_attn)
         ctx_rel_struct = self.relation_embeddings(flat_context_relation_ids)
 
         h_spatial_text = self.text_spatial_projection(h_emb_text)
@@ -373,8 +416,10 @@ class GWM(nn.Module):
         scores_text /= temp
         scores_struct /= temp
 
-        alpha = torch.sigmoid(self.score_lambda)
+        head_combined = torch.cat([query_text, query_struct], dim=-1)
+        alpha = self.alpha_mlp(head_combined)
         scores = alpha * scores_text + (1.0 - alpha) * scores_struct
+        self._record_alpha(alpha)
 
         labels = torch.arange(scores.size(0), device=scores.device)
         return nn.CrossEntropyLoss()(scores, labels), scores

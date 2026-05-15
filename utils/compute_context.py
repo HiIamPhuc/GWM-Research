@@ -51,16 +51,14 @@ class ContextProcessor:
             
         triples = torch.load(triples_path)
         adj = {}
-        
+
         # Convert to list for iteration
         for h, r, t in triples.tolist():
-            if h not in adj: adj[h] = []
-            adj[h].append(t)
-            
-        # Deduplicate neighbors
-        for h in adj:
-            adj[h] = list(set(adj[h]))
-            
+            if h not in adj:
+                adj[h] = {}
+            if t not in adj[h]:
+                adj[h][t] = r
+
         return adj
 
     def _mmr(self, query_emb, candidate_embs, k, lambda_param=0.5):
@@ -121,25 +119,32 @@ class ContextProcessor:
             
             adj = self._load_adjacency()
             context_ids = torch.zeros((num_entities, k), dtype=torch.long)
+            context_rel_ids = torch.zeros((num_entities, k), dtype=torch.long)
             
             print("Running MMR selection on neighbors...")
             for i in tqdm(range(num_entities), desc="MMR Selection"):
                 eid = i
-                neighbors = adj.get(eid, [])
+                neighbor_map = adj.get(eid, {})
+                neighbors = list(neighbor_map.keys())
+                rels = [neighbor_map[n] for n in neighbors]
                 
                 # If no neighbors, use self (or random, or zero)
                 if not neighbors:
                     context_ids[i] = torch.tensor([eid] * k)
+                    context_rel_ids[i] = torch.zeros(k, dtype=torch.long)
                     continue
                     
                 neighbor_indices = torch.tensor(neighbors, dtype=torch.long)
+                neighbor_relations = torch.tensor(rels, dtype=torch.long)
                 
                 # If neighbors <= k, take all and pad with self
                 if len(neighbors) <= k:
                     # Pad
                     needed = k - len(neighbors)
                     padded = torch.cat([neighbor_indices, torch.tensor([eid] * needed)])
+                    padded_rels = torch.cat([neighbor_relations, torch.zeros(needed, dtype=torch.long)])
                     context_ids[i] = padded
+                    context_rel_ids[i] = padded_rels
                 else:
                     # Perform MMR
                     query_emb = embeddings[eid] # (H)
@@ -147,35 +152,47 @@ class ContextProcessor:
                     
                     selected_local_indices = self._mmr(query_emb, cand_embs, k, lambda_param=mmr_lambda)
                     selected_global_indices = neighbor_indices[selected_local_indices]
-                    
+                    selected_relations = neighbor_relations[selected_local_indices]
+
                     context_ids[i] = selected_global_indices
+                    context_rel_ids[i] = selected_relations
         
         elif algorithm == 'random':
             # Randomly sample only from each node's neighbors.
             print("Generating random neighbor context...")
             adj = self._load_adjacency()
             context_ids = torch.zeros((num_entities, k), dtype=torch.long)
+            context_rel_ids = torch.zeros((num_entities, k), dtype=torch.long)
             for i in tqdm(range(num_entities)):
-                neighbors = adj.get(i, [])
+                neighbor_map = adj.get(i, {})
+                neighbors = list(neighbor_map.keys())
+                rels = [neighbor_map[n] for n in neighbors]
                 if not neighbors:
                     context_ids[i] = torch.tensor([i] * k)
+                    context_rel_ids[i] = torch.zeros(k, dtype=torch.long)
                     continue
 
                 neighbor_indices = torch.tensor(neighbors, dtype=torch.long)
+                neighbor_relations = torch.tensor(rels, dtype=torch.long)
                 if len(neighbors) >= k:
                     sampled = torch.randperm(len(neighbors))[:k]
                     context_ids[i] = neighbor_indices[sampled]
+                    context_rel_ids[i] = neighbor_relations[sampled]
                 else:
                     # Keep fixed length by sampling neighbors with replacement.
                     sampled = torch.randint(0, len(neighbors), (k,))
                     context_ids[i] = neighbor_indices[sampled]
+                    context_rel_ids[i] = neighbor_relations[sampled]
                  
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}. Supported: mmr_neighbor, random")
 
         output_file = os.path.join(self.data_dir, 'context_ids.pt')
+        output_rel_file = os.path.join(self.data_dir, 'context_rel_ids.pt')
         torch.save(context_ids, output_file)
+        torch.save(context_rel_ids, output_rel_file)
         print(f"Context nodes saved to {output_file}")
+        print(f"Context relation ids saved to {output_rel_file}")
 
 
 def load_config(config_path):

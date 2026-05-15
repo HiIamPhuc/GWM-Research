@@ -37,6 +37,12 @@ class GWMDataset(Dataset):
             # Create dummy context if missing
             self.context_ids = None
 
+        context_rel_path = os.path.join(data_dir, 'context_rel_ids.pt')
+        if os.path.exists(context_rel_path):
+            self.context_rel_ids = torch.load(context_rel_path)
+        else:
+            self.context_rel_ids = None
+
     def __len__(self):
         return len(self.triples)
         
@@ -56,12 +62,22 @@ class GWMDataset(Dataset):
             ctx_ids = self.context_ids[h]
         else:
             ctx_ids = torch.zeros(10, dtype=torch.long) # Dummy
+
+        if self.context_rel_ids is not None:
+            ctx_rel_ids = self.context_rel_ids[h]
+        else:
+            ctx_rel_ids = torch.zeros_like(ctx_ids)
             
         # Context Texts
         ctx_texts = []
         for cid in ctx_ids:
             c_str = str(cid.item())
             ctx_texts.append(self.entity_text.get(c_str, f"Entity {c_str}"))
+
+        ctx_rel_texts = []
+        for rid in ctx_rel_ids:
+            r_str = str(rid.item())
+            ctx_rel_texts.append(self.relation_text.get(r_str, f"Relation {r_str}"))
             
         return {
             'h_id': h,
@@ -71,7 +87,9 @@ class GWMDataset(Dataset):
             'r_text': r_text,
             't_text': t_text,
             'context_ids': ctx_ids,
-            'context_texts': ctx_texts
+            'context_texts': ctx_texts,
+            'context_rel_ids': ctx_rel_ids,
+            'context_rel_texts': ctx_rel_texts,
         }
 
 class CollateFN:
@@ -88,12 +106,14 @@ class CollateFN:
         
         # Context Texts: List of Lists -> Flatten
         context_texts_flat = []
+        context_rel_texts_flat = []
         
         # We need to know K (context size) to un-flatten later or reshaping
         # Assuming fixed K per batch
         
         for b in batch:
             context_texts_flat.extend(b['context_texts']) # [B*K]
+            context_rel_texts_flat.extend(b['context_rel_texts'])
         
         # Tokenize (Max length constraints for efficiency)
         h_enc = self.tokenizer(h_texts, padding=True, truncation=True, return_tensors='pt', max_length=512)
@@ -102,15 +122,24 @@ class CollateFN:
         
         # Tokenize Context (Use shorter length for context to save memory, e.g. 16/24 tokens)
         ctx_enc = self.tokenizer(context_texts_flat, padding=True, truncation=True, return_tensors='pt', max_length=24)
+        ctx_rel_enc = self.tokenizer(context_rel_texts_flat, padding=True, truncation=True, return_tensors='pt', max_length=24)
         
         h_ids = torch.stack([b['h_id'] for b in batch])
         r_ids = torch.stack([b['r_id'] for b in batch])
         t_ids = torch.stack([b['t_id'] for b in batch])
         context_ids = torch.stack([b['context_ids'] for b in batch])
+        context_rel_ids = torch.stack([b['context_rel_ids'] for b in batch])
         
         return {
             'h_batch': {'input_ids': h_enc['input_ids'], 'attention_mask': h_enc['attention_mask'], 'id': h_ids},
             'r_batch': {'input_ids': r_enc['input_ids'], 'attention_mask': r_enc['attention_mask'], 'id': r_ids},
             't_batch': {'input_ids': t_enc['input_ids'], 'attention_mask': t_enc['attention_mask'], 'id': t_ids},
-            'context_batch': {'input_ids': ctx_enc['input_ids'], 'attention_mask': ctx_enc['attention_mask'], 'id': context_ids}
+            'context_batch': {
+                'input_ids': ctx_enc['input_ids'],
+                'attention_mask': ctx_enc['attention_mask'],
+                'id': context_ids,
+                'rel_input_ids': ctx_rel_enc['input_ids'],
+                'rel_attention_mask': ctx_rel_enc['attention_mask'],
+                'rel_id': context_rel_ids,
+            }
         }

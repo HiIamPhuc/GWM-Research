@@ -295,8 +295,18 @@ def precompute_text_embeddings(
                 )
                 encoded = {k: v.to(device) for k, v in encoded.items()}
                 base_model = _get_base_model(text_encoder)
-                outputs = base_model(**encoded)
-                all_emb.append(outputs.last_hidden_state[:, 0, :].detach().cpu())
+                outputs = base_model(
+                    **encoded,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hidden = getattr(outputs, 'last_hidden_state', None)
+                if hidden is None:
+                    hidden_states = getattr(outputs, 'hidden_states', None)
+                    if not hidden_states:
+                        raise RuntimeError('Text encoder did not return hidden states.')
+                    hidden = hidden_states[-1]
+                all_emb.append(hidden[:, 0, :].detach().cpu())
         return torch.cat(all_emb, dim=0).contiguous()
 
     entity_embeddings = encode_ordered_texts(

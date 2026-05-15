@@ -66,24 +66,39 @@ def print_model_parameter_info(model):
 def get_config(args):
     with open(args.config, 'r') as f:
         config_dict = yaml.safe_load(f)
-    
+
     # Override with args
-    if args.data_dir: config_dict['data_dir'] = args.data_dir
-    if args.output_dir: config_dict['output_dir'] = args.output_dir
-    
+    if args.data_dir:
+        config_dict['data_dir'] = args.data_dir
+    if args.output_dir:
+        config_dict['output_dir'] = args.output_dir
+
     # Convert to SimpleNamespace (object with attributes)
     class Config:
         def __init__(self, dictionary):
             for k, v in dictionary.items():
                 setattr(self, k, v)
-    
-    return Config(config_dict)
+
+    return Config(config_dict), config_dict
+
+
+def save_config_snapshot(config_dict, output_dir, source_path=None):
+    if source_path is not None:
+        config_dict = dict(config_dict)
+        config_dict['config_source'] = source_path
+    yaml_path = os.path.join(output_dir, 'config.yaml')
+    json_path = os.path.join(output_dir, 'config.json')
+    with open(yaml_path, 'w') as f:
+        yaml.safe_dump(config_dict, f, sort_keys=False)
+    with open(json_path, 'w') as f:
+        json.dump(config_dict, f, indent=2)
 
 def train(args):
     # Load Config
-    config = get_config(args)
+    config, config_dict = get_config(args)
     if not os.path.exists(config.output_dir):
         os.makedirs(config.output_dir)
+    save_config_snapshot(config_dict, config.output_dir, source_path=args.config)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")

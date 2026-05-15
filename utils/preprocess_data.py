@@ -192,7 +192,10 @@ def _train_lora_adapter(
             max_length=max_length,
             return_tensors='pt',
         )
-        return collator(encoded)
+        examples = []
+        for i in range(encoded['input_ids'].size(0)):
+            examples.append({k: v[i] for k, v in encoded.items()})
+        return collator(examples)
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=_collate)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)

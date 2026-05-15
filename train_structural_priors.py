@@ -100,7 +100,7 @@ def main():
         validation=tf_valid,
         model=args.model,
         model_kwargs=dict(embedding_dim=internal_dim),
-        training_kwargs=dict(num_epochs=args.epochs, use_tqdm_batch=True),
+        training_kwargs=dict(num_epochs=args.epochs, use_tqdm_batch=False),
         evaluator_kwargs=dict(filtered=True),
         stopper='early',
         stopper_kwargs=dict(frequency=5, patience=3, relative_delta=0.002),

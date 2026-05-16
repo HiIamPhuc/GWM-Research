@@ -108,7 +108,6 @@ def compute_filtered_ranking_metrics(
     total = 0
 
     all_t_text, all_t_struct = all_entity_embeddings
-    alpha = torch.sigmoid(model.score_lambda).item()
 
     writer = None
     if save_predictions_path is not None:
@@ -129,6 +128,8 @@ def compute_filtered_ranking_metrics(
             
             scores_text = torch.mm(q_text, all_t_text.t())
             scores_struct = torch.mm(q_struct, all_t_struct.t())
+            head_combined = torch.cat([q_text, q_struct], dim=-1)
+            alpha = model.alpha_mlp(head_combined)
             scores = alpha * scores_text + (1.0 - alpha) * scores_struct
 
             for i in range(scores.size(0)):

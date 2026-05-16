@@ -45,6 +45,25 @@ class CompGCNLayer(nn.Module):
         # Pure residual fix: preserve anchor head state, add learned neighbor delta.
         return head_feat + self.lin_out(agg)
 
+
+class MLPAdapter(nn.Module):
+    def __init__(self, in_dim, hidden_dim, dropout=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, in_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return residual + x
+
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -77,6 +96,13 @@ class GWM(nn.Module):
         )
         self.dropout_rate = float(getattr(config, 'dropout', 0.0))
         self.recurrent_dropout = float(getattr(config, 'recurrent_dropout', 0.0))
+
+        text_adapter_dim = int(getattr(config, 'text_adapter_dim', self.text_embedding_dim * 2))
+        struct_adapter_dim = int(getattr(config, 'struct_adapter_dim', self.structural_dim * 2))
+        adapter_dropout = float(getattr(config, 'adapter_dropout', 0.1))
+
+        self.text_adapter = MLPAdapter(self.text_embedding_dim, text_adapter_dim, dropout=adapter_dropout)
+        self.struct_adapter = MLPAdapter(self.structural_dim, struct_adapter_dim, dropout=adapter_dropout)
 
         self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
 
@@ -279,12 +305,12 @@ class GWM(nn.Module):
         return mean
 
     def forward(self, h_batch, r_batch, context_batch):
-        h_emb_text = self.text_entity_embeddings(h_batch['id'])
-        r_emb_text = self.text_relation_embeddings(r_batch['id'])
+        h_emb_text = self.text_adapter(self.text_entity_embeddings(h_batch['id']))
+        r_emb_text = self.text_adapter(self.text_relation_embeddings(r_batch['id']))
         
         # Structural Embeddings
-        h_struct = self.entity_embeddings(h_batch['id'])
-        r_struct = self.relation_embeddings(r_batch['id'])
+        h_struct = self.struct_adapter(self.entity_embeddings(h_batch['id']))
+        r_struct = self.struct_adapter(self.relation_embeddings(r_batch['id']))
 
         h_emb_text = self.input_dropout(h_emb_text)
         r_emb_text = self.input_dropout(r_emb_text)
@@ -323,10 +349,10 @@ class GWM(nn.Module):
             if context_batch_index is None:
                 raise ValueError("context_batch['batch_index'] is required for ragged context format.")
 
-        ctx_ent_text = self.text_entity_embeddings(flat_context_entity_ids)
-        ctx_ent_struct = self.entity_embeddings(flat_context_entity_ids)
-        ctx_rel_text = self.text_relation_embeddings(flat_context_relation_ids)
-        ctx_rel_struct = self.relation_embeddings(flat_context_relation_ids)
+        ctx_ent_text = self.text_adapter(self.text_entity_embeddings(flat_context_entity_ids))
+        ctx_ent_struct = self.struct_adapter(self.entity_embeddings(flat_context_entity_ids))
+        ctx_rel_text = self.text_adapter(self.text_relation_embeddings(flat_context_relation_ids))
+        ctx_rel_struct = self.struct_adapter(self.relation_embeddings(flat_context_relation_ids))
 
         h_spatial_text = self.text_spatial_projection(h_emb_text)
         ctx_entity_spatial_text = self.text_spatial_projection(ctx_ent_text)
@@ -369,8 +395,8 @@ class GWM(nn.Module):
         return query_text, query_struct
 
     def encode_target(self, t_batch):
-        t_emb_text = self.text_entity_embeddings(t_batch['id'])
-        t_struct = self.entity_embeddings(t_batch['id'])
+        t_emb_text = self.text_adapter(self.text_entity_embeddings(t_batch['id']))
+        t_struct = self.struct_adapter(self.entity_embeddings(t_batch['id']))
         
         t_text_proj = self.text_dynamics_projection(t_emb_text)
         t_struct_proj = self.struct_dynamics_projection(t_struct)

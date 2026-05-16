@@ -53,7 +53,11 @@ class GWM(nn.Module):
         legacy_hidden_dim = int(getattr(config, 'hidden_dim', getattr(config, 'text_embedding_dim', 768)))
         self.text_embedding_dim = int(getattr(config, 'text_embedding_dim', legacy_hidden_dim))
 
-        # 1. Structural Component (Entity/Relation Embeddings)
+        # 1. Text Component (Entity/Relation Embeddings)
+        self.text_entity_embeddings = nn.Embedding(config.num_entities, self.text_embedding_dim)
+        self.text_relation_embeddings = nn.Embedding(config.num_relations, self.text_embedding_dim)
+
+        # 2. Structural Component (Entity/Relation Embeddings)
         self.structural_dim = int(getattr(config, 'structural_dim', legacy_hidden_dim))
         self.entity_embeddings = nn.Embedding(config.num_entities, self.structural_dim)
         self.relation_embeddings = nn.Embedding(config.num_relations, self.structural_dim)
@@ -76,8 +80,14 @@ class GWM(nn.Module):
 
         self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
 
-        # Learnable score-level fusion scalar
-        self.score_lambda = nn.Parameter(torch.tensor(0.5))
+        self.alpha_mlp = nn.Sequential(
+            nn.Linear(self.text_dynamics_dim + self.struct_dynamics_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+        self._alpha_sum = 0.0
+        self._alpha_count = 0
 
         def _build_projection(in_dim, out_dim):
             if in_dim == out_dim:
@@ -134,11 +144,6 @@ class GWM(nn.Module):
 
         self.recurrent_dropout_layer = nn.Dropout(self.recurrent_dropout) if self.recurrent_dropout > 0 else nn.Identity()
 
-        # Precomputed text cache loaded from preprocessing artifacts.
-        self.cached_entity_text_emb = None
-        self.cached_relation_text_emb = None
-        self.use_text_cache = False
-
     def _encode_subgraph_with_compgcn(self, h_emb, ctx_entity_emb, ctx_relation_emb, ctx_batch_index, compgcn_stack):
         h_state = h_emb
         for layer in compgcn_stack:
@@ -152,7 +157,7 @@ class GWM(nn.Module):
 
     def _run_dynamics(self, world_state, step_x, relation_emb, mixer, lstm, h0_proj, c0_proj):
         h_0 = torch.tanh(h0_proj(world_state))
-        c_0 = torch.tanh(c0_proj(world_state))
+        c_0 = c0_proj(world_state)
         
         concat_input = torch.cat([step_x, relation_emb], dim=-1)
         mixed_input = mixer(concat_input)
@@ -223,23 +228,19 @@ class GWM(nn.Module):
             self.entity_embeddings.weight.requires_grad = False
             self.relation_embeddings.weight.requires_grad = False
 
-    def load_precomputed_text_embedding_cache(self, entity_source, relation_source, cache_device='cpu'):
-        if self.use_text_cache and self.cached_entity_text_emb is not None and self.cached_relation_text_emb is not None:
-            return
-
-        cache_device = torch.device(cache_device)
-
+    def load_precomputed_text_cache(self, entity_source, relation_source, freeze=True):
+        """Loads precomputed text embeddings into text embedding tables."""
         entity_cache = self._load_embedding_tensor(
             source=entity_source,
-            expected_rows=self.entity_embeddings.num_embeddings,
-            name='entity',
-        ).to(cache_device)
+            expected_rows=self.text_entity_embeddings.num_embeddings,
+            name='text_entity',
+        )
 
         relation_cache = self._load_embedding_tensor(
             source=relation_source,
-            expected_rows=self.relation_embeddings.num_embeddings,
-            name='relation',
-        ).to(cache_device)
+            expected_rows=self.text_relation_embeddings.num_embeddings,
+            name='text_relation',
+        )
 
         if entity_cache.size(1) != relation_cache.size(1):
             raise ValueError(
@@ -254,40 +255,32 @@ class GWM(nn.Module):
                 f"Expected {expected_text_dim}, got {entity_cache.size(1)}"
             )
 
-        self.cached_entity_text_emb = entity_cache
-        self.cached_relation_text_emb = relation_cache
-        self.use_text_cache = True
+        self.text_entity_embeddings.weight.data.copy_(entity_cache)
+        self.text_relation_embeddings.weight.data.copy_(relation_cache)
 
-        if cache_device.type == 'cpu' and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if freeze:
+            self.text_entity_embeddings.weight.requires_grad = False
+            self.text_relation_embeddings.weight.requires_grad = False
 
-    # Backward-compatible alias.
-    def build_text_embedding_cache(self, entity_source, relation_source, device='cpu', **_kwargs):
-        self.load_precomputed_text_embedding_cache(entity_source, relation_source, cache_device=device)
+    def reset_alpha_stats(self):
+        self._alpha_sum = 0.0
+        self._alpha_count = 0
 
-    def _lookup_cached_text(self, ids, kind='entity'):
-        cache = self.cached_entity_text_emb if kind == 'entity' else self.cached_relation_text_emb
-        if cache is None:
-            raise RuntimeError("Text cache is not built. Call load_precomputed_text_embedding_cache first.")
-
-        original_shape = ids.shape
-        flat_ids = ids.reshape(-1)
-        if flat_ids.device != cache.device:
-            flat_ids = flat_ids.to(cache.device)
-        selected = cache.index_select(0, flat_ids)
-        if selected.device != ids.device:
-            selected = selected.to(ids.device)
-        return selected.reshape(*original_shape, -1)
+    def _record_alpha(self, alpha):
+        self._alpha_sum += alpha.sum().item()
+        self._alpha_count += alpha.numel()
 
     def get_alpha_mean(self, reset=False):
-        return torch.sigmoid(self.score_lambda).item()
+        if self._alpha_count == 0:
+            return None
+        mean = self._alpha_sum / self._alpha_count
+        if reset:
+            self.reset_alpha_stats()
+        return mean
 
     def forward(self, h_batch, r_batch, context_batch):
-        if not self.use_text_cache:
-            raise RuntimeError('Text cache is not built. Call load_precomputed_text_embedding_cache before training/inference.')
-
-        h_emb_text = self._lookup_cached_text(h_batch['id'], kind='entity')
-        r_emb_text = self._lookup_cached_text(r_batch['id'], kind='relation')
+        h_emb_text = self.text_entity_embeddings(h_batch['id'])
+        r_emb_text = self.text_relation_embeddings(r_batch['id'])
         
         # Structural Embeddings
         h_struct = self.entity_embeddings(h_batch['id'])
@@ -330,9 +323,9 @@ class GWM(nn.Module):
             if context_batch_index is None:
                 raise ValueError("context_batch['batch_index'] is required for ragged context format.")
 
-        ctx_ent_text = self._lookup_cached_text(flat_context_entity_ids, kind='entity')
+        ctx_ent_text = self.text_entity_embeddings(flat_context_entity_ids)
         ctx_ent_struct = self.entity_embeddings(flat_context_entity_ids)
-        ctx_rel_text = self._lookup_cached_text(flat_context_relation_ids, kind='relation')
+        ctx_rel_text = self.text_relation_embeddings(flat_context_relation_ids)
         ctx_rel_struct = self.relation_embeddings(flat_context_relation_ids)
 
         h_spatial_text = self.text_spatial_projection(h_emb_text)
@@ -376,10 +369,7 @@ class GWM(nn.Module):
         return query_text, query_struct
 
     def encode_target(self, t_batch):
-        if not self.use_text_cache:
-            raise RuntimeError('Text cache is not built. Call load_precomputed_text_embedding_cache before training/inference.')
-
-        t_emb_text = self._lookup_cached_text(t_batch['id'], kind='entity')
+        t_emb_text = self.text_entity_embeddings(t_batch['id'])
         t_struct = self.entity_embeddings(t_batch['id'])
         
         t_text_proj = self.text_dynamics_projection(t_emb_text)
@@ -401,8 +391,10 @@ class GWM(nn.Module):
         scores_struct /= temp
         
         # Score Level Fusion
-        alpha = torch.sigmoid(self.score_lambda)
+        head_combined = torch.cat([query_text, query_struct], dim=-1)
+        alpha = self.alpha_mlp(head_combined)
         scores = alpha * scores_text + (1.0 - alpha) * scores_struct
+        self._record_alpha(alpha)
         
         labels = torch.arange(scores.size(0), device=scores.device)
         return nn.CrossEntropyLoss()(scores, labels), scores

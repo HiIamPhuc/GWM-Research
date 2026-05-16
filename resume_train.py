@@ -214,11 +214,10 @@ def resume_training(args):
 			"Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
 		)
 
-	cache_device = getattr(config, 'text_cache_device', 'cpu')
-	model.load_precomputed_text_embedding_cache(
+	model.load_precomputed_text_cache(
 		entity_source=entity_emb_path,
 		relation_source=relation_emb_path,
-		cache_device=cache_device,
+		freeze=True,
 	)
 
 	checkpoint_path = resolve_checkpoint_path(checkpoint_dir, checkpoint_name=args.checkpoint_name)

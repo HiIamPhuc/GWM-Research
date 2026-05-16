@@ -74,14 +74,13 @@ def evaluate(args):
             "Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
         )
 
-    cache_device = getattr(config, 'text_cache_device', 'cpu')
-    print(f"Loading precomputed text embeddings for evaluation to {cache_device}...")
-    model.load_precomputed_text_embedding_cache(
+    print("Loading precomputed text embeddings for evaluation...")
+    model.load_precomputed_text_cache(
         entity_source=entity_emb_path,
         relation_source=relation_emb_path,
-        cache_device=cache_device,
+        freeze=True,
     )
-    print("Text cache ready for evaluation.")
+    print("Text embeddings ready for evaluation.")
 
     model.eval()
 

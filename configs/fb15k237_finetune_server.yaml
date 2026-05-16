@@ -26,11 +26,11 @@ max_grad_norm: 1.0
 
 # Training
 num_epochs: 400
-batch_size: 64
+batch_size: 56
 early_stopping_patience: 7
 eval_every: 1
-eval_batch_size: 64
-candidate_batch_size: 64
+eval_batch_size: 56
+candidate_batch_size: 56
 
 freeze_structural_priors: false
 

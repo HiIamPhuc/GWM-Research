@@ -44,16 +44,6 @@ seed: 42
 
 text_cache_device: cpu
 
-# LoRA preprocessing (optional, used by utils/preprocess_data.py)
-lora_pretrain: true
-lora_rank: 8
-lora_alpha: 16
-lora_dropout: 0.05
-lora_target_modules: query,value
-lora_epochs: 10
-lora_lr: 5e-5
-lora_mlm_probability: 0.15
-
 save_eval_predictions: true
 eval_topk: 10
 eval_predictions_dir: output/wn18rr/predictions

@@ -22,7 +22,6 @@ grad_clip_norm: 1.0
 num_epochs: 400
 early_stopping_patience: 15
 eval_every: 1
-structural_lr_scale: 0.05
 
 batch_size: 2048
 eval_batch_size: 2048
@@ -33,7 +32,6 @@ temperature: 0.07
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr
-freeze_structural_priors: True # or True
     
 add_inverse: true
 context_k: 5

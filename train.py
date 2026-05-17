@@ -129,24 +129,17 @@ def train(args):
             model.load_precomputed_structural_cache(
                 entity_source=structural_entity_source,
                 relation_source=structural_relation_source,
-                freeze=getattr(config, 'freeze_structural_priors', False)
+                freeze=True,
             )
         else:
             print(f"Warning: Structural priors not found at {structural_entity_source} or {structural_relation_source}")
     
     base_lr = float(config.learning_rate)
     weight_decay = float(getattr(config, 'weight_decay', 0.0))
-    structural_lr_scale = float(getattr(config, 'structural_lr_scale', 0.1))
-
-    structural_params = [model.entity_embeddings.weight, model.relation_embeddings.weight]
-    structural_param_ids = {id(p) for p in structural_params}
-    other_params = [p for p in model.parameters() if id(p) not in structural_param_ids]
-
     optimizer = torch.optim.AdamW(
-        [
-            {'params': other_params, 'lr': base_lr, 'weight_decay': weight_decay},
-            {'params': structural_params, 'lr': base_lr * structural_lr_scale, 'weight_decay': weight_decay},
-        ]
+        model.parameters(),
+        lr=base_lr,
+        weight_decay=weight_decay,
     )
 
     total_steps = max(1, config.num_epochs * len(train_loader))

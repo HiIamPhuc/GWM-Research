@@ -12,12 +12,12 @@ compgcn_op: mult
 
 text_dynamics_dim: 768
 struct_dynamics_dim: 896
-dynamics_layers: 2
+dynamics_layers: 1
 
 dropout: 0.2
-recurrent_dropout: 0.2
+recurrent_dropout: 0.1
 
-learning_rate: 5e-4
+learning_rate: 5e-5
 weight_decay: 0.01
 min_lr: 1e-5
 warmup_ratio: 0.1
@@ -31,7 +31,7 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 loss: infonce
-temperature: 0.07
+temperature: 0.1
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

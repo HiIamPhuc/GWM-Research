@@ -115,6 +115,10 @@ class GWM(nn.Module):
         self._alpha_sum = 0.0
         self._alpha_count = 0
 
+        self.learnable_loss_weights = bool(getattr(config, 'learnable_loss_weights', False))
+        if self.learnable_loss_weights:
+            self.loss_weight_logits = nn.Parameter(torch.zeros(3))
+
         def _build_projection(in_dim, out_dim):
             if in_dim == out_dim:
                 return nn.Identity()
@@ -406,21 +410,38 @@ class GWM(nn.Module):
         return t_text_norm, t_struct_norm
 
     def compute_loss(self, query_vectors, target_vectors):
+        loss_text, loss_struct, loss_fused, scores = self.compute_loss_components(
+            query_vectors,
+            target_vectors
+        )
+        return loss_fused, scores
+
+    def compute_loss_components(self, query_vectors, target_vectors):
         query_text, query_struct = query_vectors
         target_text, target_struct = target_vectors
 
         scores_text = torch.mm(query_text, target_text.t())
         scores_struct = torch.mm(query_struct, target_struct.t())
-        
+
         temp = getattr(self.config, 'temperature', 0.07)
-        scores_text /= temp
-        scores_struct /= temp
-        
+        scores_text = scores_text / temp
+        scores_struct = scores_struct / temp
+
         # Score Level Fusion
         head_combined = torch.cat([query_text, query_struct], dim=-1)
         alpha = self.alpha_mlp(head_combined)
-        scores = alpha * scores_text + (1.0 - alpha) * scores_struct
+        scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
         self._record_alpha(alpha)
-        
-        labels = torch.arange(scores.size(0), device=scores.device)
-        return nn.CrossEntropyLoss()(scores, labels), scores
+
+        labels = torch.arange(scores_fused.size(0), device=scores_fused.device)
+        loss_fn = nn.CrossEntropyLoss()
+        loss_text = loss_fn(scores_text, labels)
+        loss_struct = loss_fn(scores_struct, labels)
+        loss_fused = loss_fn(scores_fused, labels)
+
+        return loss_text, loss_struct, loss_fused, scores_fused
+
+    def get_loss_weights(self):
+        if not hasattr(self, 'loss_weight_logits'):
+            return None
+        return torch.softmax(self.loss_weight_logits, dim=0)

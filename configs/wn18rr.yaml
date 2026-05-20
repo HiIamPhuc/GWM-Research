@@ -17,8 +17,8 @@ dynamics_layers: 1
 dropout: 0.2
 recurrent_dropout: 0.1
 
-learning_rate: 5e-5
-weight_decay: 0.01
+learning_rate: 1e-5
+weight_decay: 0.001
 min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
@@ -31,7 +31,12 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 loss: infonce
-temperature: 0.1
+temperature: 0.07
+
+use_multi_loss: true
+use_pcgrad: true
+learnable_loss_weights: true
+loss_weights: [1.0, 1.0, 1.0]
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr

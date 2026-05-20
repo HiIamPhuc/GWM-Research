@@ -44,6 +44,59 @@ def save_training_config(config, output_dir, args=None):
 
     print(f"Saved training config to: {config_path}")
 
+
+def _dot_grads(grads_a, grads_b):
+    dot = 0.0
+    for ga, gb in zip(grads_a, grads_b):
+        if ga is None or gb is None:
+            continue
+        dot = dot + torch.sum(ga * gb)
+    return dot
+
+
+def _norm_sq(grads):
+    norm = 0.0
+    for g in grads:
+        if g is None:
+            continue
+        norm = norm + torch.sum(g * g)
+    return norm
+
+
+def _pcgrad(grads_list):
+    if len(grads_list) <= 1:
+        return grads_list[0] if grads_list else []
+
+    grads = [list(g) for g in grads_list]
+    num_tasks = len(grads)
+
+    for i in range(num_tasks):
+        for j in range(num_tasks):
+            if i == j:
+                continue
+            dot = _dot_grads(grads[i], grads[j])
+            if dot.item() < 0:
+                denom = _norm_sq(grads[j])
+                if denom.item() > 0:
+                    coeff = dot / denom
+                    grads[i] = [
+                        gi - coeff * gj if gi is not None and gj is not None else gi
+                        for gi, gj in zip(grads[i], grads[j])
+                    ]
+
+    merged = []
+    for per_param in zip(*grads):
+        if all(g is None for g in per_param):
+            merged.append(None)
+            continue
+        summed = None
+        for g in per_param:
+            if g is None:
+                continue
+            summed = g if summed is None else summed + g
+        merged.append(summed / num_tasks)
+    return merged
+
 def get_config(args):
     with open(args.config, 'r') as f:
         config_dict = yaml.safe_load(f)
@@ -203,6 +256,11 @@ def train(args):
         patience=getattr(config, 'early_stopping_patience', getattr(config, 'early_stopping', 10)),
         mode='max'  # Maximize MRR
     )
+
+    use_multi_loss = bool(getattr(config, 'use_multi_loss', False))
+    use_pcgrad = bool(getattr(config, 'use_pcgrad', False))
+    learnable_loss_weights = bool(getattr(config, 'learnable_loss_weights', False))
+    fixed_loss_weights = getattr(config, 'loss_weights', [1.0, 1.0, 1.0])
     
     # Simple JSON Logger
     log_path = os.path.join(config.output_dir, 'training_log.json')
@@ -222,31 +280,92 @@ def train(args):
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
             t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
-            
-            optimizer.zero_grad()
-            
+
             # Forward: Query Vector (from head, relation, context)
             query_vector = model(h_batch, r_batch, context_batch)
             
             # Forward: Target Vector (Symmetric Fused Tail)
             t_fused = model.encode_target(t_batch)
-            
-            # Loss: In-Batch Negatives
-            loss, _ = model.compute_loss(query_vector, t_fused)
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            optimizer.step()
-            scheduler.step()
-            
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+
+            optimizer.zero_grad()
+
+            if use_multi_loss:
+                loss_text, loss_struct, loss_fused, _ = model.compute_loss_components(
+                    query_vector,
+                    t_fused
+                )
+                losses = [loss_text, loss_struct, loss_fused]
+
+                if learnable_loss_weights and hasattr(model, 'get_loss_weights'):
+                    weights = model.get_loss_weights()
+                else:
+                    weights = torch.tensor(fixed_loss_weights, device=device, dtype=losses[0].dtype)
+                    weights = weights / weights.sum().clamp(min=1e-12)
+
+                weighted_loss = sum(w * l for w, l in zip(weights, losses))
+
+                if use_pcgrad:
+                    weight_params = [model.loss_weight_logits] if learnable_loss_weights and hasattr(model, 'loss_weight_logits') else []
+                    weight_param_ids = {id(p) for p in weight_params}
+                    base_params = [p for p in model.parameters() if p.requires_grad and id(p) not in weight_param_ids]
+
+                    weights_detached = weights.detach()
+                    grads_list = []
+                    for idx, loss_i in enumerate(losses):
+                        grads = torch.autograd.grad(
+                            loss_i,
+                            base_params,
+                            retain_graph=True,
+                            allow_unused=True
+                        )
+                        grads = [g * weights_detached[idx] if g is not None else None for g in grads]
+                        grads_list.append(grads)
+
+                    merged_grads = _pcgrad(grads_list)
+                    for param, grad in zip(base_params, merged_grads):
+                        param.grad = grad
+
+                    if weight_params:
+                        weight_grads = torch.autograd.grad(
+                            weighted_loss,
+                            weight_params,
+                            allow_unused=True
+                        )
+                        for param, grad in zip(weight_params, weight_grads):
+                            param.grad = grad
+
+                    torch.nn.utils.clip_grad_norm_(base_params + weight_params, grad_clip_norm)
+                    optimizer.step()
+                else:
+                    weighted_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    optimizer.step()
+
+                scheduler.step()
+                total_loss += weighted_loss.item()
+                pbar.set_postfix({'loss': weighted_loss.item()})
+            else:
+                # Loss: In-Batch Negatives (fused only)
+                loss, _ = model.compute_loss(query_vector, t_fused)
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                optimizer.step()
+                scheduler.step()
+
+                total_loss += loss.item()
+                pbar.set_postfix({'loss': loss.item()})
             
         avg_train_loss = total_loss / len(train_loader)
         train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
+        train_loss_weights = None
+        if use_multi_loss and learnable_loss_weights and hasattr(model, 'get_loss_weights'):
+            train_loss_weights = model.get_loss_weights().detach().cpu().tolist()
         print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
         if train_alpha is not None:
             print(f"Epoch {epoch+1} Train Alpha (text weight): {train_alpha:.4f}")
+        if train_loss_weights is not None:
+            print(f"Epoch {epoch+1} Train Loss Weights (text/struct/fused): {train_loss_weights}")
         
         # Validation
         eval_every = getattr(config, 'eval_every', 1)
@@ -310,6 +429,8 @@ def train(args):
             }
             if train_alpha is not None:
                 epoch_log['train_alpha'] = train_alpha
+            if train_loss_weights is not None:
+                epoch_log['train_loss_weights'] = train_loss_weights
             if val_alpha is not None:
                 epoch_log['val_alpha'] = val_alpha
             history.append(epoch_log)

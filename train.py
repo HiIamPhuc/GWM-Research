@@ -75,9 +75,11 @@ def _pcgrad(grads_list):
             if i == j:
                 continue
             dot = _dot_grads(grads[i], grads[j])
-            if dot.item() < 0:
+            dot_value = dot.item() if torch.is_tensor(dot) else float(dot)
+            if dot_value < 0.0:
                 denom = _norm_sq(grads[j])
-                if denom.item() > 0:
+                denom_value = denom.item() if torch.is_tensor(denom) else float(denom)
+                if denom_value > 0.0:
                     coeff = dot / denom
                     grads[i] = [
                         gi - coeff * gj if gi is not None and gj is not None else gi

@@ -1,20 +1,20 @@
 # Config for context-aware GWM with precomputed text embeddings
 text_embedding_dim: 768
 text_adapter_dim: 768
-structural_dim: 384
-struct_adapter_dim: 384
-adapter_dropout: 0.2
+structural_dim: 768
+struct_adapter_dim: 768
+adapter_dropout: 0.1
 
 text_compgcn_dim: 768
-struct_compgcn_dim: 384
+struct_compgcn_dim: 768
 compgcn_layers: 1
 compgcn_op: mult
 
 text_dynamics_dim: 768
-struct_dynamics_dim: 384
+struct_dynamics_dim: 768
 dynamics_layers: 1
 
-dropout: 0.2
+dropout: 0.1
 recurrent_dropout: 0.1
 
 learning_rate: 5e-5
@@ -23,7 +23,7 @@ min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
 num_epochs: 1000
-early_stopping_patience: 15
+early_stopping_patience: 10
 eval_every: 1
 
 batch_size: 2048
@@ -32,6 +32,9 @@ candidate_batch_size: 2048
 
 loss: infonce
 temperature: 0.07
+hard_negative_k: 0
+hard_negative_fraction: 0.05
+hard_negative_weight: 2.0
 
 use_multi_loss: true
 use_pcgrad: true

@@ -29,13 +29,14 @@ def plot_training_curves(log_data, output_path=None):
     
     train_alpha = [entry.get('train_alpha', None) for entry in log_data]
     val_alpha = [entry.get('val_alpha', None) for entry in log_data]
+    train_loss_weights = [entry.get('train_loss_weights', None) for entry in log_data]
     
     # Create figure with subplots
     fig = plt.figure(figsize=(16, 12))
     
     # 1. Loss Plot
     ax1 = plt.subplot(3, 3, 1)
-    ax1.plot(epochs, train_loss, 'b-o', linewidth=2, markersize=2, label='Train Loss')
+    ax1.plot(epochs, train_loss, 'b', markersize=1, label='Train Loss')
     ax1.set_xlabel('Epoch', fontsize=11)
     ax1.set_ylabel('Loss', fontsize=11)
     ax1.set_title('Training Loss', fontsize=12, fontweight='bold')
@@ -47,7 +48,7 @@ def plot_training_curves(log_data, output_path=None):
     valid_mrr = [(e, m) for e, m in zip(epochs, val_mrr) if m is not None]
     if valid_mrr:
         e_vals, m_vals = zip(*valid_mrr)
-        ax2.plot(e_vals, m_vals, 'g-o', linewidth=2, markersize=2, label='Val MRR')
+        ax2.plot(e_vals, m_vals, 'g-o', markersize=1, label='Val MRR')
         ax2.set_xlabel('Epoch', fontsize=11)
         ax2.set_ylabel('MRR', fontsize=11)
         ax2.set_title('Validation MRR (Higher is Better)', fontsize=12, fontweight='bold')
@@ -60,7 +61,7 @@ def plot_training_curves(log_data, output_path=None):
     valid_mr = [(e, m) for e, m in zip(epochs, val_mr) if m is not None]
     if valid_mr:
         e_vals, m_vals = zip(*valid_mr)
-        ax3.plot(e_vals, m_vals, 'r-o', linewidth=2, markersize=2, label='Val MR')
+        ax3.plot(e_vals, m_vals, 'r-o', markersize=1, label='Val MR')
         ax3.set_xlabel('Epoch', fontsize=11)
         ax3.set_ylabel('Mean Rank', fontsize=11)
         ax3.set_title('Validation Mean Rank (Lower is Better)', fontsize=12, fontweight='bold')
@@ -73,7 +74,7 @@ def plot_training_curves(log_data, output_path=None):
     valid_h1 = [(e, h) for e, h in zip(epochs, val_hits1) if h is not None]
     if valid_h1:
         e_vals, h_vals = zip(*valid_h1)
-        ax4.plot(e_vals, h_vals, 'purple', marker='o', linewidth=2, markersize=2, label='Hits@1')
+        ax4.plot(e_vals, h_vals, 'purple', marker='o', markersize=1, label='Hits@1')
         ax4.set_xlabel('Epoch', fontsize=11)
         ax4.set_ylabel('Hits@1', fontsize=11)
         ax4.set_title('Validation Hits@1', fontsize=12, fontweight='bold')
@@ -86,7 +87,7 @@ def plot_training_curves(log_data, output_path=None):
     valid_h3 = [(e, h) for e, h in zip(epochs, val_hits3) if h is not None]
     if valid_h3:
         e_vals, h_vals = zip(*valid_h3)
-        ax5.plot(e_vals, h_vals, 'orange', marker='o', linewidth=2, markersize=2, label='Hits@3')
+        ax5.plot(e_vals, h_vals, 'orange', marker='o', markersize=1, label='Hits@3')
         ax5.set_xlabel('Epoch', fontsize=11)
         ax5.set_ylabel('Hits@3', fontsize=11)
         ax5.set_title('Validation Hits@3', fontsize=12, fontweight='bold')
@@ -99,7 +100,7 @@ def plot_training_curves(log_data, output_path=None):
     valid_h10 = [(e, h) for e, h in zip(epochs, val_hits10) if h is not None]
     if valid_h10:
         e_vals, h_vals = zip(*valid_h10)
-        ax6.plot(e_vals, h_vals, 'brown', marker='o', linewidth=2, markersize=2, label='Hits@10')
+        ax6.plot(e_vals, h_vals, 'brown', marker='o', markersize=1, label='Hits@10')
         ax6.set_xlabel('Epoch', fontsize=11)
         ax6.set_ylabel('Hits@10', fontsize=11)
         ax6.set_title('Validation Hits@10', fontsize=12, fontweight='bold')
@@ -116,16 +117,16 @@ def plot_training_curves(log_data, output_path=None):
     
     if valid_mrr_data:
         e_vals, m_vals = zip(*valid_mrr_data)
-        ax7.plot(e_vals, m_vals, 'g-o', linewidth=2, markersize=2, label='MRR')
+        ax7.plot(e_vals, m_vals, 'g-o', markersize=1, label='MRR')
     if valid_h1_data:
         e_vals, h_vals = zip(*valid_h1_data)
-        ax7.plot(e_vals, h_vals, 'purple', marker='s', linewidth=2, markersize=2, label='Hits@1')
+        ax7.plot(e_vals, h_vals, 'purple', marker='s', markersize=1, label='Hits@1')
     if valid_h3_data:
         e_vals, h_vals = zip(*valid_h3_data)
-        ax7.plot(e_vals, h_vals, 'orange', marker='^', linewidth=2, markersize=2, label='Hits@3')
+        ax7.plot(e_vals, h_vals, 'orange', marker='^', markersize=1, label='Hits@3')
     if valid_h10_data:
         e_vals, h_vals = zip(*valid_h10_data)
-        ax7.plot(e_vals, h_vals, 'brown', marker='x', linewidth=2, markersize=2, label='Hits@10')
+        ax7.plot(e_vals, h_vals, 'brown', marker='x', markersize=1, label='Hits@10')
     
     ax7.set_xlabel('Epoch', fontsize=11)
     ax7.set_ylabel('Score', fontsize=11)
@@ -139,26 +140,31 @@ def plot_training_curves(log_data, output_path=None):
     valid_train_alpha = [(e, a) for e, a in zip(epochs, train_alpha) if a is not None]
     if valid_train_alpha:
         e_vals, a_vals = zip(*valid_train_alpha)
-        ax8.plot(e_vals, a_vals, 'b-o', linewidth=2, markersize=2, label='Train Alpha')
+        ax8.plot(e_vals, a_vals, 'b-o', markersize=1, label='Train Alpha')
         ax8.set_xlabel('Epoch', fontsize=11)
         ax8.set_ylabel('Alpha (Text Weight)', fontsize=11)
         ax8.set_title('Training Gate Weight (α)', fontsize=12, fontweight='bold')
         ax8.grid(True, alpha=0.3)
         ax8.legend()
-        ax8.set_ylim([0.9, 1.0])
+        ax8.set_ylim([0, 1])
     
-    # 9. Text Weight (Alpha) - Validation
+    # 9. Train Loss Weights
     ax9 = plt.subplot(3, 3, 9)
-    valid_val_alpha = [(e, a) for e, a in zip(epochs, val_alpha) if a is not None]
-    if valid_val_alpha:
-        e_vals, a_vals = zip(*valid_val_alpha)
-        ax9.plot(e_vals, a_vals, 'g-o', linewidth=2, markersize=2, label='Val Alpha')
+    valid_weights = [(e, w) for e, w in zip(epochs, train_loss_weights) if w is not None]
+    if valid_weights:
+        e_vals, w_vals = zip(*valid_weights)
+        w0 = [w[0] for w in w_vals]
+        w1 = [w[1] for w in w_vals]
+        w2 = [w[2] for w in w_vals]
+        ax9.plot(e_vals, w0, 'b-o', markersize=1, label='Text Loss Weight')
+        ax9.plot(e_vals, w1, 'g-o', markersize=1, label='Struct Loss Weight')
+        ax9.plot(e_vals, w2, 'r-o', markersize=1, label='Fused Loss Weight')
         ax9.set_xlabel('Epoch', fontsize=11)
-        ax9.set_ylabel('Alpha (Text Weight)', fontsize=11)
-        ax9.set_title('Validation Gate Weight (α)', fontsize=12, fontweight='bold')
+        ax9.set_ylabel('Loss Weight', fontsize=11)
+        ax9.set_title('Train Loss Weights', fontsize=12, fontweight='bold')
         ax9.grid(True, alpha=0.3)
         ax9.legend()
-        ax9.set_ylim([0.9, 1.0])
+        ax9.set_ylim([0, 1])
     
     plt.tight_layout()
     
@@ -215,7 +221,7 @@ def print_metrics_summary(log_data):
     if valid_train_alpha:
         print(f"\nGate Weight (α) - Text Contribution:")
         print(f"  Train - Initial: {valid_train_alpha[0]:.4f}, Final: {valid_train_alpha[-1]:.4f}")
-        print(f"  Val   - Initial: {valid_val_alpha[0]:.4f}, Final: {valid_val_alpha[-1]:.4f}")
+        # print(f"  Val   - Initial: {valid_val_alpha[0]:.4f}, Final: {valid_val_alpha[-1]:.4f}")
         print(f"  (Higher α = model relies more on text embeddings)")
     
     print("\n" + "="*70)

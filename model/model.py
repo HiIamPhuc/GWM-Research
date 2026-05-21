@@ -416,6 +416,42 @@ class GWM(nn.Module):
         )
         return loss_fused, scores
 
+    def _get_hard_negative_k(self, num_candidates):
+        hard_negative_k = int(getattr(self.config, 'hard_negative_k', 0) or 0)
+        if hard_negative_k > 0:
+            return min(hard_negative_k, max(0, num_candidates - 1))
+
+        hard_negative_fraction = float(getattr(self.config, 'hard_negative_fraction', 0.0) or 0.0)
+        if hard_negative_fraction > 0.0:
+            k = int(round(hard_negative_fraction * max(0, num_candidates - 1)))
+            return min(k, max(0, num_candidates - 1))
+
+        return 0
+
+    def _weighted_infonce_loss(self, scores):
+        batch_size, num_candidates = scores.shape
+        labels = torch.arange(batch_size, device=scores.device)
+
+        hard_negative_weight = float(getattr(self.config, 'hard_negative_weight', 1.0) or 1.0)
+        hard_negative_k = self._get_hard_negative_k(num_candidates)
+
+        if hard_negative_weight <= 1.0 or hard_negative_k <= 0:
+            loss_fn = nn.CrossEntropyLoss()
+            return loss_fn(scores, labels)
+
+        weights = torch.ones_like(scores)
+        scores_neg = scores.clone()
+        scores_neg.fill_diagonal_(float('-inf'))
+        topk_idx = torch.topk(scores_neg, hard_negative_k, dim=1).indices
+        weights.scatter_(1, topk_idx, hard_negative_weight)
+
+        max_scores = scores.max(dim=1, keepdim=True).values
+        exp_scores = torch.exp(scores - max_scores)
+        denom = (weights * exp_scores).sum(dim=1)
+        log_denom = torch.log(denom) + max_scores.squeeze(1)
+        loss = -scores[labels, labels] + log_denom
+        return loss.mean()
+
     def compute_loss_components(self, query_vectors, target_vectors):
         query_text, query_struct = query_vectors
         target_text, target_struct = target_vectors
@@ -433,11 +469,9 @@ class GWM(nn.Module):
         scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
         self._record_alpha(alpha)
 
-        labels = torch.arange(scores_fused.size(0), device=scores_fused.device)
-        loss_fn = nn.CrossEntropyLoss()
-        loss_text = loss_fn(scores_text, labels)
-        loss_struct = loss_fn(scores_struct, labels)
-        loss_fused = loss_fn(scores_fused, labels)
+        loss_text = self._weighted_infonce_loss(scores_text)
+        loss_struct = self._weighted_infonce_loss(scores_struct)
+        loss_fused = self._weighted_infonce_loss(scores_fused)
 
         return loss_text, loss_struct, loss_fused, scores_fused
 

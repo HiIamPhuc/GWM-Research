@@ -324,7 +324,7 @@ def resume_training(args):
 			optimizer.zero_grad()
 			query_vector = model(h_batch, r_batch, context_batch)
 			t_fused = model.encode_target(t_batch)
-			loss, _ = model.compute_loss(query_vector, t_fused)
+			loss, _ = model.compute_loss(query_vector, t_fused, relation_ids=r_batch['id'])
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 			optimizer.step()

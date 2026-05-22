@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 
@@ -116,6 +117,16 @@ class GWM(nn.Module):
         )
         self._alpha_sum = 0.0
         self._alpha_count = 0
+
+        self.per_relation_temperature = bool(getattr(config, 'per_relation_temperature', False))
+        if self.per_relation_temperature:
+            base_temp = float(getattr(config, 'temperature', 0.07))
+            base_temp = max(base_temp, 1e-4)
+            init_log_temp = math.log(base_temp)
+            self.text_rel_log_temp = nn.Embedding(config.num_relations, 1)
+            self.struct_rel_log_temp = nn.Embedding(config.num_relations, 1)
+            nn.init.constant_(self.text_rel_log_temp.weight, init_log_temp)
+            nn.init.constant_(self.struct_rel_log_temp.weight, init_log_temp)
 
         self.learnable_loss_weights = bool(getattr(config, 'learnable_loss_weights', False))
         if self.learnable_loss_weights:
@@ -411,10 +422,11 @@ class GWM(nn.Module):
         t_struct_norm = torch.nn.functional.normalize(t_struct_proj, p=2, dim=1)
         return t_text_norm, t_struct_norm
 
-    def compute_loss(self, query_vectors, target_vectors):
+    def compute_loss(self, query_vectors, target_vectors, relation_ids=None):
         loss_text, loss_struct, loss_fused, scores = self.compute_loss_components(
             query_vectors,
-            target_vectors
+            target_vectors,
+            relation_ids=relation_ids,
         )
         return loss_fused, scores
 
@@ -470,16 +482,39 @@ class GWM(nn.Module):
         self._record_alpha(alpha)
         return alpha
 
-    def compute_loss_components(self, query_vectors, target_vectors):
+    def _get_relation_temperatures(self, relation_ids, device, dtype):
+        if not self.per_relation_temperature or relation_ids is None:
+            base_temp = float(getattr(self.config, 'temperature', 0.07))
+            base_temp = max(base_temp, 1e-4)
+            temp = torch.tensor(base_temp, device=device, dtype=dtype)
+            return temp, temp
+
+        log_temp_text = self.text_rel_log_temp(relation_ids).squeeze(-1)
+        log_temp_struct = self.struct_rel_log_temp(relation_ids).squeeze(-1)
+        temp_text = torch.exp(log_temp_text).clamp(min=1e-4)
+        temp_struct = torch.exp(log_temp_struct).clamp(min=1e-4)
+        return temp_text.unsqueeze(1), temp_struct.unsqueeze(1)
+
+    def apply_temperature(self, scores_text, scores_struct, relation_ids=None):
+        temp_text, temp_struct = self._get_relation_temperatures(
+            relation_ids,
+            device=scores_text.device,
+            dtype=scores_text.dtype,
+        )
+        return scores_text / temp_text, scores_struct / temp_struct
+
+    def compute_loss_components(self, query_vectors, target_vectors, relation_ids=None):
         query_text, query_struct, relation_text, relation_struct = self._split_query_vectors(query_vectors)
         target_text, target_struct = target_vectors
 
         scores_text = torch.mm(query_text, target_text.t())
         scores_struct = torch.mm(query_struct, target_struct.t())
 
-        temp = getattr(self.config, 'temperature', 0.07)
-        scores_text = scores_text / temp
-        scores_struct = scores_struct / temp
+        scores_text, scores_struct = self.apply_temperature(
+            scores_text,
+            scores_struct,
+            relation_ids=relation_ids,
+        )
 
         # Score Level Fusion
         alpha = self.compute_alpha(query_text, query_struct, relation_text, relation_struct)

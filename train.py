@@ -294,7 +294,8 @@ def train(args):
             if use_multi_loss:
                 loss_text, loss_struct, loss_fused, _ = model.compute_loss_components(
                     query_vector,
-                    t_fused
+                    t_fused,
+                    relation_ids=r_batch['id'],
                 )
                 losses = [loss_text, loss_struct, loss_fused]
 
@@ -348,7 +349,7 @@ def train(args):
                 pbar.set_postfix({'loss': weighted_loss.item()})
             else:
                 # Loss: In-Batch Negatives (fused only)
-                loss, _ = model.compute_loss(query_vector, t_fused)
+                loss, _ = model.compute_loss(query_vector, t_fused, relation_ids=r_batch['id'])
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)

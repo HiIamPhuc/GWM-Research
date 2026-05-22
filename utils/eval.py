@@ -134,6 +134,11 @@ def compute_filtered_ranking_metrics(
             
             scores_text = torch.mm(q_text, all_t_text.t())
             scores_struct = torch.mm(q_struct, all_t_struct.t())
+            scores_text, scores_struct = model.apply_temperature(
+                scores_text,
+                scores_struct,
+                relation_ids=r_batch['id'],
+            )
             alpha = model.compute_alpha(q_text, q_struct, rel_text, rel_struct)
             scores = alpha * scores_text + (1.0 - alpha) * scores_struct
 

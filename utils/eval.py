@@ -124,12 +124,17 @@ def compute_filtered_ranking_metrics(
             h_ids = batch['h_batch']['id'].cpu().numpy()
             r_ids = batch['r_batch']['id'].cpu().numpy()
 
-            q_text, q_struct = model(h_batch, r_batch, context_batch)
+            q_out = model(h_batch, r_batch, context_batch)
+            if len(q_out) == 2:
+                q_text, q_struct = q_out
+                rel_text = None
+                rel_struct = None
+            else:
+                q_text, q_struct, rel_text, rel_struct = q_out
             
             scores_text = torch.mm(q_text, all_t_text.t())
             scores_struct = torch.mm(q_struct, all_t_struct.t())
-            head_combined = torch.cat([q_text, q_struct], dim=-1)
-            alpha = model.alpha_mlp(head_combined)
+            alpha = model.compute_alpha(q_text, q_struct, rel_text, rel_struct)
             scores = alpha * scores_text + (1.0 - alpha) * scores_struct
 
             for i in range(scores.size(0)):

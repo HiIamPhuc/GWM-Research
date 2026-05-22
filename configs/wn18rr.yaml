@@ -16,6 +16,7 @@ dynamics_layers: 1
 
 dropout: 0.1
 recurrent_dropout: 0.1
+alpha_relation_only: true
 
 learning_rate: 5e-5
 weight_decay: 0.001

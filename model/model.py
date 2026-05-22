@@ -106,8 +106,10 @@ class GWM(nn.Module):
 
         self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
 
+        self.alpha_relation_only = bool(getattr(config, 'alpha_relation_only', False))
+        alpha_in_dim = self.text_dynamics_dim + self.struct_dynamics_dim
         self.alpha_mlp = nn.Sequential(
-            nn.Linear(self.text_dynamics_dim + self.struct_dynamics_dim, 64),
+            nn.Linear(alpha_in_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
             nn.Sigmoid(),
@@ -396,7 +398,7 @@ class GWM(nn.Module):
             self.struct_dynamics_mixer, self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection
         )
 
-        return query_text, query_struct
+        return query_text, query_struct, relation_emb_text, relation_emb_struct
 
     def encode_target(self, t_batch):
         t_emb_text = self.text_adapter(self.text_entity_embeddings(t_batch['id']))
@@ -452,8 +454,24 @@ class GWM(nn.Module):
         loss = -scores[labels, labels] + log_denom
         return loss.mean()
 
+    def _split_query_vectors(self, query_vectors):
+        if len(query_vectors) == 2:
+            return query_vectors[0], query_vectors[1], None, None
+        return query_vectors[0], query_vectors[1], query_vectors[2], query_vectors[3]
+
+    def compute_alpha(self, query_text, query_struct, relation_text=None, relation_struct=None):
+        if self.alpha_relation_only:
+            if relation_text is None or relation_struct is None:
+                raise ValueError("alpha_relation_only requires relation embeddings in query_vectors.")
+            alpha_input = torch.cat([relation_text, relation_struct], dim=-1)
+        else:
+            alpha_input = torch.cat([query_text, query_struct], dim=-1)
+        alpha = self.alpha_mlp(alpha_input)
+        self._record_alpha(alpha)
+        return alpha
+
     def compute_loss_components(self, query_vectors, target_vectors):
-        query_text, query_struct = query_vectors
+        query_text, query_struct, relation_text, relation_struct = self._split_query_vectors(query_vectors)
         target_text, target_struct = target_vectors
 
         scores_text = torch.mm(query_text, target_text.t())
@@ -464,10 +482,8 @@ class GWM(nn.Module):
         scores_struct = scores_struct / temp
 
         # Score Level Fusion
-        head_combined = torch.cat([query_text, query_struct], dim=-1)
-        alpha = self.alpha_mlp(head_combined)
+        alpha = self.compute_alpha(query_text, query_struct, relation_text, relation_struct)
         scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
-        self._record_alpha(alpha)
 
         loss_text = self._weighted_infonce_loss(scores_text)
         loss_struct = self._weighted_infonce_loss(scores_struct)

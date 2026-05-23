@@ -29,6 +29,7 @@ def plot_training_curves(log_data, output_path=None):
     
     train_alpha = [entry.get('train_alpha', None) for entry in log_data]
     val_alpha = [entry.get('val_alpha', None) for entry in log_data]
+    train_sigreg = [entry.get('train_sigreg', None) for entry in log_data]
     
     # Create figure with subplots
     fig = plt.figure(figsize=(16, 12))
@@ -146,6 +147,18 @@ def plot_training_curves(log_data, output_path=None):
         ax8.grid(True, alpha=0.3)
         ax8.legend()
         ax8.set_ylim([0, 1])
+
+    # 9. SIGReg (Train)
+    ax9 = plt.subplot(3, 3, 9)
+    valid_sigreg = [(e, s) for e, s in zip(epochs, train_sigreg) if s is not None]
+    if valid_sigreg:
+        e_vals, s_vals = zip(*valid_sigreg)
+        ax9.plot(e_vals, s_vals, 'teal', marker='o', markersize=1, label='Train SIGReg')
+        ax9.set_xlabel('Epoch', fontsize=11)
+        ax9.set_ylabel('SIGReg', fontsize=11)
+        ax9.set_title('Training SIGReg', fontsize=12, fontweight='bold')
+        ax9.grid(True, alpha=0.3)
+        ax9.legend()
     
     plt.tight_layout()
     

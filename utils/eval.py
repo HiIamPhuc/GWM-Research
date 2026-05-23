@@ -129,8 +129,10 @@ def compute_filtered_ranking_metrics(
                 q_text, q_struct = q_out
                 rel_text = None
                 rel_struct = None
-            else:
+            elif len(q_out) == 4:
                 q_text, q_struct, rel_text, rel_struct = q_out
+            else:
+                q_text, q_struct, rel_text, rel_struct, _, _ = q_out
             
             scores_text = torch.mm(q_text, all_t_text.t())
             scores_struct = torch.mm(q_struct, all_t_struct.t())

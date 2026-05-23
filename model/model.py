@@ -65,6 +65,42 @@ class MLPAdapter(nn.Module):
         x = self.fc2(x)
         return residual + x
 
+
+class SIGReg(nn.Module):
+    """LeWM-style isotropic Gaussian regularizer using random projections."""
+
+    def __init__(self, knots=17, num_proj=1024):
+        super().__init__()
+        self.num_proj = int(num_proj)
+        t = torch.linspace(0, 3, int(knots), dtype=torch.float32)
+        dt = 3.0 / max(int(knots) - 1, 1)
+        weights = torch.full((int(knots),), 2 * dt, dtype=torch.float32)
+        if weights.numel() > 1:
+            weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, proj):
+        """
+        proj: (T, B, D)
+        """
+        if proj.numel() == 0:
+            return proj.new_zeros(())
+
+        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device, dtype=proj.dtype)
+        A = A.div_(A.norm(p=2, dim=0, keepdim=True).clamp(min=1e-12))
+
+        t = self.t.to(dtype=proj.dtype)
+        phi = self.phi.to(dtype=proj.dtype)
+        weights = self.weights.to(dtype=proj.dtype)
+
+        x_t = (proj @ A).unsqueeze(-1) * t
+        err = (x_t.cos().mean(-3) - phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ weights) * proj.size(-2)
+        return statistic.mean()
+
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -128,9 +164,13 @@ class GWM(nn.Module):
             nn.init.constant_(self.text_rel_log_temp.weight, init_log_temp)
             nn.init.constant_(self.struct_rel_log_temp.weight, init_log_temp)
 
-        self.learnable_loss_weights = bool(getattr(config, 'learnable_loss_weights', False))
-        if self.learnable_loss_weights:
-            self.loss_weight_logits = nn.Parameter(torch.zeros(3))
+        self.sigreg_weight = float(getattr(config, 'sigreg_weight', 0.0) or 0.0)
+        if self.sigreg_weight > 0.0:
+            sigreg_knots = int(getattr(config, 'sigreg_knots', 17))
+            sigreg_num_proj = int(getattr(config, 'sigreg_num_proj', 1024))
+            self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
+        else:
+            self.sigreg = None
 
         def _build_projection(in_dim, out_dim):
             if in_dim == out_dim:
@@ -213,8 +253,8 @@ class GWM(nn.Module):
         lstm_out, (h_n, c_n) = lstm(lstm_input, (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
         query_vector = self.recurrent_dropout_layer(query_vector)
-        
-        return torch.nn.functional.normalize(query_vector, p=2, dim=1)
+        query_norm = torch.nn.functional.normalize(query_vector, p=2, dim=1)
+        return query_vector, query_norm
 
     def _load_embedding_tensor(self, source, expected_rows, name):
         if isinstance(source, str):
@@ -389,7 +429,7 @@ class GWM(nn.Module):
         step_x_text = self.text_dynamics_projection(h_emb_text)
         relation_emb_text = self.text_dynamics_projection(r_emb_text)
         
-        query_text = self._run_dynamics(
+        query_text_raw, query_text = self._run_dynamics(
             world_state_text, step_x_text, relation_emb_text,
             self.text_dynamics_mixer, self.text_lstm, self.text_h0_projection, self.text_c0_projection
         )
@@ -404,12 +444,12 @@ class GWM(nn.Module):
         step_x_struct = self.struct_dynamics_projection(h_struct)
         relation_emb_struct = self.struct_dynamics_projection(r_struct)
         
-        query_struct = self._run_dynamics(
+        query_struct_raw, query_struct = self._run_dynamics(
             world_state_struct, step_x_struct, relation_emb_struct,
             self.struct_dynamics_mixer, self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection
         )
 
-        return query_text, query_struct, relation_emb_text, relation_emb_struct
+        return query_text, query_struct, relation_emb_text, relation_emb_struct, query_text_raw, query_struct_raw
 
     def encode_target(self, t_batch):
         t_emb_text = self.text_adapter(self.text_entity_embeddings(t_batch['id']))
@@ -423,12 +463,12 @@ class GWM(nn.Module):
         return t_text_norm, t_struct_norm
 
     def compute_loss(self, query_vectors, target_vectors, relation_ids=None):
-        loss_text, loss_struct, loss_fused, scores = self.compute_loss_components(
+        loss_text, loss_struct, scores = self.compute_loss_components(
             query_vectors,
             target_vectors,
             relation_ids=relation_ids,
         )
-        return loss_fused, scores
+        return loss_text + loss_struct, scores
 
     def _get_hard_negative_k(self, num_candidates):
         hard_negative_k = int(getattr(self.config, 'hard_negative_k', 0) or 0)
@@ -468,8 +508,29 @@ class GWM(nn.Module):
 
     def _split_query_vectors(self, query_vectors):
         if len(query_vectors) == 2:
-            return query_vectors[0], query_vectors[1], None, None
-        return query_vectors[0], query_vectors[1], query_vectors[2], query_vectors[3]
+            return query_vectors[0], query_vectors[1], None, None, None, None
+        if len(query_vectors) == 4:
+            return query_vectors[0], query_vectors[1], query_vectors[2], query_vectors[3], None, None
+        if len(query_vectors) >= 6:
+            return (
+                query_vectors[0],
+                query_vectors[1],
+                query_vectors[2],
+                query_vectors[3],
+                query_vectors[4],
+                query_vectors[5],
+            )
+        raise ValueError(f"Unexpected query vector format (len={len(query_vectors)}).")
+
+    def compute_sigreg_loss(self, query_vectors):
+        if self.sigreg is None or self.sigreg_weight <= 0.0:
+            return None
+        _, _, _, _, query_text_raw, query_struct_raw = self._split_query_vectors(query_vectors)
+        if query_text_raw is None or query_struct_raw is None:
+            return None
+        sig_text = self.sigreg(query_text_raw.unsqueeze(0))
+        sig_struct = self.sigreg(query_struct_raw.unsqueeze(0))
+        return 0.5 * (sig_text + sig_struct)
 
     def compute_alpha(self, query_text, query_struct, relation_text=None, relation_struct=None):
         if self.alpha_relation_only:
@@ -504,7 +565,7 @@ class GWM(nn.Module):
         return scores_text / temp_text, scores_struct / temp_struct
 
     def compute_loss_components(self, query_vectors, target_vectors, relation_ids=None):
-        query_text, query_struct, relation_text, relation_struct = self._split_query_vectors(query_vectors)
+        query_text, query_struct, relation_text, relation_struct, _, _ = self._split_query_vectors(query_vectors)
         target_text, target_struct = target_vectors
 
         scores_text = torch.mm(query_text, target_text.t())
@@ -522,11 +583,5 @@ class GWM(nn.Module):
 
         loss_text = self._weighted_infonce_loss(scores_text)
         loss_struct = self._weighted_infonce_loss(scores_struct)
-        loss_fused = self._weighted_infonce_loss(scores_fused)
 
-        return loss_text, loss_struct, loss_fused, scores_fused
-
-    def get_loss_weights(self):
-        if not hasattr(self, 'loss_weight_logits'):
-            return None
-        return torch.softmax(self.loss_weight_logits, dim=0)
+        return loss_text, loss_struct, scores_fused

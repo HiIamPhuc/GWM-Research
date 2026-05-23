@@ -310,6 +310,8 @@ def resume_training(args):
 	for epoch in range(start_epoch, int(config.num_epochs)):
 		model.train()
 		total_loss = 0.0
+		total_sigreg = 0.0
+		sigreg_batches = 0
 
 		if hasattr(model, 'reset_alpha_stats'):
 			model.reset_alpha_stats()
@@ -324,7 +326,19 @@ def resume_training(args):
 			optimizer.zero_grad()
 			query_vector = model(h_batch, r_batch, context_batch)
 			t_fused = model.encode_target(t_batch)
-			loss, _ = model.compute_loss(query_vector, t_fused, relation_ids=r_batch['id'])
+			loss_text, loss_struct, _ = model.compute_loss_components(
+				query_vector,
+				t_fused,
+				relation_ids=r_batch['id'],
+			)
+			main_loss = loss_text + loss_struct
+			sigreg_loss = model.compute_sigreg_loss(query_vector)
+			if sigreg_loss is None:
+				loss = main_loss
+			else:
+				loss = main_loss + model.sigreg_weight * sigreg_loss
+				total_sigreg += sigreg_loss.item()
+				sigreg_batches += 1
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 			optimizer.step()
@@ -334,10 +348,15 @@ def resume_training(args):
 			pbar.set_postfix({'loss': loss.item()})
 
 		avg_train_loss = total_loss / max(1, len(train_loader))
+		avg_sigreg = None
+		if sigreg_batches > 0:
+			avg_sigreg = total_sigreg / sigreg_batches
 		train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
 		print(f"Epoch {epoch + 1} Train Loss: {avg_train_loss:.4f}")
 		if train_alpha is not None:
 			print(f"Epoch {epoch + 1} Train Alpha (text weight): {train_alpha:.4f}")
+		if avg_sigreg is not None:
+			print(f"Epoch {epoch + 1} Train SIGReg: {avg_sigreg:.6f}")
 
 		eval_every = getattr(config, 'eval_every', 1)
 		epoch_log = {
@@ -389,6 +408,8 @@ def resume_training(args):
 			})
 			if train_alpha is not None:
 				epoch_log['train_alpha'] = train_alpha
+			if avg_sigreg is not None:
+				epoch_log['train_sigreg'] = avg_sigreg
 			if val_alpha is not None:
 				epoch_log['val_alpha'] = val_alpha
 
@@ -407,6 +428,8 @@ def resume_training(args):
 		else:
 			if train_alpha is not None:
 				epoch_log['train_alpha'] = train_alpha
+			if avg_sigreg is not None:
+				epoch_log['train_sigreg'] = avg_sigreg
 
 		history.append(epoch_log)
 		save_training_history(history, config.output_dir)

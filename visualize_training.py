@@ -29,7 +29,6 @@ def plot_training_curves(log_data, output_path=None):
     
     train_alpha = [entry.get('train_alpha', None) for entry in log_data]
     val_alpha = [entry.get('val_alpha', None) for entry in log_data]
-    train_loss_weights = [entry.get('train_loss_weights', None) for entry in log_data]
     
     # Create figure with subplots
     fig = plt.figure(figsize=(16, 12))
@@ -147,24 +146,6 @@ def plot_training_curves(log_data, output_path=None):
         ax8.grid(True, alpha=0.3)
         ax8.legend()
         ax8.set_ylim([0, 1])
-    
-    # 9. Train Loss Weights
-    ax9 = plt.subplot(3, 3, 9)
-    valid_weights = [(e, w) for e, w in zip(epochs, train_loss_weights) if w is not None]
-    if valid_weights:
-        e_vals, w_vals = zip(*valid_weights)
-        w0 = [w[0] for w in w_vals]
-        w1 = [w[1] for w in w_vals]
-        w2 = [w[2] for w in w_vals]
-        ax9.plot(e_vals, w0, 'b-o', markersize=1, label='Text Loss Weight')
-        ax9.plot(e_vals, w1, 'g-o', markersize=1, label='Struct Loss Weight')
-        ax9.plot(e_vals, w2, 'r-o', markersize=1, label='Fused Loss Weight')
-        ax9.set_xlabel('Epoch', fontsize=11)
-        ax9.set_ylabel('Loss Weight', fontsize=11)
-        ax9.set_title('Train Loss Weights', fontsize=12, fontweight='bold')
-        ax9.grid(True, alpha=0.3)
-        ax9.legend()
-        ax9.set_ylim([0, 1])
     
     plt.tight_layout()
     

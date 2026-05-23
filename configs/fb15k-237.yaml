@@ -31,17 +31,15 @@ batch_size: 2048
 eval_batch_size: 2048
 candidate_batch_size: 2048
 
-loss: infonce
 temperature: 0.07
 per_relation_temperature: true
 hard_negative_k: 0
 hard_negative_fraction: 0.05
 hard_negative_weight: 2.0
 
-use_multi_loss: true
-use_pcgrad: true
-learnable_loss_weights: true
-loss_weights: [1.0, 1.0, 1.0]
+sigreg_weight: 0.09
+sigreg_knots: 17
+sigreg_num_proj: 1024
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

@@ -32,12 +32,12 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
-per_relation_temperature: false
+per_relation_temperature: true
 hard_negative_k: 0
-hard_negative_fraction: 0
-hard_negative_weight: 1.0
+hard_negative_fraction: 0.2
+hard_negative_weight: 3.0
 
-sigreg_weight: 0.05
+sigreg_weight: 0.001
 sigreg_knots: 15
 sigreg_num_proj: 1024
 

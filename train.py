@@ -218,7 +218,7 @@ def train(args):
         if hasattr(model, 'reset_alpha_stats'):
             model.reset_alpha_stats()
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} [Train]")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
             # Move batch to device (handle nested dicts)
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
@@ -280,7 +280,6 @@ def train(args):
                 model=model,
                 entity_loader=entity_loader,
                 device=device,
-                desc="Encoding Validation Candidates",
             )
 
             save_eval_predictions = bool(getattr(config, 'save_eval_predictions', False))
@@ -298,7 +297,7 @@ def train(args):
                 all_entity_embeddings=all_entity_embeddings,
                 hr_map=hr_map,
                 device=device,
-                desc="Filtered Validation",
+                desc="Validation",
                 save_predictions_path=predictions_path,
                 topk=eval_topk,
             )
@@ -311,7 +310,7 @@ def train(args):
             val_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
             
             print(
-                f"Epoch {epoch+1} Val (Filtered) | "
+                f"Epoch {epoch+1} Val | "
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
                 f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
             )

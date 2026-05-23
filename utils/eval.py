@@ -78,12 +78,12 @@ def build_entity_loader(data_dir, batch_size, num_workers=2):
     )
 
 
-def encode_all_entities_as_targets(model, entity_loader, device, desc="Encoding Entities"):
+def encode_all_entities_as_targets(model, entity_loader, device):
     all_text_chunks = []
     all_struct_chunks = []
     model.eval()
     with torch.no_grad():
-        for batch in tqdm(entity_loader, desc=desc):
+        for batch in entity_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             txt, struct = model.encode_target(batch)
             all_text_chunks.append(txt.cpu())

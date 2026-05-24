@@ -200,11 +200,6 @@ class GWM(nn.Module):
         ])
         
         # 4. Text Transition Dynamics
-        self.text_dynamics_mixer = nn.Sequential(
-            nn.Linear(self.text_dynamics_dim * 2, self.text_dynamics_dim * 2),
-            nn.GELU(),
-            nn.Linear(self.text_dynamics_dim * 2, self.text_dynamics_dim)
-        )
         self.text_lstm = nn.LSTM(
             input_size=self.text_dynamics_dim, hidden_size=self.text_dynamics_dim,
             num_layers=int(getattr(config, 'dynamics_layers', 1)), batch_first=True
@@ -213,11 +208,6 @@ class GWM(nn.Module):
         self.text_c0_projection = _build_projection(self.text_compgcn_dim, self.text_dynamics_dim)
 
         # 5. Struct Transition Dynamics
-        self.struct_dynamics_mixer = nn.Sequential(
-            nn.Linear(self.struct_dynamics_dim * 2, self.struct_dynamics_dim * 2),
-            nn.GELU(),
-            nn.Linear(self.struct_dynamics_dim * 2, self.struct_dynamics_dim)
-        )
         self.struct_lstm = nn.LSTM(
             input_size=self.struct_dynamics_dim, hidden_size=self.struct_dynamics_dim,
             num_layers=int(getattr(config, 'dynamics_layers', 1)), batch_first=True
@@ -226,6 +216,9 @@ class GWM(nn.Module):
         self.struct_c0_projection = _build_projection(self.struct_compgcn_dim, self.struct_dynamics_dim)
 
         self.recurrent_dropout_layer = nn.Dropout(self.recurrent_dropout) if self.recurrent_dropout > 0 else nn.Identity()
+        # FiLM (relation-conditioned) projections for modulating LSTM inputs
+        self.text_film = nn.Linear(self.text_dynamics_dim, 2 * self.text_dynamics_dim)
+        self.struct_film = nn.Linear(self.struct_dynamics_dim, 2 * self.struct_dynamics_dim)
 
     def _encode_subgraph_with_compgcn(self, h_emb, ctx_entity_emb, ctx_relation_emb, ctx_batch_index, compgcn_stack):
         h_state = h_emb
@@ -238,19 +231,35 @@ class GWM(nn.Module):
             )
         return h_state
 
-    def _run_dynamics(self, world_state, step_x, relation_emb, mixer, lstm, h0_proj, c0_proj):
+    def _run_dynamics(self, world_state, step_seq, relation_emb, lstm, h0_proj, c0_proj, path='text'):
+        """
+        Run recurrent dynamics over a sequence of steps.
+
+        world_state: (B, compgcn_dim) used to initialise h0/c0
+        step_seq: (B, T, D) sequence of per-step inputs (already projected to dynamics dim)
+        relation_emb: (B, D_rel) projected relation embedding for this path
+        path: 'text' or 'struct' to select FiLM projection
+        """
         h_0 = torch.tanh(h0_proj(world_state))
         c_0 = c0_proj(world_state)
-        
-        concat_input = torch.cat([step_x, relation_emb], dim=-1)
-        mixed_input = mixer(concat_input)
-        lstm_input = mixed_input.unsqueeze(1)
-        
+
+        # Prepare initial LSTM states
         num_layers = lstm.num_layers
         h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
         c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
-        
-        lstm_out, (h_n, c_n) = lstm(lstm_input, (h_0_lstm, c_0_lstm))
+
+        # Relation-conditioned FiLM modulation on the step inputs
+        if path == 'text':
+            film_params = self.text_film(relation_emb)
+        else:
+            film_params = self.struct_film(relation_emb)
+
+        shift, scale = film_params.chunk(2, dim=-1)
+        # apply modulation across time steps
+        step_seq = (1.0 + scale.unsqueeze(1)) * step_seq + shift.unsqueeze(1)
+
+        # Run LSTM over the sequence
+        lstm_out, (h_n, c_n) = lstm(step_seq, (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
         query_vector = self.recurrent_dropout_layer(query_vector)
         query_norm = torch.nn.functional.normalize(query_vector, p=2, dim=1)
@@ -426,12 +435,20 @@ class GWM(nn.Module):
         )
         world_state_text = self.input_dropout(world_state_text)
         
-        step_x_text = self.text_dynamics_projection(h_emb_text)
+        # Build sequence of per-step node embeddings when context is provided as (B, K)
+        if context_entity_ids.dim() == 2:
+            # ctx_ent_text is flattened; reconstruct per-batch sequence directly from ids
+            ctx_ent_text_seq = self.text_adapter(self.text_entity_embeddings(context_entity_ids))
+            step_seq_text = self.text_dynamics_projection(ctx_ent_text_seq)
+        else:
+            # ragged / flattened fallback: use single-step head embedding
+            step_seq_text = self.text_dynamics_projection(h_emb_text).unsqueeze(1)
+
         relation_emb_text = self.text_dynamics_projection(r_emb_text)
-        
+
         query_text_raw, query_text = self._run_dynamics(
-            world_state_text, step_x_text, relation_emb_text,
-            self.text_dynamics_mixer, self.text_lstm, self.text_h0_projection, self.text_c0_projection
+            world_state_text, step_seq_text, relation_emb_text,
+            self.text_lstm, self.text_h0_projection, self.text_c0_projection, path='text'
         )
 
         # -- Struct Pathway --
@@ -441,12 +458,17 @@ class GWM(nn.Module):
         )
         world_state_struct = self.input_dropout(world_state_struct)
         
-        step_x_struct = self.struct_dynamics_projection(h_struct)
+        if context_entity_ids.dim() == 2:
+            ctx_ent_struct_seq = self.struct_adapter(self.entity_embeddings(context_entity_ids))
+            step_seq_struct = self.struct_dynamics_projection(ctx_ent_struct_seq)
+        else:
+            step_seq_struct = self.struct_dynamics_projection(h_struct).unsqueeze(1)
+
         relation_emb_struct = self.struct_dynamics_projection(r_struct)
-        
+
         query_struct_raw, query_struct = self._run_dynamics(
-            world_state_struct, step_x_struct, relation_emb_struct,
-            self.struct_dynamics_mixer, self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection
+            world_state_struct, step_seq_struct, relation_emb_struct,
+            self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection, path='struct'
         )
 
         return query_text, query_struct, relation_emb_text, relation_emb_struct, query_text_raw, query_struct_raw

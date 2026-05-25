@@ -1,6 +1,6 @@
 # Config for context-aware GWM with precomputed text embeddings
 text_embedding_dim: 768
-text_adapter_dim: 1536
+text_adapter_dim: 768
 structural_dim: 896
 struct_adapter_dim: 896
 adapter_dropout: 0.1

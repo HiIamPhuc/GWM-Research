@@ -75,7 +75,7 @@ class GWM(nn.Module):
         self.text_adapter = MLPAdapter(self.text_emb_dim, int(getattr(config, 'text_adapter_dim')), dropout=float(getattr(config, 'adapter_dropout')))
         self.struct_adapter = MLPAdapter(self.struct_emb_dim, int(getattr(config, 'struct_adapter_dim')), dropout=float(getattr(config, 'adapter_dropout')))
 
-        self.input_dropout = nn.Dropout(float(getattr(config, 'dropout'))) if self.dropout_rate > 0 else nn.Identity()
+        self.input_dropout = nn.Dropout(float(getattr(config, 'dropout')))
 
         self.fusion_alpha = min(max(float(getattr(config, 'fusion_alpha')), 0.0), 1.0)
         self.temperature = float(getattr(config, 'temperature'))

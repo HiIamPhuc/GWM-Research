@@ -38,6 +38,33 @@ def _to_serializable(value):
 	return str(value)
 
 
+def _get_model_parameter_info(model):
+	total_params = 0
+	trainable_params = 0
+	param_details = []
+
+	for name, param in model.named_parameters():
+		numel = int(param.numel())
+		total_params += numel
+		if param.requires_grad:
+			trainable_params += numel
+
+		param_details.append({
+			'name': name,
+			'shape': list(param.shape),
+			'numel': numel,
+			'requires_grad': bool(param.requires_grad),
+			'dtype': str(param.dtype).replace('torch.', ''),
+		})
+
+	return {
+		'total': total_params,
+		'trainable': trainable_params,
+		'frozen': total_params - trainable_params,
+		'parameters': param_details,
+	}
+
+
 def load_training_config(checkpoint_dir, data_dir=None, output_dir=None):
 	config_path = os.path.join(checkpoint_dir, 'training_config.json')
 	if not os.path.exists(config_path):
@@ -76,10 +103,12 @@ def save_training_history(history, checkpoint_dir):
 		json.dump(history, f, indent=2)
 
 
-def save_training_config(config, checkpoint_dir, args=None):
+def save_training_config(config, checkpoint_dir, args=None, model=None):
 	config_dict = {k: _to_serializable(v) for k, v in vars(config).items()}
 	if args is not None:
 		config_dict['resume_cli_args'] = {k: _to_serializable(v) for k, v in vars(args).items()}
+	if model is not None:
+		config_dict['model_parameters'] = _get_model_parameter_info(model)
 
 	config_path = os.path.join(checkpoint_dir, 'training_config.json')
 	with open(config_path, 'w', encoding='utf-8') as f:
@@ -201,8 +230,6 @@ def resume_training(args):
 	config.num_entities = num_entities
 	config.num_relations = num_relations
 
-	save_training_config(config, config.output_dir, args=args)
-
 	print("Loading model...")
 	model = GWM(config).to(device)
 
@@ -220,6 +247,8 @@ def resume_training(args):
 		kind='text',
 		freeze=True,
 	)
+
+	save_training_config(config, config.output_dir, args=args, model=model)
 
 	checkpoint_path = resolve_checkpoint_path(checkpoint_dir, checkpoint_name=args.checkpoint_name)
 	print(f"Restoring weights from: {checkpoint_path}")

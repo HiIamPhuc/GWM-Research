@@ -32,11 +32,40 @@ def _to_serializable(value):
     return str(value)
 
 
-def save_training_config(config, output_dir, args=None):
+def _get_model_parameter_info(model):
+    total_params = 0
+    trainable_params = 0
+    param_details = []
+
+    for name, param in model.named_parameters():
+        numel = int(param.numel())
+        total_params += numel
+        if param.requires_grad:
+            trainable_params += numel
+
+        param_details.append({
+            'name': name,
+            'shape': list(param.shape),
+            'numel': numel,
+            'requires_grad': bool(param.requires_grad),
+            'dtype': str(param.dtype).replace('torch.', ''),
+        })
+
+    return {
+        'total': total_params,
+        'trainable': trainable_params,
+        'frozen': total_params - trainable_params,
+        'parameters': param_details,
+    }
+
+
+def save_training_config(config, output_dir, args=None, model=None):
     """Persist the effective training config used for this run."""
     config_dict = {k: _to_serializable(v) for k, v in vars(config).items()}
     if args is not None:
         config_dict['cli_args'] = {k: _to_serializable(v) for k, v in vars(args).items()}
+    if model is not None:
+        config_dict['model_parameters'] = _get_model_parameter_info(model)
 
     config_path = os.path.join(output_dir, 'training_config.json')
     with open(config_path, 'w', encoding='utf-8') as f:
@@ -84,9 +113,6 @@ def train(args):
         
     config.num_entities = num_ent
     config.num_relations = num_rel
-    
-    # Save effective config (including inferred dimensions and CLI overrides).
-    save_training_config(config, config.output_dir, args=args)
     
     # Init Model
     print("Initializing model...")
@@ -136,6 +162,9 @@ def train(args):
             )
         else:
             print(f"Warning: Structural priors not found at {structural_entity_source} or {structural_relation_source}")
+
+    # Save effective config (including inferred dimensions, CLI overrides, and model params).
+    save_training_config(config, config.output_dir, args=args, model=model)
     
     base_lr = float(config.learning_rate)
     weight_decay = float(getattr(config, 'weight_decay', 0.0))

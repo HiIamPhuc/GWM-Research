@@ -114,9 +114,10 @@ def train(args):
         )
 
     print("Loading precomputed text embeddings into text embedding tables...")
-    model.load_precomputed_text_cache(
+    model.load_embeddings(
         entity_source=entity_emb_path,
         relation_source=relation_emb_path,
+        kind='text',
         freeze=True,
     )
     print("Text embeddings ready. Training uses ID-only batches with context IDs.")
@@ -127,9 +128,10 @@ def train(args):
     if structural_entity_source and structural_relation_source:
         print("Loading precomputed structural priors (e.g. RotatE)...")
         if os.path.exists(structural_entity_source) and os.path.exists(structural_relation_source):
-            model.load_precomputed_structural_cache(
+            model.load_embeddings(
                 entity_source=structural_entity_source,
                 relation_source=structural_relation_source,
+                kind='structural',
                 freeze=True,
             )
         else:
@@ -214,9 +216,6 @@ def train(args):
         total_loss = 0
         total_sigreg = 0.0
         sigreg_batches = 0
-
-        if hasattr(model, 'reset_alpha_stats'):
-            model.reset_alpha_stats()
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
@@ -240,6 +239,9 @@ def train(args):
                 relation_ids=r_batch['id'],
             )
             main_loss = loss_text + loss_struct
+            aux_losses = model.compute_auxiliary_losses()
+            if aux_losses is not None:
+                main_loss = main_loss + model.multi_step_weight * aux_losses['total_aux']
             sigreg_loss = model.compute_sigreg_loss(query_vector)
             if sigreg_loss is None:
                 loss = main_loss
@@ -257,14 +259,11 @@ def train(args):
             pbar.set_postfix({'loss': loss.item()})
             
         avg_train_loss = total_loss / len(train_loader)
-        train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
         avg_sigreg = None
         if sigreg_batches > 0:
             avg_sigreg = total_sigreg / sigreg_batches
 
         print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
-        if train_alpha is not None:
-            print(f"Epoch {epoch+1} Train Alpha (text weight): {train_alpha:.4f}")
         if avg_sigreg is not None:
             print(f"Epoch {epoch+1} Train SIGReg: {avg_sigreg:.6f}")
         
@@ -272,9 +271,6 @@ def train(args):
         eval_every = getattr(config, 'eval_every', 1)
         if valid_loader and (epoch + 1) % eval_every == 0:
             model.eval()
-
-            if hasattr(model, 'reset_alpha_stats'):
-                model.reset_alpha_stats()
 
             all_entity_embeddings = encode_all_entities_as_targets(
                 model=model,
@@ -297,7 +293,7 @@ def train(args):
                 all_entity_embeddings=all_entity_embeddings,
                 hr_map=hr_map,
                 device=device,
-                desc="Validation",
+                desc="Filtered Validation",
                 save_predictions_path=predictions_path,
                 topk=eval_topk,
             )
@@ -307,15 +303,12 @@ def train(args):
             val_h3 = val_metrics['Hits@3']
             val_h10 = val_metrics['Hits@10']
             val_mr = val_metrics['MR']
-            val_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
-            
+
             print(
                 f"Epoch {epoch+1} Val | "
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
                 f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
             )
-            if val_alpha is not None:
-                print(f"Epoch {epoch+1} Val Alpha (text weight): {val_alpha:.4f}")
             
             # Log metrics
             epoch_log = {
@@ -327,12 +320,8 @@ def train(args):
                 'val_hits3': val_h3,
                 'val_hits10': val_h10
             }
-            if train_alpha is not None:
-                epoch_log['train_alpha'] = train_alpha
             if avg_sigreg is not None:
                 epoch_log['train_sigreg'] = avg_sigreg
-            if val_alpha is not None:
-                epoch_log['val_alpha'] = val_alpha
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                 json.dump(history, f, indent=2)
@@ -353,8 +342,6 @@ def train(args):
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss
             }
-            if train_alpha is not None:
-                epoch_log['train_alpha'] = train_alpha
             if avg_sigreg is not None:
                 epoch_log['train_sigreg'] = avg_sigreg
             history.append(epoch_log)

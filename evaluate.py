@@ -75,9 +75,10 @@ def evaluate(args):
         )
 
     print("Loading precomputed text embeddings for evaluation...")
-    model.load_precomputed_text_cache(
+    model.load_embeddings(
         entity_source=entity_emb_path,
         relation_source=relation_emb_path,
+        kind='text',
         freeze=True,
     )
     print("Text embeddings ready for evaluation.")

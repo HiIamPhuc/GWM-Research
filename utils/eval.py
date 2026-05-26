@@ -83,7 +83,7 @@ def encode_all_entities_as_targets(model, entity_loader, device):
     all_struct_chunks = []
     model.eval()
     with torch.no_grad():
-        for batch in entity_loader:
+        for batch in tqdm(entity_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             txt, struct = model.encode_target(batch)
             all_text_chunks.append(txt.cpu())
@@ -124,24 +124,11 @@ def compute_filtered_ranking_metrics(
             h_ids = batch['h_batch']['id'].cpu().numpy()
             r_ids = batch['r_batch']['id'].cpu().numpy()
 
-            q_out = model(h_batch, r_batch, context_batch)
-            if len(q_out) == 2:
-                q_text, q_struct = q_out
-                rel_text = None
-                rel_struct = None
-            elif len(q_out) == 4:
-                q_text, q_struct, rel_text, rel_struct = q_out
-            else:
-                q_text, q_struct, rel_text, rel_struct, _, _ = q_out
+            q_text, q_struct = model(h_batch, r_batch, context_batch)
             
             scores_text = torch.mm(q_text, all_t_text.t())
             scores_struct = torch.mm(q_struct, all_t_struct.t())
-            scores_text, scores_struct = model.apply_temperature(
-                scores_text,
-                scores_struct,
-                relation_ids=r_batch['id'],
-            )
-            alpha = model.compute_alpha(q_text, q_struct, rel_text, rel_struct)
+            alpha = q_text.new_full((q_text.size(0), 1), model.fusion_alpha)
             scores = alpha * scores_text + (1.0 - alpha) * scores_struct
 
             for i in range(scores.size(0)):

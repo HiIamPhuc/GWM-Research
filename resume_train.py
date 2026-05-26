@@ -214,9 +214,10 @@ def resume_training(args):
 			"Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
 		)
 
-	model.load_precomputed_text_cache(
+	model.load_embeddings(
 		entity_source=entity_emb_path,
 		relation_source=relation_emb_path,
+		kind='text',
 		freeze=True,
 	)
 
@@ -332,6 +333,9 @@ def resume_training(args):
 				relation_ids=r_batch['id'],
 			)
 			main_loss = loss_text + loss_struct
+			aux_losses = model.compute_auxiliary_losses()
+			if aux_losses is not None:
+				main_loss = main_loss + model.multi_step_weight * aux_losses['total_aux']
 			sigreg_loss = model.compute_sigreg_loss(query_vector)
 			if sigreg_loss is None:
 				loss = main_loss

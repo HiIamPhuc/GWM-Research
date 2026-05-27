@@ -106,119 +106,76 @@ class GWM(nn.Module):
         super().__init__()
         self.config = config
 
-        legacy_hidden_dim = int(getattr(config, 'hidden_dim', getattr(config, 'text_embedding_dim', 768)))
-        self.text_embedding_dim = int(getattr(config, 'text_embedding_dim', legacy_hidden_dim))
+        # 1. Text Components (Entity/Relation Embeddings)
+        self.text_emb_dim = int(getattr(config, 'text_emb_dim'))
+        self.text_ent_embs = nn.Embedding(config.num_entities, self.text_emb_dim)
+        self.text_rel_embs = nn.Embedding(config.num_relations, self.text_emb_dim)
 
-        # 1. Text Component (Entity/Relation Embeddings)
-        self.text_entity_embeddings = nn.Embedding(config.num_entities, self.text_embedding_dim)
-        self.text_relation_embeddings = nn.Embedding(config.num_relations, self.text_embedding_dim)
+        self.text_adapter = MLPAdapter(self.text_emb_dim,
+            int(getattr(config, 'text_adapter_dim')),
+            dropout=float(getattr(config, 'adapter_dropout'))
+            )
 
-        # 2. Structural Component (Entity/Relation Embeddings)
-        self.structural_dim = int(getattr(config, 'structural_dim', legacy_hidden_dim))
-        self.entity_embeddings = nn.Embedding(config.num_entities, self.structural_dim)
-        self.relation_embeddings = nn.Embedding(config.num_relations, self.structural_dim)
+        self.text_compgcn_stack = nn.ModuleList([
+            CompGCNLayer(hidden_dim=self.text_emb_dim, comp_op=getattr(config, 'compgcn_op'))
+            for _ in range(max(int(getattr(config, 'compgcn_layers')), 1))
+        ])
 
-        # Keep each path in its native dimensionality unless explicitly overridden.
-        self.text_compgcn_dim = int(
-            getattr(config, 'text_compgcn_dim', getattr(config, 'compgcn_dim', self.text_embedding_dim))
+        self.text_h0_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
+        self.text_c0_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
+
+        self.text_film = nn.Linear(self.text_emb_dim, 2 * self.text_emb_dim)
+
+        self.text_lstm = nn.LSTM(
+            input_size=self.text_emb_dim,
+            hidden_size=self.text_emb_dim,
+            num_layers=int(getattr(config, 'dynamics_layers', 1)),
+            batch_first=True,
+            dropout=float(getattr(config, 'recurrent_dropout'))
         )
-        self.struct_compgcn_dim = int(
-            getattr(config, 'struct_compgcn_dim', getattr(config, 'compgcn_dim', self.structural_dim))
+
+        # 2. Structural Components (Entity/Relation Embeddings)
+        self.struct_emb_dim = int(getattr(config, 'struct_emb_dim'))
+        self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
+        self.struct_rel_embs = nn.Embedding(config.num_relations, self.struct_emb_dim)
+
+        self.struct_adapter = MLPAdapter(self.struct_emb_dim, int(getattr(config, 'struct_adapter_dim')), dropout=float(getattr(config, 'adapter_dropout')))
+
+        self.struct_compgcn_stack = nn.ModuleList([
+            CompGCNLayer(hidden_dim=self.struct_emb_dim, comp_op=getattr(config, 'compgcn_op'))
+            for _ in range(max(int(getattr(config, 'compgcn_layers')), 1))
+        ])
+
+        self.struct_h0_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
+        self.struct_c0_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
+
+        self.struct_film = nn.Linear(self.struct_emb_dim, 2 * self.struct_emb_dim)
+        
+        self.struct_lstm = nn.LSTM(
+            input_size=self.struct_emb_dim, 
+            hidden_size=self.struct_emb_dim,
+            num_layers=int(getattr(config, 'dynamics_layers', 1)), 
+            batch_first=True,
+            dropout=float(getattr(config, 'recurrent_dropout'))
         )
-        self.text_dynamics_dim = int(
-            getattr(config, 'text_dynamics_dim', getattr(config, 'dynamics_dim', self.text_compgcn_dim))
-        )
-        self.struct_dynamics_dim = int(
-            getattr(config, 'struct_dynamics_dim', getattr(config, 'dynamics_dim', self.struct_compgcn_dim))
-        )
-        self.dropout_rate = float(getattr(config, 'dropout', 0.0))
-        self.recurrent_dropout = float(getattr(config, 'recurrent_dropout', 0.0))
 
-        text_adapter_dim = int(getattr(config, 'text_adapter_dim', self.text_embedding_dim * 2))
-        struct_adapter_dim = int(getattr(config, 'struct_adapter_dim', self.structural_dim * 2))
-        adapter_dropout = float(getattr(config, 'adapter_dropout', 0.1))
-
-        self.text_adapter = MLPAdapter(self.text_embedding_dim, text_adapter_dim, dropout=adapter_dropout)
-        self.struct_adapter = MLPAdapter(self.structural_dim, struct_adapter_dim, dropout=adapter_dropout)
-
-        self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
-
-        self.alpha_relation_only = bool(getattr(config, 'alpha_relation_only', False))
-        alpha_in_dim = self.text_dynamics_dim + self.struct_dynamics_dim
         self.alpha_mlp = nn.Sequential(
-            nn.Linear(alpha_in_dim, 64),
+            nn.Linear(self.text_emb_dim + self.struct_emb_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
             nn.Sigmoid(),
         )
         self._alpha_sum = 0.0
         self._alpha_count = 0
-
-        self.per_relation_temperature = bool(getattr(config, 'per_relation_temperature', False))
-        if self.per_relation_temperature:
-            base_temp = float(getattr(config, 'temperature', 0.07))
-            base_temp = max(base_temp, 1e-4)
-            init_log_temp = math.log(base_temp)
-            self.text_rel_log_temp = nn.Embedding(config.num_relations, 1)
-            self.struct_rel_log_temp = nn.Embedding(config.num_relations, 1)
-            nn.init.constant_(self.text_rel_log_temp.weight, init_log_temp)
-            nn.init.constant_(self.struct_rel_log_temp.weight, init_log_temp)
-
-        self.sigreg_weight = float(getattr(config, 'sigreg_weight', 0.0) or 0.0)
-        if self.sigreg_weight > 0.0:
-            sigreg_knots = int(getattr(config, 'sigreg_knots', 17))
-            sigreg_num_proj = int(getattr(config, 'sigreg_num_proj', 1024))
-            self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
-        else:
-            self.sigreg = None
-
-        def _build_projection(in_dim, out_dim):
-            if in_dim == out_dim:
-                return nn.Identity()
-            return nn.Linear(in_dim, out_dim)
-
-        # Text Path Projections
-        self.text_spatial_projection = _build_projection(self.text_embedding_dim, self.text_compgcn_dim)
-        self.text_dynamics_projection = _build_projection(self.text_embedding_dim, self.text_dynamics_dim)
         
-        # Struct Path Projections
-        self.struct_spatial_projection = _build_projection(self.structural_dim, self.struct_compgcn_dim)
-        self.struct_dynamics_projection = _build_projection(self.structural_dim, self.struct_dynamics_dim)
+        self.input_dropout = nn.Dropout(float(getattr(config, 'dropout')))
 
-        compgcn_layers = int(getattr(config, 'compgcn_layers', 1))
-        
-        # 2. Text Spatial Encoder
-        self.text_compgcn_stack = nn.ModuleList([
-            CompGCNLayer(hidden_dim=self.text_compgcn_dim, comp_op=getattr(config, 'compgcn_op', 'sub'))
-            for _ in range(max(compgcn_layers, 1))
-        ])
+        self.sigreg_weight = float(getattr(config, 'sigreg_weight'))
+        sigreg_knots = int(getattr(config, 'sigreg_knots'))
+        sigreg_num_proj = int(getattr(config, 'sigreg_num_proj'))
+        self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
 
-        # 3. Struct Spatial Encoder
-        self.struct_compgcn_stack = nn.ModuleList([
-            CompGCNLayer(hidden_dim=self.struct_compgcn_dim, comp_op=getattr(config, 'compgcn_op', 'sub'))
-            for _ in range(max(compgcn_layers, 1))
-        ])
-        
-        # 4. Text Transition Dynamics
-        self.text_lstm = nn.LSTM(
-            input_size=self.text_dynamics_dim, hidden_size=self.text_dynamics_dim,
-            num_layers=int(getattr(config, 'dynamics_layers', 1)), batch_first=True
-        )
-        self.text_h0_projection = _build_projection(self.text_compgcn_dim, self.text_dynamics_dim)
-        self.text_c0_projection = _build_projection(self.text_compgcn_dim, self.text_dynamics_dim)
-
-        # 5. Struct Transition Dynamics
-        self.struct_lstm = nn.LSTM(
-            input_size=self.struct_dynamics_dim, hidden_size=self.struct_dynamics_dim,
-            num_layers=int(getattr(config, 'dynamics_layers', 1)), batch_first=True
-        )
-        self.struct_h0_projection = _build_projection(self.struct_compgcn_dim, self.struct_dynamics_dim)
-        self.struct_c0_projection = _build_projection(self.struct_compgcn_dim, self.struct_dynamics_dim)
-
-        self.recurrent_dropout_layer = nn.Dropout(self.recurrent_dropout) if self.recurrent_dropout > 0 else nn.Identity()
-        # FiLM (relation-conditioned) projections for modulating LSTM inputs
-        self.text_film = nn.Linear(self.text_dynamics_dim, 2 * self.text_dynamics_dim)
-        self.struct_film = nn.Linear(self.struct_dynamics_dim, 2 * self.struct_dynamics_dim)
+        self.temperature = float(getattr(config, 'temperature'))
 
     def _encode_subgraph_with_compgcn(self, h_emb, ctx_entity_emb, ctx_relation_emb, ctx_batch_index, compgcn_stack):
         h_state = h_emb
@@ -231,13 +188,53 @@ class GWM(nn.Module):
             )
         return h_state
 
-    def _run_dynamics(self, world_state, step_seq, relation_emb, lstm, h0_proj, c0_proj, path='text'):
+    def _prepare_context_batch(self, context_batch):
+        context_entity_ids = context_batch['id']
+        context_relation_ids = context_batch.get('rel_id')
+        context_batch_index = context_batch.get('batch_index')
+        context_mask = context_batch.get('sequence_mask')
+        if context_mask is None:
+            context_mask = context_batch.get('mask')
+        if context_mask is not None:
+            context_mask = context_mask.bool()
+
+        context_seq_entity_ids = context_batch.get('sequence_id')
+        context_seq_relation_ids = context_batch.get('sequence_rel_id')
+
+        if context_seq_entity_ids is not None and context_mask is not None:
+            valid_idx = context_mask.nonzero(as_tuple=False)
+            context_batch_index = valid_idx[:, 0]
+            flat_entity_ids = context_seq_entity_ids[context_mask]
+            flat_relation_ids = context_seq_relation_ids[context_mask]
+        elif context_entity_ids.dim() == 2:
+            if context_mask is None:
+                raise ValueError("context_batch['mask'] is required for padded context format.")
+            valid_idx = context_mask.nonzero(as_tuple=False)
+            context_batch_index = valid_idx[:, 0]
+            flat_entity_ids = context_entity_ids[context_mask]
+            flat_relation_ids = context_relation_ids[context_mask]
+        else:
+            flat_entity_ids = context_entity_ids
+            flat_relation_ids = context_relation_ids
+            if context_batch_index is None:
+                raise ValueError("context_batch['batch_index'] is required for ragged context format.")
+
+        return flat_entity_ids, flat_relation_ids, context_batch_index
+
+    def _encode_context_features(self, entity_ids, relation_ids):
+        entity_text = self.input_dropout(self.text_adapter(self.text_ent_embs(entity_ids)))
+        relation_text = self.input_dropout(self.text_adapter(self.text_rel_embs(relation_ids)))
+        entity_struct = self.input_dropout(self.struct_adapter(self.struct_ent_embs(entity_ids)))
+        relation_struct = self.input_dropout(self.struct_adapter(self.struct_rel_embs(relation_ids)))
+        return entity_text, relation_text, entity_struct, relation_struct
+
+    def _run_dynamics(self, world_state, head_emb, relation_emb, lstm, h0_proj, c0_proj, path='text'):
         """
         Run recurrent dynamics over a sequence of steps.
 
         world_state: (B, compgcn_dim) used to initialise h0/c0
-        step_seq: (B, T, D) sequence of per-step inputs (already projected to dynamics dim)
-        relation_emb: (B, D_rel) projected relation embedding for this path
+        head_emb: (B, D) head embedding for this path
+        relation_emb: (B, D_rel) relation embedding for this path
         path: 'text' or 'struct' to select FiLM projection
         """
         h_0 = torch.tanh(h0_proj(world_state))
@@ -256,12 +253,11 @@ class GWM(nn.Module):
 
         shift, scale = film_params.chunk(2, dim=-1)
         # apply modulation across time steps
-        step_seq = (1.0 + scale.unsqueeze(1)) * step_seq + shift.unsqueeze(1)
+        head_emb = (1.0 + scale.unsqueeze(1)) * head_emb + shift.unsqueeze(1)
 
         # Run LSTM over the sequence
-        lstm_out, (h_n, c_n) = lstm(step_seq, (h_0_lstm, c_0_lstm))
+        lstm_out, (h_n, c_n) = lstm(head_emb, (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
-        query_vector = self.recurrent_dropout_layer(query_vector)
         query_norm = torch.nn.functional.normalize(query_vector, p=2, dim=1)
         return query_vector, query_norm
 
@@ -291,68 +287,52 @@ class GWM(nn.Module):
             raise ValueError(
                 f"{name} cache row count mismatch. Expected {expected_rows}, got {loaded.size(0)}"
             )
-        return loaded
+        return loaded      
 
-    def load_precomputed_structural_cache(self, entity_source, relation_source, freeze=False):
-        """Loads precomputed structural embeddings (e.g., from RotatE or ComplEx) into the embedding tables."""
+    def load_embeddings(self, entity_source, relation_source, kind='text', freeze=False):
+        if kind == 'text':
+            entity_table = self.text_ent_embs
+            relation_table = self.text_rel_embs
+            expected_dim = self.text_emb_dim
+            entity_name = 'text_entity'
+            relation_name = 'text_relation'
+        elif kind == 'structural':
+            entity_table = self.struct_ent_embs
+            relation_table = self.struct_rel_embs
+            expected_dim = self.struct_emb_dim
+            entity_name = 'structural_entity'
+            relation_name = 'structural_relation'
+        else:
+            raise ValueError(f"Unsupported embedding kind: {kind}")
+
         entity_cache = self._load_embedding_tensor(
             source=entity_source,
-            expected_rows=self.entity_embeddings.num_embeddings,
-            name='structural_entity',
+            expected_rows=entity_table.num_embeddings,
+            name=entity_name,
         )
-        
         relation_cache = self._load_embedding_tensor(
             source=relation_source,
-            expected_rows=self.relation_embeddings.num_embeddings,
-            name='structural_relation',
-        )
-
-        expected_struct_dim = self.structural_dim
-        if entity_cache.size(1) != expected_struct_dim:
-            raise ValueError(
-                f"Structural embedding dim mismatch. Config expects {expected_struct_dim}, got {entity_cache.size(1)}"
-            )
-
-        self.entity_embeddings.weight.data.copy_(entity_cache)
-        self.relation_embeddings.weight.data.copy_(relation_cache)
-
-        if freeze:
-            self.entity_embeddings.weight.requires_grad = False
-            self.relation_embeddings.weight.requires_grad = False
-
-    def load_precomputed_text_cache(self, entity_source, relation_source, freeze=True):
-        """Loads precomputed text embeddings into text embedding tables."""
-        entity_cache = self._load_embedding_tensor(
-            source=entity_source,
-            expected_rows=self.text_entity_embeddings.num_embeddings,
-            name='text_entity',
-        )
-
-        relation_cache = self._load_embedding_tensor(
-            source=relation_source,
-            expected_rows=self.text_relation_embeddings.num_embeddings,
-            name='text_relation',
+            expected_rows=relation_table.num_embeddings,
+            name=relation_name,
         )
 
         if entity_cache.size(1) != relation_cache.size(1):
             raise ValueError(
-                "Entity and relation text embeddings must share the same embedding dimension. "
+                f"{entity_name} and {relation_name} embeddings must share the same embedding dimension. "
                 f"Got {entity_cache.size(1)} and {relation_cache.size(1)}"
             )
 
-        expected_text_dim = self.text_embedding_dim
-        if entity_cache.size(1) != expected_text_dim:
+        if entity_cache.size(1) != expected_dim:
             raise ValueError(
-                "Text embedding dimension mismatch with model config. "
-                f"Expected {expected_text_dim}, got {entity_cache.size(1)}"
+                f"Embedding dimension mismatch. Expected {expected_dim}, got {entity_cache.size(1)}"
             )
 
-        self.text_entity_embeddings.weight.data.copy_(entity_cache)
-        self.text_relation_embeddings.weight.data.copy_(relation_cache)
+        entity_table.weight.data.copy_(entity_cache)
+        relation_table.weight.data.copy_(relation_cache)
 
         if freeze:
-            self.text_entity_embeddings.weight.requires_grad = False
-            self.text_relation_embeddings.weight.requires_grad = False
+            self.text_ent_embs.weight.requires_grad = False
+            self.text_rel_embs.weight.requires_grad = False
 
     def reset_alpha_stats(self):
         self._alpha_sum = 0.0
@@ -371,239 +351,77 @@ class GWM(nn.Module):
         return mean
 
     def forward(self, h_batch, r_batch, context_batch):
-        h_emb_text = self.text_adapter(self.text_entity_embeddings(h_batch['id']))
-        r_emb_text = self.text_adapter(self.text_relation_embeddings(r_batch['id']))
-        
-        # Structural Embeddings
-        h_struct = self.struct_adapter(self.entity_embeddings(h_batch['id']))
-        r_struct = self.struct_adapter(self.relation_embeddings(r_batch['id']))
+        h_text = self.input_dropout(self.text_adapter(self.text_ent_embs(h_batch['id'])))
+        r_text = self.input_dropout(self.text_adapter(self.text_rel_embs(r_batch['id'])))
+        h_struct = self.input_dropout(self.struct_adapter(self.struct_ent_embs(h_batch['id'])))
+        r_struct = self.input_dropout(self.struct_adapter(self.struct_rel_embs(r_batch['id'])))
 
-        h_emb_text = self.input_dropout(h_emb_text)
-        r_emb_text = self.input_dropout(r_emb_text)
-        h_struct = self.input_dropout(h_struct)
-        r_struct = self.input_dropout(r_struct)
-        
-        context_entity_ids = context_batch['id']
-        context_relation_ids = context_batch.get('rel_id')
-        context_batch_index = context_batch.get('batch_index')
-        context_mask = context_batch.get('mask')
-
-        if context_entity_ids.dim() == 2:
-            B, K = context_entity_ids.shape
-            if context_relation_ids is None:
-                context_relation_ids = torch.zeros_like(context_entity_ids)
-            if context_mask is None:
-                context_mask = torch.ones_like(context_entity_ids, dtype=torch.bool)
-            else:
-                context_mask = context_mask.bool()
-
-            valid_idx = context_mask.nonzero(as_tuple=False)
-            if valid_idx.numel() == 0:
-                flat_context_entity_ids = context_entity_ids.new_zeros((0,))
-                flat_context_relation_ids = context_relation_ids.new_zeros((0,))
-                context_batch_index = context_entity_ids.new_zeros((0,))
-            else:
-                context_batch_index = valid_idx[:, 0]
-                flat_context_entity_ids = context_entity_ids[context_mask]
-                flat_context_relation_ids = context_relation_ids[context_mask]
-        else:
-            flat_context_entity_ids = context_entity_ids
-            if context_relation_ids is None:
-                flat_context_relation_ids = torch.zeros_like(flat_context_entity_ids)
-            else:
-                flat_context_relation_ids = context_relation_ids
-            if context_batch_index is None:
-                raise ValueError("context_batch['batch_index'] is required for ragged context format.")
-
-        ctx_ent_text = self.text_adapter(self.text_entity_embeddings(flat_context_entity_ids))
-        ctx_ent_struct = self.struct_adapter(self.entity_embeddings(flat_context_entity_ids))
-        ctx_rel_text = self.text_adapter(self.text_relation_embeddings(flat_context_relation_ids))
-        ctx_rel_struct = self.struct_adapter(self.relation_embeddings(flat_context_relation_ids))
-
-        h_spatial_text = self.text_spatial_projection(h_emb_text)
-        ctx_entity_spatial_text = self.text_spatial_projection(ctx_ent_text)
-        ctx_relation_spatial_text = self.text_spatial_projection(ctx_rel_text)
-
-        h_spatial_struct = self.struct_spatial_projection(h_struct)
-        ctx_entity_spatial_struct = self.struct_spatial_projection(ctx_ent_struct)
-        ctx_relation_spatial_struct = self.struct_spatial_projection(ctx_rel_struct)
+        flat_context_entity_ids, flat_context_relation_ids, context_batch_index = self._prepare_context_batch(context_batch)
+        ctx_ent_text = self.input_dropout(self.text_adapter(self.text_ent_embs(flat_context_entity_ids)))
+        ctx_rel_text = self.input_dropout(self.text_adapter(self.text_rel_embs(flat_context_relation_ids)))
+        ctx_ent_struct = self.input_dropout(self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids)))
+        ctx_rel_struct = self.input_dropout(self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids)))
 
         # -- Text Pathway --
         world_state_text = self._encode_subgraph_with_compgcn(
-            h_spatial_text, ctx_entity_spatial_text, ctx_relation_spatial_text,
+            h_text, ctx_ent_text, ctx_rel_text,
             context_batch_index, self.text_compgcn_stack
         )
-        world_state_text = self.input_dropout(world_state_text)
-        
-        # Build sequence of per-step node embeddings when context is provided as (B, K)
-        if context_entity_ids.dim() == 2:
-            # ctx_ent_text is flattened; reconstruct per-batch sequence directly from ids
-            ctx_ent_text_seq = self.text_adapter(self.text_entity_embeddings(context_entity_ids))
-            step_seq_text = self.text_dynamics_projection(ctx_ent_text_seq)
-        else:
-            # ragged / flattened fallback: use single-step head embedding
-            step_seq_text = self.text_dynamics_projection(h_emb_text).unsqueeze(1)
-
-        relation_emb_text = self.text_dynamics_projection(r_emb_text)
 
         query_text_raw, query_text = self._run_dynamics(
-            world_state_text, step_seq_text, relation_emb_text,
+            world_state_text, h_text, r_text,
             self.text_lstm, self.text_h0_projection, self.text_c0_projection, path='text'
         )
 
         # -- Struct Pathway --
         world_state_struct = self._encode_subgraph_with_compgcn(
-            h_spatial_struct, ctx_entity_spatial_struct, ctx_relation_spatial_struct,
+            h_struct, ctx_ent_struct, ctx_rel_struct,
             context_batch_index, self.struct_compgcn_stack
         )
-        world_state_struct = self.input_dropout(world_state_struct)
-        
-        if context_entity_ids.dim() == 2:
-            ctx_ent_struct_seq = self.struct_adapter(self.entity_embeddings(context_entity_ids))
-            step_seq_struct = self.struct_dynamics_projection(ctx_ent_struct_seq)
-        else:
-            step_seq_struct = self.struct_dynamics_projection(h_struct).unsqueeze(1)
-
-        relation_emb_struct = self.struct_dynamics_projection(r_struct)
-
+    
         query_struct_raw, query_struct = self._run_dynamics(
-            world_state_struct, step_seq_struct, relation_emb_struct,
+            world_state_struct, h_struct, r_struct,
             self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection, path='struct'
         )
 
-        return query_text, query_struct, relation_emb_text, relation_emb_struct, query_text_raw, query_struct_raw
+        return query_text, query_struct, r_text, r_struct, query_text_raw, query_struct_raw
 
     def encode_target(self, t_batch):
-        t_emb_text = self.text_adapter(self.text_entity_embeddings(t_batch['id']))
-        t_struct = self.struct_adapter(self.entity_embeddings(t_batch['id']))
+        t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
+        t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
         
-        t_text_proj = self.text_dynamics_projection(t_emb_text)
-        t_struct_proj = self.struct_dynamics_projection(t_struct)
-        
-        t_text_norm = torch.nn.functional.normalize(t_text_proj, p=2, dim=1)
-        t_struct_norm = torch.nn.functional.normalize(t_struct_proj, p=2, dim=1)
+        t_text_norm = torch.nn.functional.normalize(t_text, p=2, dim=1)
+        t_struct_norm = torch.nn.functional.normalize(t_struct, p=2, dim=1)
         return t_text_norm, t_struct_norm
 
-    def compute_loss(self, query_vectors, target_vectors, relation_ids=None):
-        loss_text, loss_struct, scores = self.compute_loss_components(
-            query_vectors,
-            target_vectors,
-            relation_ids=relation_ids,
-        )
-        return loss_text + loss_struct, scores
-
-    def _get_hard_negative_k(self, num_candidates):
-        hard_negative_k = int(getattr(self.config, 'hard_negative_k', 0) or 0)
-        if hard_negative_k > 0:
-            return min(hard_negative_k, max(0, num_candidates - 1))
-
-        hard_negative_fraction = float(getattr(self.config, 'hard_negative_fraction', 0.0) or 0.0)
-        if hard_negative_fraction > 0.0:
-            k = int(round(hard_negative_fraction * max(0, num_candidates - 1)))
-            return min(k, max(0, num_candidates - 1))
-
-        return 0
-
-    def _weighted_infonce_loss(self, scores):
-        batch_size, num_candidates = scores.shape
-        labels = torch.arange(batch_size, device=scores.device)
-
-        hard_negative_weight = float(getattr(self.config, 'hard_negative_weight', 1.0) or 1.0)
-        hard_negative_k = self._get_hard_negative_k(num_candidates)
-
-        if hard_negative_weight <= 1.0 or hard_negative_k <= 0:
-            loss_fn = nn.CrossEntropyLoss()
-            return loss_fn(scores, labels)
-
-        weights = torch.ones_like(scores)
-        scores_neg = scores.clone()
-        scores_neg.fill_diagonal_(float('-inf'))
-        topk_idx = torch.topk(scores_neg, hard_negative_k, dim=1).indices
-        weights.scatter_(1, topk_idx, hard_negative_weight)
-
-        max_scores = scores.max(dim=1, keepdim=True).values
-        exp_scores = torch.exp(scores - max_scores)
-        denom = (weights * exp_scores).sum(dim=1)
-        log_denom = torch.log(denom) + max_scores.squeeze(1)
-        loss = -scores[labels, labels] + log_denom
-        return loss.mean()
-
-    def _split_query_vectors(self, query_vectors):
-        if len(query_vectors) == 2:
-            return query_vectors[0], query_vectors[1], None, None, None, None
-        if len(query_vectors) == 4:
-            return query_vectors[0], query_vectors[1], query_vectors[2], query_vectors[3], None, None
-        if len(query_vectors) >= 6:
-            return (
-                query_vectors[0],
-                query_vectors[1],
-                query_vectors[2],
-                query_vectors[3],
-                query_vectors[4],
-                query_vectors[5],
-            )
-        raise ValueError(f"Unexpected query vector format (len={len(query_vectors)}).")
-
-    def compute_sigreg_loss(self, query_vectors):
-        if self.sigreg is None or self.sigreg_weight <= 0.0:
-            return None
-        _, _, _, _, query_text_raw, query_struct_raw = self._split_query_vectors(query_vectors)
-        if query_text_raw is None or query_struct_raw is None:
-            return None
-        sig_text = self.sigreg(query_text_raw.unsqueeze(0))
-        sig_struct = self.sigreg(query_struct_raw.unsqueeze(0))
-        return 0.5 * (sig_text + sig_struct)
-
-    def compute_alpha(self, query_text, query_struct, relation_text=None, relation_struct=None):
-        if self.alpha_relation_only:
-            if relation_text is None or relation_struct is None:
-                raise ValueError("alpha_relation_only requires relation embeddings in query_vectors.")
-            alpha_input = torch.cat([relation_text, relation_struct], dim=-1)
-        else:
-            alpha_input = torch.cat([query_text, query_struct], dim=-1)
-        alpha = self.alpha_mlp(alpha_input)
-        self._record_alpha(alpha)
-        return alpha
-
-    def _get_relation_temperatures(self, relation_ids, device, dtype):
-        if not self.per_relation_temperature or relation_ids is None:
-            base_temp = float(getattr(self.config, 'temperature', 0.07))
-            base_temp = max(base_temp, 1e-4)
-            temp = torch.tensor(base_temp, device=device, dtype=dtype)
-            return temp, temp
-
-        log_temp_text = self.text_rel_log_temp(relation_ids).squeeze(-1)
-        log_temp_struct = self.struct_rel_log_temp(relation_ids).squeeze(-1)
-        temp_text = torch.exp(log_temp_text).clamp(min=1e-4)
-        temp_struct = torch.exp(log_temp_struct).clamp(min=1e-4)
-        return temp_text.unsqueeze(1), temp_struct.unsqueeze(1)
-
-    def apply_temperature(self, scores_text, scores_struct, relation_ids=None):
-        temp_text, temp_struct = self._get_relation_temperatures(
-            relation_ids,
-            device=scores_text.device,
-            dtype=scores_text.dtype,
-        )
-        return scores_text / temp_text, scores_struct / temp_struct
-
-    def compute_loss_components(self, query_vectors, target_vectors, relation_ids=None):
-        query_text, query_struct, relation_text, relation_struct, _, _ = self._split_query_vectors(query_vectors)
+    def compute_loss(self, query_vectors, target_vectors):
+        query_text, query_struct, relation_text, relation_struct, _, _ = query_vectors
         target_text, target_struct = target_vectors
 
         scores_text = torch.mm(query_text, target_text.t())
         scores_struct = torch.mm(query_struct, target_struct.t())
 
-        scores_text, scores_struct = self.apply_temperature(
-            scores_text,
-            scores_struct,
-            relation_ids=relation_ids,
-        )
+        scores_text = scores_text / self.temperature
+        scores_struct = scores_struct / self.temperature
 
-        # Score Level Fusion
-        alpha = self.compute_alpha(query_text, query_struct, relation_text, relation_struct)
+        head_combined = torch.cat([relation_text, relation_struct], dim=-1)
+        alpha = self.alpha_mlp(head_combined)
         scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
+        self._record_alpha(alpha)
 
-        loss_text = self._weighted_infonce_loss(scores_text)
-        loss_struct = self._weighted_infonce_loss(scores_struct)
+        labels = torch.arange(scores_fused.size(0), device=scores_fused.device)
+        loss_fn = nn.CrossEntropyLoss()
+        loss_text = loss_fn(scores_text, labels)
+        loss_struct = loss_fn(scores_struct, labels)
 
         return loss_text, loss_struct, scores_fused
+
+    def compute_sigreg_loss(self, query_vectors):
+        if self.sigreg is None or self.sigreg_weight <= 0.0:
+            return None
+        _, _, _, _, query_text_raw, query_struct_raw = query_vectors
+        if query_text_raw is None or query_struct_raw is None:
+            return None
+        sig_text = self.sigreg(query_text_raw.unsqueeze(0))
+        sig_struct = self.sigreg(query_struct_raw.unsqueeze(0))
+        return 0.5 * (sig_text + sig_struct)

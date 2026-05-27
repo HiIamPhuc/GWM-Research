@@ -54,5 +54,5 @@ seed: 42
 text_cache_device: cpu
 
 save_eval_predictions: true
-eval_topk: 10
+eval_topk: 50
 eval_predictions_dir: output/wn18rr/predictions

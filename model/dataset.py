@@ -83,6 +83,22 @@ class CollateFN:
         r_ids = torch.stack([b['r_id'] for b in batch])
         t_ids = torch.stack([b['t_id'] for b in batch])
 
+        max_context_len = max((b['context_entity_ids'].numel() for b in batch), default=0)
+        context_entity_ids_seq = torch.full((len(batch), max_context_len), -1, dtype=torch.long)
+        context_relation_ids_seq = torch.full((len(batch), max_context_len), -1, dtype=torch.long)
+        context_mask_seq = torch.zeros((len(batch), max_context_len), dtype=torch.bool)
+
+        for sample_idx, item in enumerate(batch):
+            ent_ids = item['context_entity_ids'].long().reshape(-1)
+            rel_ids = item['context_relation_ids'].long().reshape(-1)
+            mask = item['context_mask'].bool().reshape(-1)
+
+            seq_len = min(ent_ids.numel(), rel_ids.numel(), mask.numel(), max_context_len)
+            if seq_len > 0:
+                context_entity_ids_seq[sample_idx, :seq_len] = ent_ids[:seq_len]
+                context_relation_ids_seq[sample_idx, :seq_len] = rel_ids[:seq_len]
+                context_mask_seq[sample_idx, :seq_len] = mask[:seq_len]
+
         # Build ragged context representation: flattened edges + edge->sample index.
         context_entity_chunks = []
         context_relation_chunks = []
@@ -127,5 +143,9 @@ class CollateFN:
                 'id': context_entity_ids,
                 'rel_id': context_relation_ids,
                 'batch_index': context_batch_index,
+                'sequence_id': context_entity_ids_seq,
+                'sequence_rel_id': context_relation_ids_seq,
+                'sequence_mask': context_mask_seq,
+                'mask': context_mask_seq,
             },
         }

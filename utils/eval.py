@@ -125,23 +125,15 @@ def compute_filtered_ranking_metrics(
             r_ids = batch['r_batch']['id'].cpu().numpy()
 
             q_out = model(h_batch, r_batch, context_batch)
-            if len(q_out) == 2:
-                q_text, q_struct = q_out
-                rel_text = None
-                rel_struct = None
-            elif len(q_out) == 4:
-                q_text, q_struct, rel_text, rel_struct = q_out
-            else:
-                q_text, q_struct, rel_text, rel_struct, _, _ = q_out
+            q_text, q_struct, rel_text, rel_struct, _, _ = q_out
             
             scores_text = torch.mm(q_text, all_t_text.t())
             scores_struct = torch.mm(q_struct, all_t_struct.t())
-            scores_text, scores_struct = model.apply_temperature(
-                scores_text,
-                scores_struct,
-                relation_ids=r_batch['id'],
-            )
-            alpha = model.compute_alpha(q_text, q_struct, rel_text, rel_struct)
+
+            scores_text = scores_text / model.temperature
+            scores_struct = scores_struct / model.temperature
+
+            alpha = model.alpha_mlp(torch.cat([rel_text, rel_struct], dim=-1))
             scores = alpha * scores_text + (1.0 - alpha) * scores_struct
 
             for i in range(scores.size(0)):

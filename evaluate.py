@@ -134,6 +134,8 @@ def evaluate(args):
             fallback_splits=['train']
         )
 
+    predictions_path = os.path.join(config.output_dir, f'predictions_{split}.jsonl')
+
     metrics = compute_filtered_ranking_metrics(
         model=model,
         data_loader=test_loader,
@@ -141,6 +143,7 @@ def evaluate(args):
         hr_map=hr_map,
         device=device,
         desc="Evaluating",
+        save_predictions_path=predictions_path,
     )
 
     final_mrr = metrics['MRR']

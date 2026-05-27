@@ -15,6 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.model import GWM
 from model.dataset import GWMDataset, CollateFN
+from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
 	build_entity_loader,
 	compute_filtered_ranking_metrics,
@@ -209,6 +210,9 @@ def resume_training(args):
 
 	os.makedirs(config.output_dir, exist_ok=True)
 
+	seed = int(getattr(config, 'seed', 42))
+	seed_everything(seed)
+
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 	print(f"Using device: {device}")
 	print(f"Checkpoint directory: {checkpoint_dir}")
@@ -264,6 +268,8 @@ def resume_training(args):
 		num_workers=4,
 		pin_memory=(device.type == 'cuda'),
 		drop_last=True,
+		generator=make_torch_generator(seed),
+		worker_init_fn=make_worker_init_fn(seed),
 	)
 
 	valid_loader = None
@@ -277,6 +283,7 @@ def resume_training(args):
 			num_workers=2,
 			pin_memory=(device.type == 'cuda'),
 			drop_last=False,
+			worker_init_fn=make_worker_init_fn(seed),
 		)
 
 	hr_map = None

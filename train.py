@@ -14,6 +14,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.model import GWM
 from model.dataset import GWMDataset, CollateFN
+from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
     build_entity_loader,
     compute_filtered_ranking_metrics,
@@ -94,6 +95,9 @@ def train(args):
     if not os.path.exists(config.output_dir):
         os.makedirs(config.output_dir)
 
+    seed = int(getattr(config, 'seed', 42))
+    seed_everything(seed)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -126,7 +130,9 @@ def train(args):
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=(device.type == 'cuda'),
-        drop_last=True # Important for In-Batch Negatives stability
+        drop_last=True, # Important for In-Batch Negatives stability
+        generator=make_torch_generator(seed),
+        worker_init_fn=make_worker_init_fn(seed),
     )
 
     entity_emb_path = os.path.join(config.data_dir, 'entity_text_embeddings.pt')
@@ -202,7 +208,8 @@ def train(args):
             collate_fn=collate_fn,
             num_workers=2,
             pin_memory=(device.type == 'cuda'),
-            drop_last=False
+            drop_last=False,
+            worker_init_fn=make_worker_init_fn(seed),
         )
     else:
         valid_loader = None

@@ -4,6 +4,7 @@ import torch
 import argparse
 from pykeen.pipeline import pipeline
 from pykeen.triples import TriplesFactory
+from utils.seed import seed_everything
 
 def load_json(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -72,6 +73,7 @@ def main():
     parser.add_argument('--model', type=str, default='RotatE', choices=['RotatE', 'ComplEx', 'TransE'])
     parser.add_argument('--dim', type=int, default=384, help="Embedding dimension. Note: RotatE complex space means internal dim is halved.")
     parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible PyKEEN runs')
     args = parser.parse_args()
 
     dataset_lower = args.dataset.lower()
@@ -89,6 +91,7 @@ def main():
     tf_valid = TriplesFactory.from_path(valid_path, entity_to_id=tf_train.entity_to_id, relation_to_id=tf_train.relation_to_id)
     tf_test = TriplesFactory.from_path(test_path, entity_to_id=tf_train.entity_to_id, relation_to_id=tf_train.relation_to_id)
 
+    seed_everything(args.seed)
     # For RotatE, the user-facing dimension represents both real and imaginary combined in our PyTorch tensor.
     # PyKEEN's internal embedding_dim for RotatE is usually dim // 2.
     internal_dim = args.dim // 2 if args.model == 'RotatE' else args.dim
@@ -105,7 +108,7 @@ def main():
         stopper='early',
         stopper_kwargs=dict(frequency=5, patience=3, relative_delta=0.002),
         device='cuda' if torch.cuda.is_available() else 'cpu',
-        random_seed=42,
+        random_seed=args.seed,
     )
     
     metrics = pipeline_result.metric_results

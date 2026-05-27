@@ -3,6 +3,11 @@ import json
 import argparse
 from tqdm import tqdm
 import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from utils.seed import seed_everything
 
 class ContextProcessor:
     def __init__(self, data_dir, device='cuda'):
@@ -252,7 +257,15 @@ if __name__ == '__main__':
         default='cuda',
         help='Device to use (cuda or cpu)'
     )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed for reproducible context selection',
+    )
     args = parser.parse_args()
+
+    seed_everything(args.seed)
     
     processor = ContextProcessor(args.data_dir, device=args.device)
     processor.compute_context_nodes(

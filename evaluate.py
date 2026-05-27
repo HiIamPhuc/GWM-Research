@@ -75,9 +75,10 @@ def evaluate(args):
         )
 
     print("Loading precomputed text embeddings for evaluation...")
-    model.load_precomputed_text_cache(
+    model.load_embeddings(
         entity_source=entity_emb_path,
         relation_source=relation_emb_path,
+        kind='text',
         freeze=True,
     )
     print("Text embeddings ready for evaluation.")
@@ -133,6 +134,8 @@ def evaluate(args):
             fallback_splits=['train']
         )
 
+    predictions_path = os.path.join(config.output_dir, f'predictions_{split}.jsonl')
+
     metrics = compute_filtered_ranking_metrics(
         model=model,
         data_loader=test_loader,
@@ -140,6 +143,7 @@ def evaluate(args):
         hr_map=hr_map,
         device=device,
         desc="Evaluating",
+        save_predictions_path=predictions_path,
     )
 
     final_mrr = metrics['MRR']

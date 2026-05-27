@@ -252,8 +252,9 @@ class GWM(nn.Module):
             film_params = self.struct_film(relation_emb)
 
         shift, scale = film_params.chunk(2, dim=-1)
-        # apply modulation across time steps
-        head_emb = (1.0 + scale.unsqueeze(1)) * head_emb + shift.unsqueeze(1)
+
+        head_emb = (1.0 + scale) * head_emb + shift
+        head_emb = head_emb.unsqueeze(1)
 
         # Run LSTM over the sequence
         lstm_out, (h_n, c_n) = lstm(head_emb, (h_0_lstm, c_0_lstm))

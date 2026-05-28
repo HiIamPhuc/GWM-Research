@@ -1,5 +1,6 @@
 import os
 import math
+import time
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -88,6 +89,10 @@ def get_config(args):
                 setattr(self, k, v)
     
     return Config(config_dict)
+
+def _sync_device(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
 
 def train(args):
     # Load Config
@@ -233,6 +238,7 @@ def train(args):
         )
     
     print("Starting training...")
+    train_start_time = time.perf_counter()
     best_mrr = 0.0
     
     early_stopping = EarlyStopping(
@@ -245,6 +251,8 @@ def train(args):
     history = []
     
     for epoch in range(config.num_epochs):
+        epoch_start_time = time.perf_counter()
+        _sync_device(device)
         model.train()
         total_loss = 0
         total_sigreg = 0.0
@@ -289,6 +297,11 @@ def train(args):
 
             total_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})
+
+        _sync_device(device)
+        epoch_train_seconds = time.perf_counter() - epoch_start_time
+        train_examples = len(train_loader) * int(config.batch_size)
+        examples_per_second = train_examples / max(epoch_train_seconds, 1e-8)
             
         avg_train_loss = total_loss / len(train_loader)
         train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
@@ -297,6 +310,10 @@ def train(args):
             avg_sigreg = total_sigreg / sigreg_batches
 
         print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
+        print(
+            f"Epoch {epoch+1} Train Time: {epoch_train_seconds:.2f}s | "
+            f"Throughput: {examples_per_second:.2f} examples/s"
+        )
         if train_alpha is not None:
             print(f"Epoch {epoch+1} Train Alpha (text weight): {train_alpha:.4f}")
         if avg_sigreg is not None:
@@ -397,6 +414,17 @@ def train(args):
         
         # Save Checkpoint
         torch.save(model.state_dict(), os.path.join(config.output_dir, 'latest_checkpoint.pt'))
+
+    _sync_device(device)
+    total_train_seconds = time.perf_counter() - train_start_time
+    print(f"Total training time: {total_train_seconds:.2f}s")
+    history.append({
+        'event': 'training_complete',
+        'total_train_seconds': total_train_seconds,
+        'epochs_completed': len(history),
+    })
+    with open(log_path, 'w') as f:
+        json.dump(history, f, indent=2)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

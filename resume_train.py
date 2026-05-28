@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import math
+import time
 from types import SimpleNamespace
 
 import torch
@@ -150,6 +151,11 @@ def infer_vocab_sizes(data_dir):
 	with open(os.path.join(data_dir, 'relation2id.json'), 'r', encoding='utf-8') as f:
 		num_relations = len(json.load(f))
 	return num_entities, num_relations
+
+
+def _sync_device(device):
+	if device.type == 'cuda':
+		torch.cuda.synchronize(device)
 
 
 def resolve_checkpoint_dir(args):
@@ -344,7 +350,11 @@ def resume_training(args):
 	if hasattr(model, 'reset_alpha_stats'):
 		model.reset_alpha_stats()
 
+	resume_start_time = time.perf_counter()
+
 	for epoch in range(start_epoch, int(config.num_epochs)):
+		epoch_start_time = time.perf_counter()
+		_sync_device(device)
 		model.train()
 		total_loss = 0.0
 		total_sigreg = 0.0
@@ -387,12 +397,21 @@ def resume_training(args):
 			total_loss += loss.item()
 			pbar.set_postfix({'loss': loss.item()})
 
+		_sync_device(device)
+		epoch_train_seconds = time.perf_counter() - epoch_start_time
+		train_examples = len(train_loader) * int(config.batch_size)
+		examples_per_second = train_examples / max(epoch_train_seconds, 1e-8)
+
 		avg_train_loss = total_loss / max(1, len(train_loader))
 		avg_sigreg = None
 		if sigreg_batches > 0:
 			avg_sigreg = total_sigreg / sigreg_batches
 		train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
 		print(f"Epoch {epoch + 1} Train Loss: {avg_train_loss:.4f}")
+		print(
+			f"Epoch {epoch + 1} Train Time: {epoch_train_seconds:.2f}s | "
+			f"Throughput: {examples_per_second:.2f} examples/s"
+		)
 		if train_alpha is not None:
 			print(f"Epoch {epoch + 1} Train Alpha (text weight): {train_alpha:.4f}")
 		if avg_sigreg is not None:
@@ -474,6 +493,16 @@ def resume_training(args):
 		history.append(epoch_log)
 		save_training_history(history, config.output_dir)
 		torch.save(model.state_dict(), os.path.join(config.output_dir, 'latest_checkpoint.pt'))
+
+	_sync_device(device)
+	total_resume_seconds = time.perf_counter() - resume_start_time
+	print(f"Total resumed training time: {total_resume_seconds:.2f}s")
+	history.append({
+		'event': 'resume_training_complete',
+		'total_resume_seconds': total_resume_seconds,
+		'epochs_completed': len(history),
+	})
+	save_training_history(history, config.output_dir)
 
 	print("Resume training finished.")
 

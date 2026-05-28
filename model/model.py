@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class CompGCNLayer(nn.Module):
@@ -101,6 +102,61 @@ class SIGReg(nn.Module):
         statistic = (err @ weights) * proj.size(-2)
         return statistic.mean()
 
+
+class AsymmetricContrastiveLoss(nn.Module):
+    """Asymmetric focal contrastive loss for one-positive-many-negative ranking.
+
+    This is a practical adaptation for KG tail reranking: each query has one
+    positive target on the diagonal of the in-batch similarity matrix, and all
+    off-diagonal entries are negatives. The loss down-weights easy negatives more
+    aggressively than positives.
+    """
+
+    def __init__(
+        self,
+        temperature=0.07,
+        gamma_pos=0.0,
+        gamma_neg=4.0,
+        clip=0.05,
+        pos_weight=1.0,
+        neg_weight=1.0,
+    ):
+        super().__init__()
+        self.temperature = float(temperature)
+        self.gamma_pos = float(gamma_pos)
+        self.gamma_neg = float(gamma_neg)
+        self.clip = float(clip)
+        self.pos_weight = float(pos_weight)
+        self.neg_weight = float(neg_weight)
+
+    def forward(self, scores):
+        if scores.dim() != 2 or scores.size(0) != scores.size(1):
+            raise ValueError(
+                f"AsymmetricContrastiveLoss expects a square score matrix, got {tuple(scores.shape)}"
+            )
+
+        logits = scores / max(self.temperature, 1e-8)
+        probs = torch.sigmoid(logits)
+        bsz = probs.size(0)
+        eye = torch.eye(bsz, device=probs.device, dtype=torch.bool)
+
+        pos_prob = probs.diagonal().clamp(min=1e-8, max=1.0 - 1e-8)
+        neg_prob = probs.masked_select(~eye).clamp(min=1e-8, max=1.0 - 1e-8)
+
+        if self.clip > 0.0:
+            neg_prob = torch.clamp(neg_prob + self.clip, max=1.0 - 1e-8)
+
+        pos_term = -torch.log(pos_prob) * torch.pow(1.0 - pos_prob, self.gamma_pos)
+        neg_term = -torch.log(1.0 - neg_prob) * torch.pow(neg_prob, self.gamma_neg)
+
+        if neg_term.numel() > 0:
+            neg_term = neg_term.view(bsz, -1).mean(dim=1)
+        else:
+            neg_term = torch.zeros_like(pos_term)
+
+        loss = self.pos_weight * pos_term + self.neg_weight * neg_term
+        return loss.mean()
+
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -176,6 +232,27 @@ class GWM(nn.Module):
         self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
 
         self.temperature = float(getattr(config, 'temperature'))
+        self.loss_type = str(getattr(config, 'loss_type', 'acl')).lower()
+        self.acl_gamma_pos = float(getattr(config, 'acl_gamma_pos', 0.0))
+        self.acl_gamma_neg = float(getattr(config, 'acl_gamma_neg', 4.0))
+        self.acl_clip = float(getattr(config, 'acl_clip', 0.05))
+        self.acl_pos_weight = float(getattr(config, 'acl_pos_weight', 1.0))
+        self.acl_neg_weight = float(getattr(config, 'acl_neg_weight', 1.0))
+        self.acl = AsymmetricContrastiveLoss(
+            temperature=self.temperature,
+            gamma_pos=self.acl_gamma_pos,
+            gamma_neg=self.acl_gamma_neg,
+            clip=self.acl_clip,
+            pos_weight=self.acl_pos_weight,
+            neg_weight=self.acl_neg_weight,
+        )
+
+    def _ranking_loss(self, scores):
+        if self.loss_type == 'acl':
+            return self.acl(scores)
+
+        labels = torch.arange(scores.size(0), device=scores.device)
+        return F.cross_entropy(scores / self.temperature, labels)
 
     def _encode_subgraph_with_compgcn(self, h_emb, ctx_entity_emb, ctx_relation_emb, ctx_batch_index, compgcn_stack):
         h_state = h_emb
@@ -410,10 +487,8 @@ class GWM(nn.Module):
         scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
         self._record_alpha(alpha)
 
-        labels = torch.arange(scores_fused.size(0), device=scores_fused.device)
-        loss_fn = nn.CrossEntropyLoss()
-        loss_text = loss_fn(scores_text, labels)
-        loss_struct = loss_fn(scores_struct, labels)
+        loss_text = self._ranking_loss(scores_text)
+        loss_struct = self._ranking_loss(scores_struct)
 
         return loss_text, loss_struct, scores_fused
 

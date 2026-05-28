@@ -31,6 +31,13 @@ candidate_batch_size: 2048
 
 temperature: 0.07
 
+loss_type: acl
+acl_gamma_pos: 0.0
+acl_gamma_neg: 4.0
+acl_clip: 0.05
+acl_pos_weight: 1.0
+acl_neg_weight: 1.0
+
 sigreg_weight: 0.005
 sigreg_knots: 10
 sigreg_num_proj: 512

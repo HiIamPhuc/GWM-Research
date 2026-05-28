@@ -389,6 +389,11 @@ def resume_training(args):
 				loss = main_loss + model.sigreg_weight * sigreg_loss
 				total_sigreg += sigreg_loss.item()
 				sigreg_batches += 1
+
+			if not torch.isfinite(loss):
+				print("Warning: non-finite loss detected; skipping batch to avoid corrupting model weights.")
+				optimizer.zero_grad(set_to_none=True)
+				continue
 			loss.backward()
 			torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 			optimizer.step()

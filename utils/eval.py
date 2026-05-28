@@ -136,6 +136,12 @@ def compute_filtered_ranking_metrics(
             alpha = model.alpha_mlp(torch.cat([rel_text, rel_struct], dim=-1))
             scores = alpha * scores_text + (1.0 - alpha) * scores_struct
 
+            # Prevent NaNs/Infs from masquerading as perfect ranks.
+            scores = torch.nan_to_num(scores, nan=-1e9, posinf=1e9, neginf=-1e9)
+            scores_text = torch.nan_to_num(scores_text, nan=-1e9, posinf=1e9, neginf=-1e9)
+            scores_struct = torch.nan_to_num(scores_struct, nan=-1e9, posinf=1e9, neginf=-1e9)
+            alpha = torch.nan_to_num(alpha, nan=0.5, posinf=1.0, neginf=0.0)
+
             for i in range(scores.size(0)):
                 h_id = h_ids[i]
                 r_id = r_ids[i]

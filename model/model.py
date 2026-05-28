@@ -136,18 +136,32 @@ class AsymmetricContrastiveLoss(nn.Module):
             )
 
         logits = scores / max(self.temperature, 1e-8)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         probs = torch.sigmoid(logits)
         bsz = probs.size(0)
         eye = torch.eye(bsz, device=probs.device, dtype=torch.bool)
 
-        pos_prob = probs.diagonal().clamp(min=1e-8, max=1.0 - 1e-8)
-        neg_prob = probs.masked_select(~eye).clamp(min=1e-8, max=1.0 - 1e-8)
+        pos_logits = logits.diagonal()
+        neg_logits = logits.masked_select(~eye)
+        pos_prob = probs.diagonal().clamp(min=1e-6, max=1.0 - 1e-6)
+        neg_prob = probs.masked_select(~eye).clamp(min=1e-6, max=1.0 - 1e-6)
 
         if self.clip > 0.0:
-            neg_prob = torch.clamp(neg_prob + self.clip, max=1.0 - 1e-8)
+            neg_prob = torch.clamp(neg_prob + self.clip, max=1.0 - 1e-6)
 
-        pos_term = -torch.log(pos_prob) * torch.pow(1.0 - pos_prob, self.gamma_pos)
-        neg_term = -torch.log(1.0 - neg_prob) * torch.pow(neg_prob, self.gamma_neg)
+        pos_bce = F.binary_cross_entropy_with_logits(
+            pos_logits,
+            torch.ones_like(pos_logits),
+            reduction='none',
+        )
+        neg_bce = F.binary_cross_entropy_with_logits(
+            neg_logits,
+            torch.zeros_like(neg_logits),
+            reduction='none',
+        )
+
+        pos_term = torch.pow(1.0 - pos_prob, self.gamma_pos) * pos_bce
+        neg_term = torch.pow(neg_prob, self.gamma_neg) * neg_bce
 
         if neg_term.numel() > 0:
             neg_term = neg_term.view(bsz, -1).mean(dim=1)

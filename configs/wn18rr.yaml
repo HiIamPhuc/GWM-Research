@@ -33,12 +33,12 @@ temperature: 0.07
 
 loss_type: acl
 acl_gamma_pos: 0.0
-acl_gamma_neg: 2.0
+acl_gamma_neg: 1.5
 acl_clip: 0.0
 acl_pos_weight: 1.0
-acl_neg_weight: 1.0
+acl_neg_weight: 0.5
 
-sigreg_weight: 0.005
+sigreg_weight: 0.002
 sigreg_knots: 10
 sigreg_num_proj: 512
 

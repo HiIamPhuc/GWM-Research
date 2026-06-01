@@ -86,42 +86,6 @@ class DynamicsMixer(nn.Module):
         return self.dropout(self.out_proj(mixed))
 
 
-class SIGReg(nn.Module):
-    """LeWM-style isotropic Gaussian regularizer using random projections."""
-
-    def __init__(self, knots=17, num_proj=1024):
-        super().__init__()
-        self.num_proj = int(num_proj)
-        t = torch.linspace(0, 3, int(knots), dtype=torch.float32)
-        dt = 3.0 / max(int(knots) - 1, 1)
-        weights = torch.full((int(knots),), 2 * dt, dtype=torch.float32)
-        if weights.numel() > 1:
-            weights[[0, -1]] = dt
-        window = torch.exp(-t.square() / 2.0)
-        self.register_buffer("t", t)
-        self.register_buffer("phi", window)
-        self.register_buffer("weights", weights * window)
-
-    def forward(self, proj):
-        """
-        proj: (T, B, D)
-        """
-        if proj.numel() == 0:
-            return proj.new_zeros(())
-
-        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device, dtype=proj.dtype)
-        A = A.div_(A.norm(p=2, dim=0, keepdim=True).clamp(min=1e-12))
-
-        t = self.t.to(dtype=proj.dtype)
-        phi = self.phi.to(dtype=proj.dtype)
-        weights = self.weights.to(dtype=proj.dtype)
-
-        x_t = (proj @ A).unsqueeze(-1) * t
-        err = (x_t.cos().mean(-3) - phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ weights) * proj.size(-2)
-        return statistic.mean()
-
-
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -191,10 +155,7 @@ class GWM(nn.Module):
         
         self.input_dropout = nn.Dropout(float(getattr(config, 'dropout')))
 
-        self.sigreg_weight = float(getattr(config, 'sigreg_weight'))
-        sigreg_knots = int(getattr(config, 'sigreg_knots'))
-        sigreg_num_proj = int(getattr(config, 'sigreg_num_proj'))
-        self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
+        self.balance_floor = float(getattr(config, 'balance_floor', 0.0))
 
         self.temperature = float(getattr(config, 'temperature'))
 
@@ -427,17 +388,16 @@ class GWM(nn.Module):
         scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
         self._record_alpha(alpha)
 
-        loss_text = F.cross_entropy(scores_text, labels)
-        loss_struct = F.cross_entropy(scores_struct, labels)
+        loss_text_per_sample = F.cross_entropy(scores_text, labels, reduction='none')
+        loss_struct_per_sample = F.cross_entropy(scores_struct, labels, reduction='none')
 
-        return loss_text, loss_struct, scores_fused
+        balance = alpha.squeeze(-1)
+        if self.balance_floor > 0.0:
+            balance = balance.clamp(min=self.balance_floor, max=1.0 - self.balance_floor)
 
-    def compute_sigreg_loss(self, query_vectors):
-        if self.sigreg is None or self.sigreg_weight <= 0.0:
-            return None
-        _, _, _, _, query_text_raw, query_struct_raw = query_vectors
-        if query_text_raw is None or query_struct_raw is None:
-            return None
-        sig_text = self.sigreg(query_text_raw.unsqueeze(0))
-        sig_struct = self.sigreg(query_struct_raw.unsqueeze(0))
-        return 0.5 * (sig_text + sig_struct)
+        loss_text = loss_text_per_sample.mean()
+        loss_struct = loss_struct_per_sample.mean()
+        loss = (balance * loss_text_per_sample + (1.0 - balance) * loss_struct_per_sample).mean()
+
+        return loss_text, loss_struct, loss, scores_fused, alpha
+

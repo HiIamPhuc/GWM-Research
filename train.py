@@ -255,8 +255,6 @@ def train(args):
         _sync_device(device)
         model.train()
         total_loss = 0
-        total_sigreg = 0.0
-        sigreg_batches = 0
 
         if hasattr(model, 'reset_alpha_stats'):
             model.reset_alpha_stats()
@@ -277,18 +275,10 @@ def train(args):
 
             optimizer.zero_grad()
 
-            loss_text, loss_struct, _ = model.compute_loss(
+            loss_text, loss_struct, loss, _, _ = model.compute_loss(
                 query_vector,
                 t_fused,
             )
-            main_loss = loss_text + loss_struct
-            sigreg_loss = model.compute_sigreg_loss(query_vector)
-            if sigreg_loss is None:
-                loss = main_loss
-            else:
-                loss = main_loss + model.sigreg_weight * sigreg_loss
-                total_sigreg += sigreg_loss.item()
-                sigreg_batches += 1
 
             if not torch.isfinite(loss):
                 print("Warning: non-finite loss detected; skipping batch to avoid corrupting model weights.")
@@ -310,9 +300,6 @@ def train(args):
             
         avg_train_loss = total_loss / len(train_loader)
         train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
-        avg_sigreg = None
-        if sigreg_batches > 0:
-            avg_sigreg = total_sigreg / sigreg_batches
 
         print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
         print(
@@ -321,8 +308,6 @@ def train(args):
         )
         if train_alpha is not None:
             print(f"Epoch {epoch+1} Train Alpha (text weight): {train_alpha:.4f}")
-        if avg_sigreg is not None:
-            print(f"Epoch {epoch+1} Train SIGReg: {avg_sigreg:.6f}")
         
         # Validation
         eval_every = getattr(config, 'eval_every', 1)
@@ -385,8 +370,6 @@ def train(args):
             }
             if train_alpha is not None:
                 epoch_log['train_alpha'] = train_alpha
-            if avg_sigreg is not None:
-                epoch_log['train_sigreg'] = avg_sigreg
             if val_alpha is not None:
                 epoch_log['val_alpha'] = val_alpha
             history.append(epoch_log)
@@ -411,8 +394,6 @@ def train(args):
             }
             if train_alpha is not None:
                 epoch_log['train_alpha'] = train_alpha
-            if avg_sigreg is not None:
-                epoch_log['train_sigreg'] = avg_sigreg
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                   json.dump(history, f, indent=2)

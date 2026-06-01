@@ -16,8 +16,8 @@ dynamics_layers: 1
 dropout: 0.1
 recurrent_dropout: 0.2
 
-learning_rate: 2e-5
-weight_decay: 0.001
+learning_rate: 5e-5
+weight_decay: 0.01
 min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
@@ -29,18 +29,11 @@ batch_size: 2048
 eval_batch_size: 2048
 candidate_batch_size: 2048
 
-temperature: 0.1
+temperature: 0.07
 
-loss_type: acl
-acl_gamma_pos: 0.0
-acl_gamma_neg: 1.0
-acl_clip: 0.01
-acl_pos_weight: 1.0
-acl_neg_weight: 1.0
-
-sigreg_weight: 0.0005
-sigreg_knots: 15
-sigreg_num_proj: 1024
+sigreg_weight: 0.001
+sigreg_knots: 10
+sigreg_num_proj: 512
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr

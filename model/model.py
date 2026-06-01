@@ -67,6 +67,25 @@ class MLPAdapter(nn.Module):
         return residual + x
 
 
+class DynamicsMixer(nn.Module):
+    """Relation-conditioned mixer for the LSTM action input."""
+
+    def __init__(self, hidden_dim, dropout=0.0):
+        super().__init__()
+        self.head_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.rel_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.gate_proj = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, head_emb, relation_emb):
+        head_state = self.head_proj(head_emb)
+        rel_state = self.rel_proj(relation_emb)
+        gate = torch.sigmoid(self.gate_proj(torch.cat([head_state, rel_state], dim=-1)))
+        mixed = gate * head_state + (1.0 - gate) * rel_state
+        return self.dropout(self.out_proj(mixed))
+
+
 class SIGReg(nn.Module):
     """LeWM-style isotropic Gaussian regularizer using random projections."""
 
@@ -103,74 +122,6 @@ class SIGReg(nn.Module):
         return statistic.mean()
 
 
-class AsymmetricContrastiveLoss(nn.Module):
-    """Asymmetric focal contrastive loss for one-positive-many-negative ranking.
-
-    This is a practical adaptation for KG tail reranking: each query has one
-    positive target on the diagonal of the in-batch similarity matrix, and all
-    off-diagonal entries are negatives. The loss down-weights easy negatives more
-    aggressively than positives.
-    """
-
-    def __init__(
-        self,
-        temperature=0.07,
-        gamma_pos=0.0,
-        gamma_neg=4.0,
-        clip=0.05,
-        pos_weight=1.0,
-        neg_weight=1.0,
-    ):
-        super().__init__()
-        self.temperature = float(temperature)
-        self.gamma_pos = float(gamma_pos)
-        self.gamma_neg = float(gamma_neg)
-        self.clip = float(clip)
-        self.pos_weight = float(pos_weight)
-        self.neg_weight = float(neg_weight)
-
-    def forward(self, scores):
-        if scores.dim() != 2 or scores.size(0) != scores.size(1):
-            raise ValueError(
-                f"AsymmetricContrastiveLoss expects a square score matrix, got {tuple(scores.shape)}"
-            )
-
-        logits = scores / max(self.temperature, 1e-8)
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        probs = torch.sigmoid(logits)
-        bsz = probs.size(0)
-        eye = torch.eye(bsz, device=probs.device, dtype=torch.bool)
-
-        pos_logits = logits.diagonal()
-        neg_logits = logits.masked_select(~eye)
-        pos_prob = probs.diagonal().clamp(min=1e-6, max=1.0 - 1e-6)
-        neg_prob = probs.masked_select(~eye).clamp(min=1e-6, max=1.0 - 1e-6)
-
-        if self.clip > 0.0:
-            neg_prob = torch.clamp(neg_prob + self.clip, max=1.0 - 1e-6)
-
-        pos_bce = F.binary_cross_entropy_with_logits(
-            pos_logits,
-            torch.ones_like(pos_logits),
-            reduction='none',
-        )
-        neg_bce = F.binary_cross_entropy_with_logits(
-            neg_logits,
-            torch.zeros_like(neg_logits),
-            reduction='none',
-        )
-
-        pos_term = torch.pow(1.0 - pos_prob, self.gamma_pos) * pos_bce
-        neg_term = torch.pow(neg_prob, self.gamma_neg) * neg_bce
-
-        if neg_term.numel() > 0:
-            neg_term = neg_term.view(bsz, -1).mean(dim=1)
-        else:
-            neg_term = torch.zeros_like(pos_term)
-
-        loss = self.pos_weight * pos_term + self.neg_weight * neg_term
-        return loss.mean()
-
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -194,7 +145,7 @@ class GWM(nn.Module):
         self.text_h0_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
         self.text_c0_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
 
-        self.text_film = nn.Linear(self.text_emb_dim, 2 * self.text_emb_dim)
+        self.text_dynamics_mixer = DynamicsMixer(self.text_emb_dim, dropout=float(getattr(config, 'dropout')))
 
         self.text_lstm = nn.LSTM(
             input_size=self.text_emb_dim,
@@ -219,7 +170,7 @@ class GWM(nn.Module):
         self.struct_h0_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
         self.struct_c0_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
 
-        self.struct_film = nn.Linear(self.struct_emb_dim, 2 * self.struct_emb_dim)
+        self.struct_dynamics_mixer = DynamicsMixer(self.struct_emb_dim, dropout=float(getattr(config, 'dropout')))
         
         self.struct_lstm = nn.LSTM(
             input_size=self.struct_emb_dim, 
@@ -246,25 +197,8 @@ class GWM(nn.Module):
         self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
 
         self.temperature = float(getattr(config, 'temperature'))
-        self.loss_type = str(getattr(config, 'loss_type', 'acl')).lower()
-        self.acl_gamma_pos = float(getattr(config, 'acl_gamma_pos', 0.0))
-        self.acl_gamma_neg = float(getattr(config, 'acl_gamma_neg', 4.0))
-        self.acl_clip = float(getattr(config, 'acl_clip', 0.05))
-        self.acl_pos_weight = float(getattr(config, 'acl_pos_weight', 1.0))
-        self.acl_neg_weight = float(getattr(config, 'acl_neg_weight', 1.0))
-        self.acl = AsymmetricContrastiveLoss(
-            temperature=self.temperature,
-            gamma_pos=self.acl_gamma_pos,
-            gamma_neg=self.acl_gamma_neg,
-            clip=self.acl_clip,
-            pos_weight=self.acl_pos_weight,
-            neg_weight=self.acl_neg_weight,
-        )
 
     def _ranking_loss(self, scores):
-        if self.loss_type == 'acl':
-            return self.acl(scores)
-
         labels = torch.arange(scores.size(0), device=scores.device)
         return F.cross_entropy(scores / self.temperature, labels)
 
@@ -319,14 +253,13 @@ class GWM(nn.Module):
         relation_struct = self.input_dropout(self.struct_adapter(self.struct_rel_embs(relation_ids)))
         return entity_text, relation_text, entity_struct, relation_struct
 
-    def _run_dynamics(self, world_state, head_emb, relation_emb, lstm, h0_proj, c0_proj, path='text'):
+    def _run_dynamics(self, world_state, head_emb, relation_emb, mixer, lstm, h0_proj, c0_proj):
         """
         Run recurrent dynamics over a sequence of steps.
 
         world_state: (B, compgcn_dim) used to initialise h0/c0
         head_emb: (B, D) head embedding for this path
         relation_emb: (B, D_rel) relation embedding for this path
-        path: 'text' or 'struct' to select FiLM projection
         """
         h_0 = torch.tanh(h0_proj(world_state))
         c_0 = c0_proj(world_state)
@@ -336,19 +269,11 @@ class GWM(nn.Module):
         h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
         c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
 
-        # Relation-conditioned FiLM modulation on the step inputs
-        if path == 'text':
-            film_params = self.text_film(relation_emb)
-        else:
-            film_params = self.struct_film(relation_emb)
-
-        shift, scale = film_params.chunk(2, dim=-1)
-
-        head_emb = (1.0 + scale) * head_emb + shift
-        head_emb = head_emb.unsqueeze(1)
+        # Relation-conditioned dynamics mixer on the step inputs
+        mixed_step = mixer(head_emb, relation_emb).unsqueeze(1)
 
         # Run LSTM over the sequence
-        lstm_out, (h_n, c_n) = lstm(head_emb, (h_0_lstm, c_0_lstm))
+        lstm_out, (h_n, c_n) = lstm(mixed_step, (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
         query_norm = torch.nn.functional.normalize(query_vector, p=2, dim=1)
         return query_vector, query_norm
@@ -462,7 +387,7 @@ class GWM(nn.Module):
 
         query_text_raw, query_text = self._run_dynamics(
             world_state_text, h_text, r_text,
-            self.text_lstm, self.text_h0_projection, self.text_c0_projection, path='text'
+            self.text_dynamics_mixer, self.text_lstm, self.text_h0_projection, self.text_c0_projection
         )
 
         # -- Struct Pathway --
@@ -473,7 +398,7 @@ class GWM(nn.Module):
     
         query_struct_raw, query_struct = self._run_dynamics(
             world_state_struct, h_struct, r_struct,
-            self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection, path='struct'
+            self.struct_dynamics_mixer, self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection
         )
 
         return query_text, query_struct, r_text, r_struct, query_text_raw, query_struct_raw
@@ -492,6 +417,7 @@ class GWM(nn.Module):
 
         scores_text = torch.mm(query_text, target_text.t())
         scores_struct = torch.mm(query_struct, target_struct.t())
+        labels = torch.arange(scores_text.size(0), device=scores_text.device)
 
         scores_text = scores_text / self.temperature
         scores_struct = scores_struct / self.temperature
@@ -501,8 +427,8 @@ class GWM(nn.Module):
         scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
         self._record_alpha(alpha)
 
-        loss_text = self._ranking_loss(scores_text)
-        loss_struct = self._ranking_loss(scores_struct)
+        loss_text = F.cross_entropy(scores_text, labels)
+        loss_struct = F.cross_entropy(scores_struct, labels)
 
         return loss_text, loss_struct, scores_fused
 

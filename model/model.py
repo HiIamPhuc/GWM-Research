@@ -68,22 +68,16 @@ class MLPAdapter(nn.Module):
 
 
 class DynamicsMixer(nn.Module):
-    """Relation-conditioned mixer for the LSTM action input."""
-
     def __init__(self, hidden_dim, dropout=0.0):
         super().__init__()
-        self.head_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.rel_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.gate_proj = nn.Linear(2 * hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.mixer = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
 
     def forward(self, head_emb, relation_emb):
-        head_state = self.head_proj(head_emb)
-        rel_state = self.rel_proj(relation_emb)
-        gate = torch.sigmoid(self.gate_proj(torch.cat([head_state, rel_state], dim=-1)))
-        mixed = gate * head_state + (1.0 - gate) * rel_state
-        return self.dropout(self.out_proj(mixed))
+        return self.mixer(torch.cat([head_emb, relation_emb], dim=-1))
 
 
 class GWM(nn.Module):

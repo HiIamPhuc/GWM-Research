@@ -159,10 +159,6 @@ class GWM(nn.Module):
 
         self.temperature = float(getattr(config, 'temperature'))
 
-    def _ranking_loss(self, scores):
-        labels = torch.arange(scores.size(0), device=scores.device)
-        return F.cross_entropy(scores / self.temperature, labels)
-
     def _encode_subgraph_with_compgcn(self, h_emb, ctx_entity_emb, ctx_relation_emb, ctx_batch_index, compgcn_stack):
         h_state = h_emb
         for layer in compgcn_stack:
@@ -206,13 +202,6 @@ class GWM(nn.Module):
                 raise ValueError("context_batch['batch_index'] is required for ragged context format.")
 
         return flat_entity_ids, flat_relation_ids, context_batch_index
-
-    def _encode_context_features(self, entity_ids, relation_ids):
-        entity_text = self.input_dropout(self.text_adapter(self.text_ent_embs(entity_ids)))
-        relation_text = self.input_dropout(self.text_adapter(self.text_rel_embs(relation_ids)))
-        entity_struct = self.input_dropout(self.struct_adapter(self.struct_ent_embs(entity_ids)))
-        relation_struct = self.input_dropout(self.struct_adapter(self.struct_rel_embs(relation_ids)))
-        return entity_text, relation_text, entity_struct, relation_struct
 
     def _run_dynamics(self, world_state, head_emb, relation_emb, mixer, lstm, h0_proj, c0_proj):
         """

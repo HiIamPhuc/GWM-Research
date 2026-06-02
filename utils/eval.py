@@ -103,6 +103,7 @@ def compute_filtered_ranking_metrics(
     desc="Filtered Ranking",
     save_predictions_path=None,
     topk=50,
+    rerank_topk=100,
 ):
     hits1, hits3, hits10, mrr, mr = 0, 0, 0, 0.0, 0.0
     total = 0
@@ -127,20 +128,14 @@ def compute_filtered_ranking_metrics(
             q_out = model(h_batch, r_batch, context_batch)
             q_text, q_struct, rel_text, rel_struct, _, _ = q_out
             
-            scores_text = torch.mm(q_text, all_t_text.t())
-            scores_struct = torch.mm(q_struct, all_t_struct.t())
-
-            scores_text = scores_text / model.temperature
-            scores_struct = scores_struct / model.temperature
-
-            alpha = model.alpha_mlp(torch.cat([rel_text, rel_struct], dim=-1))
-            scores = alpha * scores_text + (1.0 - alpha) * scores_struct
+            scores_text = torch.mm(q_text, all_t_text.t()) / model.temperature
+            scores_struct = torch.mm(q_struct, all_t_struct.t()) / model.temperature
+            scores = 0.5 * (scores_text + scores_struct)
 
             # Prevent NaNs/Infs from masquerading as perfect ranks.
             scores = torch.nan_to_num(scores, nan=-1e9, posinf=1e9, neginf=-1e9)
             scores_text = torch.nan_to_num(scores_text, nan=-1e9, posinf=1e9, neginf=-1e9)
             scores_struct = torch.nan_to_num(scores_struct, nan=-1e9, posinf=1e9, neginf=-1e9)
-            alpha = torch.nan_to_num(alpha, nan=0.5, posinf=1.0, neginf=0.0)
 
             for i in range(scores.size(0)):
                 h_id = h_ids[i]
@@ -155,6 +150,28 @@ def compute_filtered_ranking_metrics(
                     scores[i, filter_mask_indices] = -float('inf')
                     scores_text[i, filter_mask_indices] = -float('inf')
                     scores_struct[i, filter_mask_indices] = -float('inf')
+
+                # Two-stage retrieve-and-rerank:
+                # 1) retrieve top candidates from both pipes
+                # 2) rerank their union using cross-modal reranker
+                k = max(1, min(int(rerank_topk), scores.size(1)))
+                text_top_idx = torch.topk(scores_text[i], k=k, dim=0).indices
+                struct_top_idx = torch.topk(scores_struct[i], k=k, dim=0).indices
+                true_idx = torch.tensor([true_t], device=device, dtype=torch.long)
+                cand_idx = torch.cat([text_top_idx, struct_top_idx, true_idx], dim=0)
+                cand_idx = torch.unique(cand_idx, sorted=False)
+
+                rerank_scores = model.rerank_with_indices(
+                    relation_text=rel_text[i:i+1],
+                    relation_struct=rel_struct[i:i+1],
+                    target_text=all_t_text,
+                    target_struct=all_t_struct,
+                    candidate_indices=cand_idx.unsqueeze(0),
+                )
+                rerank_scores = rerank_scores.squeeze(0) / model.temperature
+
+                # Keep coarse scores globally, replace candidate subset with reranker scores.
+                scores[i, cand_idx] = rerank_scores
 
             target_scores = scores.gather(1, t_ids.unsqueeze(1))
             ranks = (scores > target_scores).sum(dim=1) + 1

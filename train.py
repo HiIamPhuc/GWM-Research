@@ -325,6 +325,7 @@ def train(args):
 
             save_eval_predictions = bool(getattr(config, 'save_eval_predictions', False))
             eval_topk = int(getattr(config, 'eval_topk', 50))
+            reranker_eval_topk = int(getattr(config, 'reranker_eval_topk', 100))
             predictions_dir = getattr(config, 'eval_predictions_dir', None)
             predictions_path = None
             if save_eval_predictions:
@@ -341,6 +342,7 @@ def train(args):
                 desc="Validation",
                 save_predictions_path=predictions_path,
                 topk=eval_topk,
+                rerank_topk=reranker_eval_topk,
             )
 
             val_mrr = val_metrics['MRR']

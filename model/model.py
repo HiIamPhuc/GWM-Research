@@ -80,6 +80,44 @@ class DynamicsMixer(nn.Module):
         return self.mixer(torch.cat([head_emb, relation_emb], dim=-1))
 
 
+class CrossModalReranker(nn.Module):
+    """Cross-encoder style reranker over candidates, conditioned by relation queries."""
+
+    def __init__(self, text_dim, struct_dim, proj_dim=128, hidden_dim=256, dropout=0.1):
+        super().__init__()
+        self.text_proj = nn.Linear(text_dim, proj_dim)
+        self.struct_proj = nn.Linear(struct_dim, proj_dim)
+
+        # Features per candidate:
+        # [q_t, c_t, q_t*c_t, q_s, c_s, q_s*c_s] -> 6 * proj_dim
+        feat_dim = proj_dim * 6
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, relation_text, relation_struct, cand_text, cand_struct):
+        """
+        relation_text:   (B, D_t)
+        relation_struct: (B, D_s)
+        cand_text:    (B, K, D_t)
+        cand_struct:  (B, K, D_s)
+        returns:      (B, K)
+        """
+        q_t = self.text_proj(relation_text).unsqueeze(1)
+        q_s = self.struct_proj(relation_struct).unsqueeze(1)
+        c_t = self.text_proj(cand_text)
+        c_s = self.struct_proj(cand_struct)
+
+        feat = torch.cat([q_t.expand_as(c_t), c_t, q_t * c_t, q_s.expand_as(c_s), c_s, q_s * c_s], dim=-1)
+        return self.head(feat).squeeze(-1)
+
+
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -138,18 +176,18 @@ class GWM(nn.Module):
             dropout=float(getattr(config, 'recurrent_dropout'))
         )
 
-        self.alpha_mlp = nn.Sequential(
-            nn.Linear(self.text_emb_dim + self.struct_emb_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid(),
+        self.reranker = CrossModalReranker(
+            text_dim=self.text_emb_dim,
+            struct_dim=self.struct_emb_dim,
+            proj_dim=int(getattr(config, 'reranker_proj_dim', 64)),
+            hidden_dim=int(getattr(config, 'reranker_hidden_dim', 128)),
+            dropout=float(getattr(config, 'reranker_dropout', getattr(config, 'dropout', 0.1))),
         )
-        self._alpha_sum = 0.0
-        self._alpha_count = 0
+        self.reranker_train_topk = int(getattr(config, 'reranker_train_topk', 16))
+        self.reranker_loss_weight = float(getattr(config, 'reranker_loss_weight', 1.0))
+        self.bi_loss_weight = float(getattr(config, 'bi_loss_weight', 0.5))
         
         self.input_dropout = nn.Dropout(float(getattr(config, 'dropout')))
-
-        self.balance_floor = float(getattr(config, 'balance_floor', 0.0))
 
         self.temperature = float(getattr(config, 'temperature'))
 
@@ -296,20 +334,27 @@ class GWM(nn.Module):
             self.text_rel_embs.weight.requires_grad = False
 
     def reset_alpha_stats(self):
-        self._alpha_sum = 0.0
-        self._alpha_count = 0
+        # Kept for backward-compatibility with existing train loop logging.
+        return None
 
     def _record_alpha(self, alpha):
-        self._alpha_sum += alpha.sum().item()
-        self._alpha_count += alpha.numel()
+        return None
 
     def get_alpha_mean(self, reset=False):
-        if self._alpha_count == 0:
-            return None
-        mean = self._alpha_sum / self._alpha_count
-        if reset:
-            self.reset_alpha_stats()
-        return mean
+        return None
+
+    def rerank_with_indices(self, relation_text, relation_struct, target_text, target_struct, candidate_indices):
+        """
+        Candidate reranking helper conditioned on relation queries.
+
+        relation_text/relation_struct: (B, D)
+        target_text/target_struct: (N, D)
+        candidate_indices: (B, K)
+        returns: (B, K)
+        """
+        cand_text = target_text[candidate_indices]
+        cand_struct = target_struct[candidate_indices]
+        return self.reranker(relation_text, relation_struct, cand_text, cand_struct)
 
     def forward(self, h_batch, r_batch, context_batch):
         h_text = self.input_dropout(self.text_adapter(self.text_ent_embs(h_batch['id'])))
@@ -366,21 +411,34 @@ class GWM(nn.Module):
         scores_text = scores_text / self.temperature
         scores_struct = scores_struct / self.temperature
 
-        head_combined = torch.cat([relation_text, relation_struct], dim=-1)
-        alpha = self.alpha_mlp(head_combined)
-        scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
-        self._record_alpha(alpha)
+        loss_text = F.cross_entropy(scores_text, labels)
+        loss_struct = F.cross_entropy(scores_struct, labels)
 
-        loss_text_per_sample = F.cross_entropy(scores_text, labels, reduction='none')
-        loss_struct_per_sample = F.cross_entropy(scores_struct, labels, reduction='none')
+        # Training rerank candidates: top-K from each pipe + guaranteed positive tail.
+        k = max(1, min(self.reranker_train_topk, scores_text.size(1)))
+        top_text_idx = torch.topk(scores_text, k=k, dim=1).indices
+        top_struct_idx = torch.topk(scores_struct, k=k, dim=1).indices
+        true_idx = labels.unsqueeze(1)
+        candidate_indices = torch.cat([top_text_idx, top_struct_idx, true_idx], dim=1)
 
-        balance = alpha.squeeze(-1)
-        if self.balance_floor > 0.0:
-            balance = balance.clamp(min=self.balance_floor, max=1.0 - self.balance_floor)
+        rerank_scores = self.rerank_with_indices(
+            relation_text=relation_text,
+            relation_struct=relation_struct,
+            target_text=target_text,
+            target_struct=target_struct,
+            candidate_indices=candidate_indices,
+        )
+        rerank_scores = rerank_scores / self.temperature
 
-        loss_text = loss_text_per_sample.mean()
-        loss_struct = loss_struct_per_sample.mean()
-        loss = (balance * loss_text_per_sample + (1.0 - balance) * loss_struct_per_sample).mean()
+        rerank_labels = torch.full(
+            (rerank_scores.size(0),),
+            rerank_scores.size(1) - 1,
+            device=rerank_scores.device,
+            dtype=torch.long,
+        )
+        loss_rerank = F.cross_entropy(rerank_scores, rerank_labels)
 
-        return loss_text, loss_struct, loss, scores_fused, alpha
+        loss = self.reranker_loss_weight * loss_rerank + self.bi_loss_weight * 0.5 * (loss_text + loss_struct)
+
+        return loss_text, loss_struct, loss, rerank_scores, None
 

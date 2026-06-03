@@ -130,7 +130,12 @@ def compute_filtered_ranking_metrics(
             
             scores_text = torch.mm(q_text, all_t_text.t()) / model.temperature
             scores_struct = torch.mm(q_struct, all_t_struct.t()) / model.temperature
-            scores = 0.5 * (scores_text + scores_struct)
+            alpha = model.alpha_mlp(torch.cat([rel_text, rel_struct], dim=-1))
+            balance = alpha.squeeze(-1)
+            if getattr(model, 'balance_floor', 0.0) > 0.0:
+                balance = balance.clamp(min=model.balance_floor, max=1.0 - model.balance_floor)
+            alpha_eff = balance.unsqueeze(-1)
+            scores = alpha_eff * scores_text + (1.0 - alpha_eff) * scores_struct
 
             # Prevent NaNs/Infs from masquerading as perfect ranks.
             scores = torch.nan_to_num(scores, nan=-1e9, posinf=1e9, neginf=-1e9)
@@ -152,13 +157,12 @@ def compute_filtered_ranking_metrics(
                     scores_struct[i, filter_mask_indices] = -float('inf')
 
                 # Two-stage retrieve-and-rerank:
-                # 1) retrieve top candidates from both pipes
-                # 2) rerank their union using cross-modal reranker
+                # 1) retrieve top candidates from fused score
+                # 2) rerank that local pool
                 k = max(1, min(int(rerank_topk), scores.size(1)))
-                text_top_idx = torch.topk(scores_text[i], k=k, dim=0).indices
-                struct_top_idx = torch.topk(scores_struct[i], k=k, dim=0).indices
+                fused_top_idx = torch.topk(scores[i], k=k, dim=0).indices
                 true_idx = torch.tensor([true_t], device=device, dtype=torch.long)
-                cand_idx = torch.cat([text_top_idx, struct_top_idx, true_idx], dim=0)
+                cand_idx = torch.cat([fused_top_idx, true_idx], dim=0)
                 cand_idx = torch.unique(cand_idx, sorted=False)
 
                 rerank_scores = model.rerank_with_indices(

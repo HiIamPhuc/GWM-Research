@@ -183,9 +183,20 @@ class GWM(nn.Module):
             hidden_dim=int(getattr(config, 'reranker_hidden_dim', 128)),
             dropout=float(getattr(config, 'reranker_dropout', getattr(config, 'dropout', 0.1))),
         )
+        self.alpha_mlp = nn.Sequential(
+            nn.Linear(self.text_emb_dim + self.struct_emb_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+        self._alpha_sum = 0.0
+        self._alpha_count = 0
+
         self.reranker_train_topk = int(getattr(config, 'reranker_train_topk', 16))
         self.reranker_loss_weight = float(getattr(config, 'reranker_loss_weight', 1.0))
         self.bi_loss_weight = float(getattr(config, 'bi_loss_weight', 0.5))
+        self.fused_loss_weight = float(getattr(config, 'fused_loss_weight', 1.0))
+        self.balance_floor = float(getattr(config, 'balance_floor', 0.0))
         
         self.input_dropout = nn.Dropout(float(getattr(config, 'dropout')))
 
@@ -334,14 +345,20 @@ class GWM(nn.Module):
             self.text_rel_embs.weight.requires_grad = False
 
     def reset_alpha_stats(self):
-        # Kept for backward-compatibility with existing train loop logging.
-        return None
+        self._alpha_sum = 0.0
+        self._alpha_count = 0
 
     def _record_alpha(self, alpha):
-        return None
+        self._alpha_sum += alpha.sum().item()
+        self._alpha_count += alpha.numel()
 
     def get_alpha_mean(self, reset=False):
-        return None
+        if self._alpha_count == 0:
+            return None
+        mean = self._alpha_sum / self._alpha_count
+        if reset:
+            self.reset_alpha_stats()
+        return mean
 
     def freeze_base_keep_reranker(self):
         for name, param in self.named_parameters():
@@ -423,15 +440,25 @@ class GWM(nn.Module):
         scores_text = scores_text / self.temperature
         scores_struct = scores_struct / self.temperature
 
+        head_combined = torch.cat([relation_text, relation_struct], dim=-1)
+        alpha = self.alpha_mlp(head_combined)
+        self._record_alpha(alpha)
+
+        balance = alpha.squeeze(-1)
+        if self.balance_floor > 0.0:
+            balance = balance.clamp(min=self.balance_floor, max=1.0 - self.balance_floor)
+        alpha_eff = balance.unsqueeze(-1)
+        scores_fused = alpha_eff * scores_text + (1.0 - alpha_eff) * scores_struct
+
         loss_text = F.cross_entropy(scores_text, labels)
         loss_struct = F.cross_entropy(scores_struct, labels)
+        loss_fused = F.cross_entropy(scores_fused, labels)
 
-        # Training rerank candidates: top-K from each pipe + guaranteed positive tail.
-        k = max(1, min(self.reranker_train_topk, scores_text.size(1)))
-        top_text_idx = torch.topk(scores_text, k=k, dim=1).indices
-        top_struct_idx = torch.topk(scores_struct, k=k, dim=1).indices
+        # Training rerank candidates: top-K from fused retrieval + guaranteed positive tail.
+        k = max(1, min(self.reranker_train_topk, scores_fused.size(1)))
+        top_fused_idx = torch.topk(scores_fused, k=k, dim=1).indices
         true_idx = labels.unsqueeze(1)
-        candidate_indices = torch.cat([top_text_idx, top_struct_idx, true_idx], dim=1)
+        candidate_indices = torch.cat([top_fused_idx, true_idx], dim=1)
 
         # Avoid duplicate positives in non-label slots.
         # If the true tail is already present before the final slot, CE receives conflicting
@@ -460,7 +487,11 @@ class GWM(nn.Module):
         )
         loss_rerank = F.cross_entropy(rerank_scores, rerank_labels)
 
-        loss = reranker_loss_weight * loss_rerank + bi_loss_weight * 0.5 * (loss_text + loss_struct)
+        loss = (
+            self.fused_loss_weight * loss_fused
+            + reranker_loss_weight * loss_rerank
+            + bi_loss_weight * 0.5 * (loss_text + loss_struct)
+        )
 
-        return loss_text, loss_struct, loss, rerank_scores, None
+        return loss_text, loss_struct, loss, rerank_scores, alpha
 

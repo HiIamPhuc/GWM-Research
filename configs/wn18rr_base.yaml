@@ -34,8 +34,17 @@ balance_floor: 0.2
 bi_loss_weight: 1.0
 fused_loss_weight: 1.0
 
+reranker_proj_dim: 64
+reranker_hidden_dim: 128
+reranker_dropout: 0.2
+reranker_train_topk: 100
+reranker_eval_topk: 100
+reranker_loss_weight: 0.5
+
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr
+cache_dir: output/wn18rr/cache
+init_checkpoint: output/wn18rr/best_checkpoint.pt
     
 add_inverse: true
 context_k: 5

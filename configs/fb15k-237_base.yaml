@@ -34,8 +34,17 @@ balance_floor: 0.1
 bi_loss_weight: 1.0
 fused_loss_weight: 1.0
 
+reranker_proj_dim: 64
+reranker_hidden_dim: 128
+reranker_dropout: 0.2
+reranker_train_topk: 100
+reranker_eval_topk: 100
+reranker_loss_weight: 0.5
+
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237
+cache_dir: output/fb15k-237/cache
+init_checkpoint: output/fb15k-237/best_checkpoint.pt
     
 add_inverse: true
 context_k: 15

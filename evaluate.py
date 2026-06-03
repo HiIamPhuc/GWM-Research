@@ -10,6 +10,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.model import GWM
+from model.reranker import GWMReranker
 from model.dataset import GWMDataset, CollateFN
 from utils.eval import (
     build_entity_loader,
@@ -23,6 +24,7 @@ def get_config(args):
         config_dict = yaml.safe_load(f)
     if args.data_dir: config_dict['data_dir'] = args.data_dir
     if args.output_dir: config_dict['output_dir'] = args.output_dir
+    if args.eval_mode: config_dict['eval_mode'] = args.eval_mode
     
     class Config:
         def __init__(self, dictionary):
@@ -49,11 +51,8 @@ def evaluate(args):
 
     model = GWM(config).to(device)
     
-    # Load Checkpoint
+    # Load retriever checkpoint
     checkpoint_path = os.path.join(config.output_dir, 'best_checkpoint.pt')
-    if not os.path.exists(checkpoint_path):
-        print(f"Checkpoint not found at {checkpoint_path}, trying latest...")
-        checkpoint_path = os.path.join(config.output_dir, 'latest_checkpoint.pt')
     
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint: {checkpoint_path}")
@@ -66,22 +65,18 @@ def evaluate(args):
     else:
         print("No checkpoint found. Evaluating initialized model (random).")
 
-    entity_emb_path = os.path.join(config.data_dir, 'entity_text_embeddings.pt')
-    relation_emb_path = os.path.join(config.data_dir, 'relation_text_embeddings.pt')
-    if not os.path.exists(entity_emb_path) or not os.path.exists(relation_emb_path):
-        raise FileNotFoundError(
-            "Missing precomputed text embedding cache files. "
-            "Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
-        )
+    # Optional standalone reranker for stage-2 end-to-end evaluation.
+    reranker = None
+    reranker_checkpoint = os.path.join(config.output_dir, 'reranker_best.pt')
 
-    print("Loading precomputed text embeddings for evaluation...")
-    model.load_embeddings(
-        entity_source=entity_emb_path,
-        relation_source=relation_emb_path,
-        kind='text',
-        freeze=True,
-    )
-    print("Text embeddings ready for evaluation.")
+    if reranker_checkpoint is not None and os.path.exists(reranker_checkpoint):
+        print(f"Loading standalone reranker: {reranker_checkpoint}")
+        reranker = GWMReranker(config).to(device)
+        reranker_state = torch.load(reranker_checkpoint, map_location=device)
+        reranker.load_state_dict(reranker_state, strict=True)
+        reranker.eval()
+    else:
+        print("No reranker checkpoint found. Running retrieval-only evaluation.")
 
     model.eval()
 
@@ -134,37 +129,75 @@ def evaluate(args):
             fallback_splits=['train']
         )
 
-    predictions_path = os.path.join(config.output_dir, f'predictions_{split}.jsonl')
+    def _run_single_eval(mode_name, mode_reranker):
+        predictions_path = os.path.join(config.output_dir, f'predictions_{split}_{mode_name}.jsonl')
+        metrics = compute_filtered_ranking_metrics(
+            model=model,
+            data_loader=test_loader,
+            all_entity_embeddings=all_entity_embeddings,
+            hr_map=hr_map,
+            device=device,
+            desc=f"Evaluating ({mode_name})",
+            save_predictions_path=predictions_path,
+            rerank_topk=int(getattr(config, 'reranker_eval_topk', 100)),
+            reranker=mode_reranker,
+        )
 
-    metrics = compute_filtered_ranking_metrics(
-        model=model,
-        data_loader=test_loader,
-        all_entity_embeddings=all_entity_embeddings,
-        hr_map=hr_map,
-        device=device,
-        desc="Evaluating",
-        save_predictions_path=predictions_path,
-    )
+        print(f"\n--- Evaluation Results ({split}) [{mode_name}] ---")
+        print(f"MRR       : {metrics['MRR']:.4f}")
+        print(f"Hits@1    : {metrics['Hits@1']:.4f}")
+        print(f"Hits@3    : {metrics['Hits@3']:.4f}")
+        print(f"Hits@10   : {metrics['Hits@10']:.4f}")
+        print("-----------------------------------------------")
+        return {
+            'metrics': {
+                'mrr': metrics['MRR'],
+                'hits1': metrics['Hits@1'],
+                'hits3': metrics['Hits@3'],
+                'hits10': metrics['Hits@10'],
+                'mr': metrics['MR'],
+            },
+            'predictions_path': predictions_path,
+        }
 
-    final_mrr = metrics['MRR']
-    final_h1 = metrics['Hits@1']
-    final_h3 = metrics['Hits@3']
-    final_h10 = metrics['Hits@10']
+    eval_mode = getattr(config, 'eval_mode', getattr(args, 'eval_mode', 'both')).lower()
+    if eval_mode not in {'both', 'retriever', 'full'}:
+        raise ValueError("eval_mode must be one of: both, retriever, full")
 
-    print(f"\n--- Evaluation Results ({split}) ---")
-    print(f"MRR       : {final_mrr:.4f}")
-    print(f"Hits@1    : {final_h1:.4f}")
-    print(f"Hits@3    : {final_h3:.4f}")
-    print(f"Hits@10   : {final_h10:.4f}")
-    print("-------------------------------")
-    
-    # Save results
     results = {
-        'mrr': final_mrr,
-        'hits1': final_h1,
-        'hits3': final_h3,
-        'hits10': final_h10
+        'split': split,
+        'retriever_checkpoint': checkpoint_path,
+        'reranker_checkpoint': reranker_checkpoint if reranker is not None else None,
+        'runs': {},
     }
+
+    if eval_mode in {'both', 'retriever'}:
+        results['runs']['retriever_only'] = _run_single_eval('retriever_only', None)
+
+    if eval_mode in {'both', 'full'}:
+        if reranker is None:
+            print("Skipping retriever+rereanker run because reranker checkpoint is unavailable.")
+        else:
+            results['runs']['retriever_reranker'] = _run_single_eval('retriever_reranker', reranker)
+
+    if 'retriever_only' in results['runs'] and 'retriever_reranker' in results['runs']:
+        r = results['runs']['retriever_only']['metrics']
+        rr = results['runs']['retriever_reranker']['metrics']
+        results['delta'] = {
+            'mrr': rr['mrr'] - r['mrr'],
+            'hits1': rr['hits1'] - r['hits1'],
+            'hits3': rr['hits3'] - r['hits3'],
+            'hits10': rr['hits10'] - r['hits10'],
+            'mr': rr['mr'] - r['mr'],
+        }
+
+        print("\n--- Delta (Retriever+Reranker - Retriever) ---")
+        print(f"MRR       : {results['delta']['mrr']:+.4f}")
+        print(f"Hits@1    : {results['delta']['hits1']:+.4f}")
+        print(f"Hits@3    : {results['delta']['hits3']:+.4f}")
+        print(f"Hits@10   : {results['delta']['hits10']:+.4f}")
+        print(f"MR        : {results['delta']['mr']:+.4f}")
+
     with open(os.path.join(config.output_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)
 
@@ -173,5 +206,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, required=True, help='Path to yaml config')
     parser.add_argument('--data_dir', type=str, help='Override data directory')
     parser.add_argument('--output_dir', type=str, help='Override output directory')
+    parser.add_argument('--eval_mode', type=str, default='both', choices=['both', 'retriever', 'full'],
+                        help='both: run retriever-only and retriever+reranker; retriever: retriever-only; full: retriever+reranker only')
     args = parser.parse_args()
     evaluate(args)

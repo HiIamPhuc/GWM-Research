@@ -17,6 +17,8 @@ def load_training_log(log_path):
 
 def plot_training_curves(log_data, output_path=None):
     """Create comprehensive training visualization."""
+
+    log_data = [entry for entry in log_data if entry.get('train_loss') is not None]
     
     epochs = [entry['epoch'] for entry in log_data]
     train_loss = [entry['train_loss'] for entry in log_data]
@@ -179,6 +181,7 @@ def print_metrics_summary(log_data):
     print(f"\nTotal Epochs: {len(log_data)}")
     
     # Training Loss
+    log_data = [entry for entry in log_data if entry.get('train_loss') is not None]
     train_losses = [entry['train_loss'] for entry in log_data]
     print(f"\nTraining Loss:")
     print(f"  Initial: {train_losses[0]:.4f}")

@@ -421,6 +421,16 @@ class GWM(nn.Module):
         true_idx = labels.unsqueeze(1)
         candidate_indices = torch.cat([top_text_idx, top_struct_idx, true_idx], dim=1)
 
+        # Avoid duplicate positives in non-label slots.
+        # If the true tail is already present before the final slot, CE receives conflicting
+        # supervision (same entity as both positive and negative column). Replace those slots.
+        pre_label = candidate_indices[:, :-1]
+        dup_true_mask = pre_label.eq(true_idx)
+        if dup_true_mask.any():
+            replacement = (pre_label + 1) % scores_text.size(1)
+            pre_label = torch.where(dup_true_mask, replacement, pre_label)
+            candidate_indices = torch.cat([pre_label, true_idx], dim=1)
+
         rerank_scores = self.rerank_with_indices(
             relation_text=relation_text,
             relation_struct=relation_struct,

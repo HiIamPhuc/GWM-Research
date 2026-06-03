@@ -31,18 +31,8 @@ candidate_batch_size: 2048
 
 temperature: 0.07
 balance_floor: 0.1
-
-reranker_proj_dim: 64
-reranker_hidden_dim: 128
-reranker_dropout: 0.2
-reranker_train_topk: 100
-reranker_eval_topk: 100
-reranker_loss_weight: 0.5
 bi_loss_weight: 1.0
 fused_loss_weight: 1.0
-reranker_start_epoch: 20
-reranker_warmup_epochs: 10
-freeze_base_for_reranker: false
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237
@@ -55,5 +45,5 @@ device: cuda
 seed: 42
 
 save_eval_predictions: true
-eval_topk: 100
+eval_topk: 50
 eval_predictions_dir: output/fb15k-237/predictions

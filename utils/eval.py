@@ -104,6 +104,7 @@ def compute_filtered_ranking_metrics(
     save_predictions_path=None,
     topk=50,
     rerank_topk=100,
+    reranker=None,
 ):
     hits1, hits3, hits10, mrr, mr = 0, 0, 0, 0.0, 0.0
     total = 0
@@ -165,17 +166,18 @@ def compute_filtered_ranking_metrics(
                 cand_idx = torch.cat([fused_top_idx, true_idx], dim=0)
                 cand_idx = torch.unique(cand_idx, sorted=False)
 
-                rerank_scores = model.rerank_with_indices(
-                    relation_text=rel_text[i:i+1],
-                    relation_struct=rel_struct[i:i+1],
-                    target_text=all_t_text,
-                    target_struct=all_t_struct,
-                    candidate_indices=cand_idx.unsqueeze(0),
-                )
-                rerank_scores = rerank_scores.squeeze(0) / model.temperature
+                if reranker is not None:
+                    rerank_scores = reranker.rerank_with_indices(
+                        relation_text=rel_text[i:i+1],
+                        relation_struct=rel_struct[i:i+1],
+                        all_t_text=all_t_text,
+                        all_t_struct=all_t_struct,
+                        candidate_indices=cand_idx.unsqueeze(0),
+                    )
+                    rerank_scores = rerank_scores.squeeze(0) / reranker.temperature
 
-                # Keep coarse scores globally, replace candidate subset with reranker scores.
-                scores[i, cand_idx] = rerank_scores
+                    # Keep coarse scores globally, replace candidate subset with reranker scores.
+                    scores[i, cand_idx] = rerank_scores
 
             target_scores = scores.gather(1, t_ids.unsqueeze(1))
             ranks = (scores > target_scores).sum(dim=1) + 1

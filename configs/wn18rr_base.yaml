@@ -11,17 +11,17 @@ struct_compgcn_dim: 384
 compgcn_layers: 1
 compgcn_op: mult
 
-dynamics_layers: 1
+dynamics_layers: 2
 
 dropout: 0.2
 recurrent_dropout: 0.2
 
-learning_rate: 1e-4
+learning_rate: 5e-4
 weight_decay: 0.01
 min_lr: 1e-5
-warmup_ratio: 0.2
+warmup_ratio: 0.1
 grad_clip_norm: 1.0
-num_epochs: 500
+num_epochs: 1000
 early_stopping_patience: 15
 eval_every: 2
 
@@ -30,7 +30,7 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
-balance_floor: 0.3
+balance_floor: 0.2
 bi_loss_weight: 1.0
 fused_loss_weight: 1.0
 

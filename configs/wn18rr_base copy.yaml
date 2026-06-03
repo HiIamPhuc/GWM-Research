@@ -1,0 +1,58 @@
+# Config for context-aware GWM with precomputed text embeddings
+text_emb_dim: 768
+struct_emb_dim: 384
+
+text_adapter_dim: 768
+struct_adapter_dim: 384
+adapter_dropout: 0.1
+
+text_compgcn_dim: 768
+struct_compgcn_dim: 384
+compgcn_layers: 1
+compgcn_op: mult
+
+dynamics_layers: 2
+
+dropout: 0.2
+recurrent_dropout: 0.2
+
+learning_rate: 5e-4
+weight_decay: 0.01
+min_lr: 1e-5
+warmup_ratio: 0.1
+grad_clip_norm: 1.0
+num_epochs: 1000
+early_stopping_patience: 15
+eval_every: 2
+
+batch_size: 2048
+eval_batch_size: 2048
+candidate_batch_size: 2048
+
+temperature: 0.07
+balance_floor: 0.2
+bi_loss_weight: 1.0
+fused_loss_weight: 1.0
+
+reranker_proj_dim: 64
+reranker_hidden_dim: 128
+reranker_dropout: 0.2
+reranker_train_topk: 100
+reranker_eval_topk: 100
+reranker_loss_weight: 0.5
+
+data_dir: /kaggle/input/models/danielnguyen20044/gwm/pytorch/default/1/data-processed/wn18rr
+output_dir: /kaggle/input/models/danielnguyen20044/gwm/pytorch/default/1/output/wn18rr
+cache_dir: output/wn18rr/cache
+init_checkpoint: /kaggle/input/models/danielnguyen20044/gwm/pytorch/default/1/output/wn18rr/best_checkpoint.pt
+    
+add_inverse: true
+context_k: 5
+context_agg: mean
+    
+device: cuda
+seed: 42
+
+save_eval_predictions: true
+eval_topk: 50
+eval_predictions_dir: output/wn18rr/predictions

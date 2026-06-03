@@ -343,6 +343,13 @@ class GWM(nn.Module):
     def get_alpha_mean(self, reset=False):
         return None
 
+    def freeze_base_keep_reranker(self):
+        for name, param in self.named_parameters():
+            if name.startswith('reranker.'):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
     def rerank_with_indices(self, relation_text, relation_struct, target_text, target_struct, candidate_indices):
         """
         Candidate reranking helper conditioned on relation queries.
@@ -400,9 +407,14 @@ class GWM(nn.Module):
         t_struct_norm = torch.nn.functional.normalize(t_struct, p=2, dim=1)
         return t_text_norm, t_struct_norm
 
-    def compute_loss(self, query_vectors, target_vectors):
+    def compute_loss(self, query_vectors, target_vectors, bi_loss_weight=None, reranker_loss_weight=None):
         query_text, query_struct, relation_text, relation_struct, _, _ = query_vectors
         target_text, target_struct = target_vectors
+
+        if bi_loss_weight is None:
+            bi_loss_weight = self.bi_loss_weight
+        if reranker_loss_weight is None:
+            reranker_loss_weight = self.reranker_loss_weight
 
         scores_text = torch.mm(query_text, target_text.t())
         scores_struct = torch.mm(query_struct, target_struct.t())
@@ -448,7 +460,7 @@ class GWM(nn.Module):
         )
         loss_rerank = F.cross_entropy(rerank_scores, rerank_labels)
 
-        loss = self.reranker_loss_weight * loss_rerank + self.bi_loss_weight * 0.5 * (loss_text + loss_struct)
+        loss = reranker_loss_weight * loss_rerank + bi_loss_weight * 0.5 * (loss_text + loss_struct)
 
         return loss_text, loss_struct, loss, rerank_scores, None
 

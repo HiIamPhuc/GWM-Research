@@ -35,10 +35,13 @@ balance_floor: 0.1
 reranker_proj_dim: 64
 reranker_hidden_dim: 128
 reranker_dropout: 0.2
-reranker_train_topk: 15
+reranker_train_topk: 30
 reranker_eval_topk: 100
-reranker_loss_weight: 0.7
-bi_loss_weight: 0.8
+reranker_loss_weight: 0.2
+bi_loss_weight: 1.0
+reranker_start_epoch: 10
+reranker_warmup_epochs: 10
+freeze_base_for_reranker: false
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

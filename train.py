@@ -94,6 +94,21 @@ def _sync_device(device):
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
 
+
+def _get_epoch_reranker_weight(config, epoch_index):
+    target_weight = float(getattr(config, 'reranker_loss_weight', 0.0))
+    start_epoch = int(getattr(config, 'reranker_start_epoch', 0))
+    warmup_epochs = int(getattr(config, 'reranker_warmup_epochs', 0))
+
+    current_epoch = epoch_index + 1
+    if current_epoch <= start_epoch:
+        return 0.0
+    if warmup_epochs <= 0:
+        return target_weight
+
+    progress = min(max((current_epoch - start_epoch) / max(warmup_epochs, 1), 0.0), 1.0)
+    return target_weight * progress
+
 def train(args):
     # Load Config
     config = get_config(args)
@@ -249,10 +264,20 @@ def train(args):
     # Simple JSON Logger
     log_path = os.path.join(config.output_dir, 'training_log.json')
     history = []
+    froze_base_for_reranker = False
     
     for epoch in range(config.num_epochs):
         epoch_start_time = time.perf_counter()
         _sync_device(device)
+
+        current_reranker_weight = _get_epoch_reranker_weight(config, epoch)
+        current_bi_weight = float(getattr(config, 'bi_loss_weight', 1.0))
+        freeze_base_for_reranker = bool(getattr(config, 'freeze_base_for_reranker', False))
+        reranker_start_epoch = int(getattr(config, 'reranker_start_epoch', 0))
+        if freeze_base_for_reranker and not froze_base_for_reranker and (epoch + 1) > reranker_start_epoch:
+            model.freeze_base_keep_reranker()
+            froze_base_for_reranker = True
+
         model.train()
         total_loss = 0
 
@@ -278,6 +303,8 @@ def train(args):
             loss_text, loss_struct, loss, _, _ = model.compute_loss(
                 query_vector,
                 t_fused,
+                bi_loss_weight=current_bi_weight,
+                reranker_loss_weight=current_reranker_weight,
             )
 
             if not torch.isfinite(loss):
@@ -306,6 +333,7 @@ def train(args):
             f"Epoch {epoch+1} Train Time: {epoch_train_seconds:.2f}s | "
             f"Throughput: {examples_per_second:.2f} examples/s"
         )
+        print(f"Epoch {epoch+1} Reranker Loss Weight: {current_reranker_weight:.4f}")
         if train_alpha is not None:
             print(f"Epoch {epoch+1} Train Alpha (text weight): {train_alpha:.4f}")
         
@@ -364,6 +392,7 @@ def train(args):
             epoch_log = {
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
+                'reranker_loss_weight': current_reranker_weight,
                 'val_mrr': val_mrr, 
                 'val_mr': val_mr,
                 'val_hits1': val_h1,
@@ -392,7 +421,8 @@ def train(args):
              # Log train only
             epoch_log = {
                 'epoch': epoch + 1,
-                'train_loss': avg_train_loss
+                'train_loss': avg_train_loss,
+                'reranker_loss_weight': current_reranker_weight,
             }
             if train_alpha is not None:
                 epoch_log['train_alpha'] = train_alpha

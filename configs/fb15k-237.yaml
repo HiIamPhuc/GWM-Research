@@ -30,18 +30,18 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
-balance_floor: 0.1
+balance_floor: 0.3
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237
     
 add_inverse: true
-context_k: 15
+context_k: 10
 context_agg: mean
     
 device: cuda
 seed: 42
 
 save_eval_predictions: true
-eval_topk: 100
+eval_topk: 10
 eval_predictions_dir: output/fb15k-237/predictions

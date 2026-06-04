@@ -25,9 +25,22 @@ num_epochs: 500
 early_stopping_patience: 15
 eval_every: 2
 
+rr_learning_rate: 5e-5
+rr_weight_decay: 0.01
+rr_min_lr: 1e-5
+rr_warmup_ratio: 0.1
+rr_grad_clip_norm: 1.0
+rr_num_epochs: 500
+rr_early_stopping_patience: 5
+rr_eval_every: 2
+
 batch_size: 2048
 eval_batch_size: 2048
 candidate_batch_size: 2048
+
+rr_batch_size: 512
+rr_eval_batch_size: 512
+rr_candidate_batch_size: 512
 
 temperature: 0.07
 balance_floor: 0.1

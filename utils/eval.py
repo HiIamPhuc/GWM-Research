@@ -176,8 +176,15 @@ def compute_filtered_ranking_metrics(
                     )
                     rerank_scores = rerank_scores.squeeze(0) / reranker.temperature
 
-                    # Keep coarse scores globally, replace candidate subset with reranker scores.
-                    scores[i, cand_idx] = rerank_scores
+                    # Reranker is trained with listwise CE on the local candidate pool, so its
+                    # logits are only guaranteed to be meaningful *relative within that pool*.
+                    # Preserve the retriever's global score scale and use reranker for ordering.
+                    base_subset_scores = scores[i, cand_idx]
+                    rerank_order = torch.argsort(rerank_scores, descending=True)
+                    sorted_base_scores = torch.sort(base_subset_scores, descending=True).values
+                    remapped_subset_scores = torch.empty_like(base_subset_scores)
+                    remapped_subset_scores[rerank_order] = sorted_base_scores
+                    scores[i, cand_idx] = remapped_subset_scores
 
             target_scores = scores.gather(1, t_ids.unsqueeze(1))
             ranks = (scores > target_scores).sum(dim=1) + 1

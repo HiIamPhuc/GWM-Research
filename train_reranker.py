@@ -108,7 +108,7 @@ def train_reranker(args):
     train_dataset = RerankerCacheDataset(cache_dir, split='train')
     train_loader  = DataLoader(
         train_dataset,
-        batch_size=int(getattr(config, 'batch_size', 256)),
+        batch_size=int(getattr(config, 'rr_batch_size', 256)),
         shuffle=True,
         collate_fn=reranker_collate,
         num_workers=int(getattr(config, 'num_workers', 2)),
@@ -155,7 +155,7 @@ def train_reranker(args):
         valid_dataset = GWMDataset(config.data_dir, split='valid')
         valid_loader  = DataLoader(
             valid_dataset,
-            batch_size=int(getattr(config, 'eval_batch_size', config.batch_size)),
+            batch_size=int(getattr(config, 'rr_eval_batch_size', getattr(config, 'eval_batch_size', config.batch_size))),
             shuffle=False,
             collate_fn=CollateFN(),
             num_workers=int(getattr(config, 'num_workers', 2)),
@@ -169,8 +169,8 @@ def train_reranker(args):
         )
         entity_loader = build_entity_loader(
             data_dir=config.data_dir,
-            batch_size=int(getattr(config, 'candidate_batch_size',
-                                   getattr(config, 'eval_batch_size', 512))),
+            batch_size=int(getattr(config, 'rr_candidate_batch_size',
+                                   getattr(config, 'rr_eval_batch_size', getattr(config, 'eval_batch_size', 512)))),
             num_workers=int(getattr(config, 'num_workers', 2)),
         )
 
@@ -178,23 +178,23 @@ def train_reranker(args):
     # Optimiser + LR schedule
     # ------------------------------------------------------------------
     base_lr      = float(config.learning_rate)
-    weight_decay = float(getattr(config, 'weight_decay', 0.0))
+    weight_decay = float(getattr(config, 'rr_weight_decay', 0.0))
     optimizer    = torch.optim.AdamW(reranker.parameters(), lr=base_lr,
                                      weight_decay=weight_decay)
-    grad_clip    = float(getattr(config, 'grad_clip_norm', 1.0))
+    grad_clip    = float(getattr(config, 'rr_grad_clip_norm', 1.0))
+    num_epochs = int(getattr(config, 'rr_num_epochs', 1000))
 
-    total_steps  = max(1, config.num_epochs * len(train_loader))
-    warmup_steps = min(int(total_steps * float(getattr(config, 'warmup_ratio', 0.0))),
+    total_steps  = max(1, num_epochs * len(train_loader))
+    warmup_steps = min(int(total_steps * float(getattr(config, 'rr_warmup_ratio', 0.0))),
                        total_steps)
-    min_lr       = float(getattr(config, 'min_lr', 0.0))
+    min_lr       = float(getattr(config, 'rr_min_lr', 0.0))
     min_lr_ratio = 0.0 if base_lr <= 0 else max(min_lr / base_lr, 0.0)
 
     scheduler = LambdaLR(optimizer,
                          lr_lambda=_lr_lambda_fn(warmup_steps, total_steps, min_lr_ratio))
 
     early_stop = EarlyStopping(
-        patience=int(getattr(config, 'early_stopping_patience',
-                             getattr(config, 'early_stopping', 10))),
+        patience=int(getattr(config, 'rr_early_stopping_patience', 5)),
         mode='max',
     )
 
@@ -215,15 +215,15 @@ def train_reranker(args):
     })
     best_mrr    = 0.0
     train_start = time.perf_counter()
-    eval_every  = int(getattr(config, 'eval_every', 1))
+    eval_every  = int(getattr(config, 'rr_eval_every', 1))
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(num_epochs):
         t0 = time.perf_counter()
         _sync(device)
         reranker.train()
         total_loss = 0.0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} [Reranker]")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Reranker]")
         for batch in pbar:
             rel_text    = batch['rel_text'].to(device)
             rel_struct  = batch['rel_struct'].to(device)

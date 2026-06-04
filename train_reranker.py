@@ -179,19 +179,15 @@ def train_reranker(args):
     # ------------------------------------------------------------------
     base_lr      = float(config.learning_rate)
     weight_decay = float(getattr(config, 'rr_weight_decay', 0.0))
-    optimizer    = torch.optim.AdamW(reranker.parameters(), lr=base_lr,
-                                     weight_decay=weight_decay)
+    optimizer    = torch.optim.AdamW(reranker.parameters(), lr=base_lr, weight_decay=weight_decay)
     grad_clip    = float(getattr(config, 'rr_grad_clip_norm', 1.0))
-    num_epochs = int(getattr(config, 'rr_num_epochs', 1000))
-
+    num_epochs   = int(getattr(config, 'rr_num_epochs', 1000))
     total_steps  = max(1, num_epochs * len(train_loader))
-    warmup_steps = min(int(total_steps * float(getattr(config, 'rr_warmup_ratio', 0.0))),
-                       total_steps)
+    warmup_steps = min(int(total_steps * float(getattr(config, 'rr_warmup_ratio', 0.0))), total_steps)
     min_lr       = float(getattr(config, 'rr_min_lr', 0.0))
     min_lr_ratio = 0.0 if base_lr <= 0 else max(min_lr / base_lr, 0.0)
 
-    scheduler = LambdaLR(optimizer,
-                         lr_lambda=_lr_lambda_fn(warmup_steps, total_steps, min_lr_ratio))
+    scheduler = LambdaLR(optimizer, lr_lambda=_lr_lambda_fn(warmup_steps, total_steps, min_lr_ratio))
 
     early_stop = EarlyStopping(
         patience=int(getattr(config, 'rr_early_stopping_patience', 5)),

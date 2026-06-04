@@ -47,12 +47,11 @@ balance_floor: 0.2
 bi_loss_weight: 1.0
 fused_loss_weight: 1.0
 
-reranker_proj_dim: 64
-reranker_hidden_dim: 128
+reranker_proj_dim: 256
+reranker_hidden_dim: 512
 reranker_dropout: 0.2
-reranker_train_topk: 100
-reranker_eval_topk: 100
-reranker_loss_weight: 0.5
+reranker_train_topk: 50
+reranker_eval_topk: 50
 
 data_dir: /kaggle/input/models/danielnguyen20044/gwm/pytorch/default/1/data-processed/wn18rr
 output_dir: /kaggle/input/models/danielnguyen20044/gwm/pytorch/default/1/output/wn18rr

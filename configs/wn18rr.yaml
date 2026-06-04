@@ -52,7 +52,6 @@ reranker_hidden_dim: 128
 reranker_dropout: 0.2
 reranker_train_topk: 100
 reranker_eval_topk: 100
-reranker_loss_weight: 0.5
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr

@@ -255,34 +255,66 @@ def train_reranker(args):
             reranker.eval()
             all_ent_emb = encode_all_entities_as_targets(gwm, entity_loader, device)
 
+            # Baseline retriever-only metrics (no reranker)
+            val_metrics_retriever = compute_filtered_ranking_metrics(
+                model=gwm,
+                data_loader=valid_loader,
+                all_entity_embeddings=all_ent_emb,
+                hr_map=hr_map,
+                device=device,
+                desc="Validation [Retriever]",
+                topk=int(getattr(config, 'eval_topk', 50)),
+                rerank_topk=int(getattr(config, 'reranker_eval_topk', 100)),
+                reranker=None,
+            )
+
+            # Retriever + reranker metrics
             val_metrics = compute_filtered_ranking_metrics(
                 model=gwm,
                 data_loader=valid_loader,
                 all_entity_embeddings=all_ent_emb,
                 hr_map=hr_map,
                 device=device,
-                desc="Validation",
+                desc="Validation [Retriever+Reranker]",
                 topk=int(getattr(config, 'eval_topk', 50)),
                 rerank_topk=int(getattr(config, 'reranker_eval_topk', 100)),
                 reranker=reranker,
             )
 
+            retr_mrr = val_metrics_retriever['MRR']
             val_mrr = val_metrics['MRR']
+            delta_mrr = val_mrr - retr_mrr
             print(
                 f"Epoch {epoch+1} Val | "
-                f"MRR={val_mrr:.4f} | MR={val_metrics['MR']:.1f} | "
-                f"H@1={val_metrics['Hits@1']:.4f} | "
-                f"H@3={val_metrics['Hits@3']:.4f} | "
-                f"H@10={val_metrics['Hits@10']:.4f}"
+                f"Retriever MRR={retr_mrr:.4f} | "
+                f"Reranker MRR={val_mrr:.4f} | "
+                f"Delta={delta_mrr:+.4f}"
             )
 
             epoch_log.update({
                 'stage': 'reranker',
+                # Keep legacy keys mapped to reranked metrics for compatibility.
                 'val_mrr':    val_mrr,
                 'val_mr':     val_metrics['MR'],
                 'val_hits1':  val_metrics['Hits@1'],
                 'val_hits3':  val_metrics['Hits@3'],
                 'val_hits10': val_metrics['Hits@10'],
+
+                # Explicit per-mode metrics for analysis.
+                'val_retriever_mrr': val_metrics_retriever['MRR'],
+                'val_retriever_mr': val_metrics_retriever['MR'],
+                'val_retriever_hits1': val_metrics_retriever['Hits@1'],
+                'val_retriever_hits3': val_metrics_retriever['Hits@3'],
+                'val_retriever_hits10': val_metrics_retriever['Hits@10'],
+
+                'val_reranker_mrr': val_metrics['MRR'],
+                'val_reranker_mr': val_metrics['MR'],
+                'val_reranker_hits1': val_metrics['Hits@1'],
+                'val_reranker_hits3': val_metrics['Hits@3'],
+                'val_reranker_hits10': val_metrics['Hits@10'],
+
+                'val_delta_mrr': val_metrics['MRR'] - val_metrics_retriever['MRR'],
+                'val_delta_hits10': val_metrics['Hits@10'] - val_metrics_retriever['Hits@10'],
             })
 
             if val_mrr > best_mrr:

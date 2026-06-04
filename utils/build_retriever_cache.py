@@ -143,6 +143,8 @@ def main():
                         help='Override cache output directory (default: config.output_dir)')
     parser.add_argument('--splits',     nargs='+', default=['train', 'valid'],
                         choices=['train', 'valid', 'test'])
+    parser.add_argument('--force_rebuild', action='store_true',
+                        help='Rebuild entity/query cache files even if they already exist.')
     args = parser.parse_args()
 
     config = _load_config(args.config, args.data_dir, args.output_dir)
@@ -182,12 +184,18 @@ def main():
     # Encode all entities once and save
     # -----------------------------------------------------------------------
     entity_cache_path = os.path.join(cache_dir, 'entity_cache.pt')
-    print("Encoding all entities ...")
-    num_workers = int(getattr(config, 'num_workers', 2))
-    entity_loader = build_entity_loader(config.data_dir, batch_size=int(getattr(config, 'eval_batch_size', 512)), num_workers=num_workers)
-    all_t_text, all_t_struct = encode_all_entities_as_targets(model, entity_loader, device)
-    torch.save({'entity_text': all_t_text.cpu(), 'entity_struct': all_t_struct.cpu()}, entity_cache_path)
-    print(f"Entity cache saved → {entity_cache_path}")
+    if (not args.force_rebuild) and os.path.exists(entity_cache_path):
+        print(f"Entity cache already exists at {entity_cache_path}, loading ...")
+        entity_cache = torch.load(entity_cache_path, map_location='cpu')
+        all_t_text = entity_cache['entity_text'].to(device)
+        all_t_struct = entity_cache['entity_struct'].to(device)
+    else:
+        print("Encoding all entities ...")
+        num_workers = int(getattr(config, 'num_workers', 2))
+        entity_loader = build_entity_loader(config.data_dir, batch_size=int(getattr(config, 'eval_batch_size', 512)), num_workers=num_workers)
+        all_t_text, all_t_struct = encode_all_entities_as_targets(model, entity_loader, device)
+        torch.save({'entity_text': all_t_text.cpu(), 'entity_struct': all_t_struct.cpu()}, entity_cache_path)
+        print(f"Entity cache saved → {entity_cache_path}")
 
     # -----------------------------------------------------------------------
     # Build query cache per split
@@ -198,7 +206,7 @@ def main():
 
     for split in args.splits:
         out_path = os.path.join(cache_dir, f'{split}_query_cache.pt')
-        if os.path.exists(out_path):
+        if (not args.force_rebuild) and os.path.exists(out_path):
             print(f"[{split}] Cache already exists at {out_path}, skipping.")
             continue
 

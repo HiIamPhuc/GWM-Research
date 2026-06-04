@@ -52,7 +52,7 @@ class GWMReranker(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        self.temperature = float(getattr(config, 'temperature', 0.12))
+        self.temperature = float(getattr(config, 'rr_temperature', 1.0))
         self.train_topk  = int(getattr(config, 'reranker_train_topk', 30))
 
     # ------------------------------------------------------------------

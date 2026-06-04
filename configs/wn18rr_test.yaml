@@ -33,6 +33,7 @@ rr_grad_clip_norm: 1.0
 rr_num_epochs: 500
 rr_early_stopping_patience: 5
 rr_eval_every: 2
+rr_temperature: 1.0
 
 batch_size: 2048
 eval_batch_size: 2048

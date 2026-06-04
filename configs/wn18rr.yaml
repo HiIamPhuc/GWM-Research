@@ -17,7 +17,7 @@ dropout: 0.2
 recurrent_dropout: 0.2
 
 learning_rate: 5e-4
-weight_decay: 0.01
+weight_decay: 0.0001
 min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
@@ -43,5 +43,5 @@ device: cuda
 seed: 42
 
 save_eval_predictions: true
-eval_topk: 100
+eval_topk: 10
 eval_predictions_dir: output/wn18rr/predictions

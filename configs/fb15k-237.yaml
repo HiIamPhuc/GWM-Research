@@ -17,7 +17,7 @@ dropout: 0.2
 recurrent_dropout: 0.2
 
 learning_rate: 5e-4
-weight_decay: 0.01
+weight_decay: 0.0001
 min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
@@ -30,13 +30,13 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
-balance_floor: 0.3
+balance_floor: 0.1
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237
     
 add_inverse: true
-context_k: 10
+context_k: 15
 context_agg: mean
     
 device: cuda

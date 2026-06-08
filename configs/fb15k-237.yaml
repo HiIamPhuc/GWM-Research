@@ -25,8 +25,9 @@ candidate_batch_size: 2048
 temperature: 0.07
 balance_floor: 0.1
 alpha_target: 0.3
-alpha_tolerance: 0.05
-alpha_reg_weight: 0.2
+alpha_prior_weight: 0.2
+alpha_entropy_weight: 0.05
+alpha_entropy_min: 0.45
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

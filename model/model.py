@@ -142,8 +142,9 @@ class GWM(nn.Module):
         
         self.balance_floor = float(getattr(config, 'balance_floor', 0.0))
         self.alpha_target = float(getattr(config, 'alpha_target', 0.5))
-        self.alpha_tolerance = float(getattr(config, 'alpha_tolerance', 0.05))
-        self.alpha_reg_weight = float(getattr(config, 'alpha_reg_weight', 0.0))
+        self.alpha_prior_weight = float(getattr(config, 'alpha_prior_weight', 0.0))
+        self.alpha_entropy_weight = float(getattr(config, 'alpha_entropy_weight', 0.0))
+        self.alpha_entropy_min = float(getattr(config, 'alpha_entropy_min', 0.0))
 
         self.temperature = float(getattr(config, 'temperature'))
 
@@ -293,6 +294,11 @@ class GWM(nn.Module):
             self.reset_alpha_stats()
         return mean
 
+    def _alpha_entropy(self, alpha):
+        alpha = alpha.clamp(1e-6, 1.0 - 1e-6)
+        entropy = -(alpha * alpha.log() + (1.0 - alpha) * (1.0 - alpha).log())
+        return entropy.mean()
+
     def forward(self, h_batch, r_batch, context_batch):
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
         r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
@@ -375,9 +381,13 @@ class GWM(nn.Module):
         loss_main = (balance * loss_text_per_sample + (1.0 - balance) * loss_struct_per_sample).mean()
 
         alpha_mean = balance.mean()
-        alpha_deviation = (alpha_mean - self.alpha_target).abs()
-        alpha_reg = torch.relu(alpha_deviation - self.alpha_tolerance).pow(2)
-        loss = loss_main + self.alpha_reg_weight * alpha_reg
+        alpha_prior = (alpha_mean - self.alpha_target).pow(2)
 
-        return loss_text, loss_struct, loss, scores_fused, alpha, alpha_reg
+        alpha_entropy = self._alpha_entropy(balance)
+        alpha_entropy_floor = balance.new_tensor(self.alpha_entropy_min)
+        alpha_entropy_reg = torch.relu(alpha_entropy_floor - alpha_entropy)
+
+        loss = loss_main + self.alpha_prior_weight * alpha_prior + self.alpha_entropy_weight * alpha_entropy_reg
+
+        return loss_text, loss_struct, loss, scores_fused, alpha, alpha_prior, alpha_entropy_reg
 

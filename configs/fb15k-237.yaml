@@ -4,17 +4,10 @@ struct_emb_dim: 896
 
 text_adapter_dim: 768
 struct_adapter_dim: 896
-adapter_dropout: 0.1
-
-text_compgcn_dim: 768
-struct_compgcn_dim: 896
-compgcn_layers: 1
-compgcn_op: mult
 
 dynamics_layers: 2
 
-dropout: 0.2
-recurrent_dropout: 0.2
+dropout: 0.1
 
 learning_rate: 5e-4
 weight_decay: 0.0001
@@ -31,13 +24,16 @@ candidate_batch_size: 2048
 
 temperature: 0.07
 balance_floor: 0.1
+alpha_target: 0.3
+alpha_tolerance: 0.05
+alpha_reg_weight: 0.2
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237
     
 add_inverse: true
 context_k: 15
-context_pooling: mean
+context_agg: mean
     
 device: cuda
 seed: 42

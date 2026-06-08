@@ -4,20 +4,13 @@ struct_emb_dim: 384
 
 text_adapter_dim: 768
 struct_adapter_dim: 384
-adapter_dropout: 0.1
 
-text_compgcn_dim: 768
-struct_compgcn_dim: 384
-compgcn_layers: 1
-compgcn_op: mult
+dynamics_layers: 2
 
-dynamics_layers: 1
+dropout: 0.1
 
-dropout: 0.2
-recurrent_dropout: 0.2
-
-learning_rate: 1e-4
-weight_decay: 0.01
+learning_rate: 5e-4
+weight_decay: 0.0001
 min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
@@ -31,13 +24,16 @@ candidate_batch_size: 2048
 
 temperature: 0.07
 balance_floor: 0.1
+alpha_target: 0.8
+alpha_tolerance: 0.05
+alpha_reg_weight: 0.2
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr
     
 add_inverse: true
 context_k: 5
-context_pooling: mean
+context_agg: mean
     
 device: cuda
 seed: 42

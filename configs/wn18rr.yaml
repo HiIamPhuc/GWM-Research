@@ -37,7 +37,7 @@ output_dir: output/wn18rr
     
 add_inverse: true
 context_k: 5
-context_agg: mean
+context_pooling: mean
     
 device: cuda
 seed: 42

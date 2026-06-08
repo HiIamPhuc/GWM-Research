@@ -1,51 +1,6 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class CompGCNLayer(nn.Module):
-    """A lightweight CompGCN-style layer for head-centric aggregation."""
-
-    def __init__(self, hidden_dim, comp_op='sub'):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.comp_op = comp_op
-        self.lin_self = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.lin_msg = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.lin_out = nn.Linear(hidden_dim, hidden_dim)
-
-    def _compose(self, entity_feat, relation_feat):
-        if self.comp_op == 'sub':
-            return entity_feat - relation_feat
-        if self.comp_op == 'mult':
-            return entity_feat * relation_feat
-        raise ValueError(f"Unsupported compgcn_op: {self.comp_op}. Use 'sub' or 'mult'.")
-
-    def forward(self, head_feat, nbr_entity_feat, nbr_relation_feat, nbr_batch_index):
-        """
-        head_feat: (B, H)
-        nbr_entity_feat: (E, H)
-        nbr_relation_feat: (E, H)
-        nbr_batch_index: (E,) long, edge -> head index in batch
-        """
-        B = head_feat.size(0)
-        composed = self._compose(nbr_entity_feat, nbr_relation_feat)  # (E, H)
-        msg = self.lin_msg(composed)  # (E, H)
-
-        agg = torch.zeros_like(head_feat)
-        if msg.numel() > 0:
-            agg.index_add_(0, nbr_batch_index, msg)
-
-        denom = torch.zeros(B, 1, device=head_feat.device, dtype=head_feat.dtype)
-        if msg.numel() > 0:
-            ones = torch.ones(msg.size(0), 1, device=head_feat.device, dtype=head_feat.dtype)
-            denom.index_add_(0, nbr_batch_index, ones)
-        denom = denom.clamp(min=1.0)
-        agg = agg / denom
-
-        # Pure residual fix: preserve anchor head state, add learned neighbor delta.
-        return head_feat + self.lin_out(agg)
 
 
 class MLPAdapter(nn.Module):
@@ -68,7 +23,7 @@ class MLPAdapter(nn.Module):
 
 
 class DynamicsMixer(nn.Module):
-    def __init__(self, hidden_dim, dropout=0.0):
+    def __init__(self, hidden_dim):
         super().__init__()
         self.mixer = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim * 2),
@@ -95,15 +50,10 @@ class GWM(nn.Module):
             dropout=float(getattr(config, 'adapter_dropout'))
             )
 
-        self.text_compgcn_stack = nn.ModuleList([
-            CompGCNLayer(hidden_dim=self.text_emb_dim, comp_op=getattr(config, 'compgcn_op'))
-            for _ in range(max(int(getattr(config, 'compgcn_layers')), 1))
-        ])
-
         self.text_h0_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
         self.text_c0_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
 
-        self.text_dynamics_mixer = DynamicsMixer(self.text_emb_dim, dropout=float(getattr(config, 'dropout')))
+        self.text_dynamics_mixer = DynamicsMixer(self.text_emb_dim)
 
         self.text_lstm = nn.LSTM(
             input_size=self.text_emb_dim,
@@ -120,15 +70,10 @@ class GWM(nn.Module):
 
         self.struct_adapter = MLPAdapter(self.struct_emb_dim, int(getattr(config, 'struct_adapter_dim')), dropout=float(getattr(config, 'adapter_dropout')))
 
-        self.struct_compgcn_stack = nn.ModuleList([
-            CompGCNLayer(hidden_dim=self.struct_emb_dim, comp_op=getattr(config, 'compgcn_op'))
-            for _ in range(max(int(getattr(config, 'compgcn_layers')), 1))
-        ])
-
         self.struct_h0_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
         self.struct_c0_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
 
-        self.struct_dynamics_mixer = DynamicsMixer(self.struct_emb_dim, dropout=float(getattr(config, 'dropout')))
+        self.struct_dynamics_mixer = DynamicsMixer(self.struct_emb_dim)
         
         self.struct_lstm = nn.LSTM(
             input_size=self.struct_emb_dim, 
@@ -148,21 +93,40 @@ class GWM(nn.Module):
         self._alpha_count = 0
         
         self.input_dropout = nn.Dropout(float(getattr(config, 'dropout')))
+        self.context_pooling = str(getattr(config, 'context_pooling', 'mean')).lower()
 
         self.balance_floor = float(getattr(config, 'balance_floor', 0.0))
 
         self.temperature = float(getattr(config, 'temperature'))
 
-    def _encode_subgraph_with_compgcn(self, h_emb, ctx_entity_emb, ctx_relation_emb, ctx_batch_index, compgcn_stack):
-        h_state = h_emb
-        for layer in compgcn_stack:
-            h_state = layer(
-                head_feat=h_state,
-                nbr_entity_feat=ctx_entity_emb,
-                nbr_relation_feat=ctx_relation_emb,
-                nbr_batch_index=ctx_batch_index,
-            )
-        return h_state
+    def _pool_mixed_context(self, mixed_context, batch_index, batch_size, pooling_mode):
+        pooled = mixed_context.new_zeros((batch_size, mixed_context.size(-1)))
+        counts = mixed_context.new_zeros((batch_size, 1))
+
+        if mixed_context.numel() == 0:
+            return pooled, counts > 0
+
+        ones = mixed_context.new_ones((mixed_context.size(0), 1))
+        counts.index_add_(0, batch_index, ones)
+        has_context = counts > 0
+
+        if pooling_mode == 'sum':
+            pooled.index_add_(0, batch_index, mixed_context)
+            return pooled, has_context
+
+        if pooling_mode == 'mean':
+            pooled.index_add_(0, batch_index, mixed_context)
+            pooled = pooled / counts.clamp(min=1.0)
+            return pooled, has_context
+
+        if pooling_mode == 'max':
+            index = batch_index.unsqueeze(-1).expand(-1, mixed_context.size(-1))
+            pooled = mixed_context.new_full((batch_size, mixed_context.size(-1)), float('-inf'))
+            pooled.scatter_reduce_(0, index, mixed_context, reduce='amax', include_self=True)
+            pooled = torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
+            return pooled, has_context
+
+        raise ValueError(f"Unsupported context_pooling mode: {pooling_mode}. Use 'mean', 'sum', or 'max'.")
 
     def _prepare_context_batch(self, context_batch):
         context_entity_ids = context_batch['id']
@@ -197,27 +161,27 @@ class GWM(nn.Module):
 
         return flat_entity_ids, flat_relation_ids, context_batch_index
 
-    def _run_dynamics(self, world_state, head_emb, relation_emb, mixer, lstm, h0_proj, c0_proj):
+    def _run_dynamics(self, world_state, head_emb, relation_emb, lstm, h0_proj, c0_proj):
         """
         Run recurrent dynamics over a sequence of steps.
 
-        world_state: (B, compgcn_dim) used to initialise h0/c0
+        world_state: (B, D) used to initialise h0/c0
         head_emb: (B, D) head embedding for this path
-        relation_emb: (B, D_rel) relation embedding for this path
+        relation_emb: (B, D) relation embedding for this path
         """
         h_0 = torch.tanh(h0_proj(world_state))
-        c_0 = c0_proj(world_state)
+        c_0 = torch.tanh(c0_proj(world_state))
 
         # Prepare initial LSTM states
         num_layers = lstm.num_layers
         h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
         c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
 
-        # Relation-conditioned dynamics mixer on the step inputs
-        mixed_step = mixer(head_emb, relation_emb).unsqueeze(1)
+        # Two-step sequence: state (head) then action (relation)
+        lstm_input = torch.stack([head_emb, relation_emb], dim=1)
 
         # Run LSTM over the sequence
-        lstm_out, (h_n, c_n) = lstm(mixed_step, (h_0_lstm, c_0_lstm))
+        lstm_out, (h_n, c_n) = lstm(lstm_input, (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
         query_norm = torch.nn.functional.normalize(query_vector, p=2, dim=1)
         return query_vector, query_norm
@@ -323,26 +287,36 @@ class GWM(nn.Module):
         ctx_ent_struct = self.input_dropout(self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids)))
         ctx_rel_struct = self.input_dropout(self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids)))
 
+        batch_size = h_text.size(0)
+
         # -- Text Pathway --
-        world_state_text = self._encode_subgraph_with_compgcn(
-            h_text, ctx_ent_text, ctx_rel_text,
-            context_batch_index, self.text_compgcn_stack
+        mixed_context_text = self.text_dynamics_mixer(ctx_ent_text, ctx_rel_text)
+        pooled_context_text, has_context_text = self._pool_mixed_context(
+            mixed_context_text,
+            context_batch_index,
+            batch_size,
+            self.context_pooling,
         )
+        world_state_text = torch.where(has_context_text, pooled_context_text, h_text)
 
         query_text_raw, query_text = self._run_dynamics(
             world_state_text, h_text, r_text,
-            self.text_dynamics_mixer, self.text_lstm, self.text_h0_projection, self.text_c0_projection
+            self.text_lstm, self.text_h0_projection, self.text_c0_projection
         )
 
         # -- Struct Pathway --
-        world_state_struct = self._encode_subgraph_with_compgcn(
-            h_struct, ctx_ent_struct, ctx_rel_struct,
-            context_batch_index, self.struct_compgcn_stack
+        mixed_context_struct = self.struct_dynamics_mixer(ctx_ent_struct, ctx_rel_struct)
+        pooled_context_struct, has_context_struct = self._pool_mixed_context(
+            mixed_context_struct,
+            context_batch_index,
+            batch_size,
+            self.context_pooling,
         )
+        world_state_struct = torch.where(has_context_struct, pooled_context_struct, h_struct)
     
         query_struct_raw, query_struct = self._run_dynamics(
             world_state_struct, h_struct, r_struct,
-            self.struct_dynamics_mixer, self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection
+            self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection
         )
 
         return query_text, query_struct, r_text, r_struct, query_text_raw, query_struct_raw

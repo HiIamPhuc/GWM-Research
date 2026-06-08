@@ -125,7 +125,7 @@ def compute_filtered_ranking_metrics(
             r_ids = batch['r_batch']['id'].cpu().numpy()
 
             q_out = model(h_batch, r_batch, context_batch)
-            q_text, q_struct, rel_text, rel_struct, _, _ = q_out
+            q_text, q_struct, rel_text, rel_struct = q_out
             
             scores_text = torch.mm(q_text, all_t_text.t())
             scores_struct = torch.mm(q_struct, all_t_struct.t())

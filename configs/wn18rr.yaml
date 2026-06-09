@@ -7,6 +7,7 @@ struct_adapter_dim: 384
 
 dynamics_layers: 2
 
+adapter_dropout: 0.1
 dropout: 0.2
 
 learning_rate: 5e-4
@@ -23,11 +24,14 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
+struct_loss_type: self_adversarial
+struct_adv_temperature: 1.0
+struct_adv_detach_weights: true
 balance_floor: 0.1
 alpha_target: 0.8
-alpha_prior_weight: 0.2
-alpha_entropy_weight: 0.05
-alpha_entropy_min: 0.45
+alpha_prior_weight: 0.3
+alpha_entropy_weight: 0.1
+alpha_entropy_min: 0.5
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr

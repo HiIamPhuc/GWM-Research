@@ -79,6 +79,7 @@ class GWM(nn.Module):
         super().__init__()
         self.config = config
         self.dropout = float(getattr(config, 'dropout'))
+        self.adapter_dropout = float(getattr(config, 'adapter_dropout', self.dropout))
 
         # 1. Text Components (Entity/Relation Embeddings)
         self.text_emb_dim = int(getattr(config, 'text_emb_dim'))
@@ -87,7 +88,7 @@ class GWM(nn.Module):
 
         self.text_adapter = MLPAdapter(self.text_emb_dim,
             int(getattr(config, 'text_adapter_dim')),
-            dropout=self.dropout
+            dropout=self.adapter_dropout
             )
 
         self.text_compgcn = CompGCN(hidden_dim=self.text_emb_dim, dropout=self.dropout)
@@ -112,7 +113,11 @@ class GWM(nn.Module):
         self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
         self.struct_rel_embs = nn.Embedding(config.num_relations, self.struct_emb_dim)
 
-        self.struct_adapter = MLPAdapter(self.struct_emb_dim, int(getattr(config, 'struct_adapter_dim')), dropout=self.dropout)
+        self.struct_adapter = MLPAdapter(
+            self.struct_emb_dim, 
+            int(getattr(config, 'struct_adapter_dim')),
+            dropout=self.adapter_dropout
+            )
 
         self.struct_compgcn = CompGCN(hidden_dim=self.struct_emb_dim, dropout=self.dropout)
 
@@ -145,6 +150,9 @@ class GWM(nn.Module):
         self.alpha_prior_weight = float(getattr(config, 'alpha_prior_weight', 0.0))
         self.alpha_entropy_weight = float(getattr(config, 'alpha_entropy_weight', 0.0))
         self.alpha_entropy_min = float(getattr(config, 'alpha_entropy_min', 0.0))
+        self.struct_loss_type = str(getattr(config, 'struct_loss_type', 'self_adversarial')).lower()
+        self.struct_adv_temperature = float(getattr(config, 'struct_adv_temperature', 1.0))
+        self.struct_adv_detach_weights = bool(getattr(config, 'struct_adv_detach_weights', True))
 
         self.temperature = float(getattr(config, 'temperature'))
 
@@ -299,6 +307,29 @@ class GWM(nn.Module):
         entropy = -(alpha * alpha.log() + (1.0 - alpha) * (1.0 - alpha).log())
         return entropy.mean()
 
+    def _self_adversarial_inbatch_loss(self, scores):
+        """
+        In-batch self-adversarial loss per sample.
+        scores: (B, B), diagonal are positives and off-diagonals are negatives.
+        Returns: (B,) per-sample loss
+        """
+        bsz = scores.size(0)
+        diag_idx = torch.arange(bsz, device=scores.device)
+
+        pos_scores = scores[diag_idx, diag_idx]  # (B,)
+        neg_mask = ~torch.eye(bsz, dtype=torch.bool, device=scores.device)
+        neg_scores = scores[neg_mask].view(bsz, bsz - 1)  # (B, B-1)
+
+        adv_logits = neg_scores / max(self.struct_adv_temperature, 1e-6)
+        adv_weights = torch.softmax(adv_logits, dim=-1)
+        if self.struct_adv_detach_weights:
+            adv_weights = adv_weights.detach()
+
+        # -log(sigmoid(pos)) + E_w[-log(sigmoid(-neg))]
+        pos_term = F.softplus(-pos_scores)
+        neg_term = (adv_weights * F.softplus(neg_scores)).sum(dim=-1)
+        return pos_term + neg_term
+
     def forward(self, h_batch, r_batch, context_batch):
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
         r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
@@ -370,7 +401,15 @@ class GWM(nn.Module):
         self._record_alpha(alpha)
 
         loss_text_per_sample = F.cross_entropy(scores_text, labels, reduction='none')
-        loss_struct_per_sample = F.cross_entropy(scores_struct, labels, reduction='none')
+        if self.struct_loss_type == 'self_adversarial':
+            loss_struct_per_sample = self._self_adversarial_inbatch_loss(scores_struct)
+        elif self.struct_loss_type == 'infonce':
+            loss_struct_per_sample = F.cross_entropy(scores_struct, labels, reduction='none')
+        else:
+            raise ValueError(
+                f"Unsupported struct_loss_type: {self.struct_loss_type}. "
+                "Use 'self_adversarial' or 'infonce'."
+            )
 
         balance = alpha.squeeze(-1)
         if self.balance_floor > 0.0:

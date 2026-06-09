@@ -24,15 +24,17 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
-struct_loss_type: self_adversarial
-struct_adv_temperature: 1.0
-struct_adv_detach_weights: true
 balance_floor: 0.1
 alpha_target: 0.3
 alpha_prior_weight: 0.3
 alpha_entropy_weight: 0.1
 alpha_entropy_min: 0.5
+# Self-Adversarial Margin Loss for the structural path
+struct_margin: 9.0
+struct_adv_temperature: 1.0
 
+# EMA decay for loss-scale normalisation across heterogeneous losses
+loss_ema_decay: 0.99
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237
     

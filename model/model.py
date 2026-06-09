@@ -150,9 +150,17 @@ class GWM(nn.Module):
         self.alpha_prior_weight = float(getattr(config, 'alpha_prior_weight', 0.0))
         self.alpha_entropy_weight = float(getattr(config, 'alpha_entropy_weight', 0.0))
         self.alpha_entropy_min = float(getattr(config, 'alpha_entropy_min', 0.0))
-        self.struct_loss_type = str(getattr(config, 'struct_loss_type', 'self_adversarial')).lower()
+
+        # SAML hyperparameters for the structural path.
+        self.struct_margin = float(getattr(config, 'struct_margin', 9.0))
         self.struct_adv_temperature = float(getattr(config, 'struct_adv_temperature', 1.0))
-        self.struct_adv_detach_weights = bool(getattr(config, 'struct_adv_detach_weights', True))
+
+        # EMA running estimates for heterogeneous loss scale normalization.
+        # Both are stored as plain Python floats (not nn.Parameters) so they
+        # are not included in the optimizer update.
+        self._ema_decay = float(getattr(config, 'loss_ema_decay', 0.99))
+        self._ema_loss_text = 1.0
+        self._ema_loss_struct = 1.0
 
         self.temperature = float(getattr(config, 'temperature'))
 
@@ -307,28 +315,36 @@ class GWM(nn.Module):
         entropy = -(alpha * alpha.log() + (1.0 - alpha) * (1.0 - alpha).log())
         return entropy.mean()
 
-    def _self_adversarial_inbatch_loss(self, scores):
+    def _self_adversarial_margin_loss(self, scores, labels):
+        """Self-adversarial margin loss (RotatE, Sun et al. 2019) for in-batch negatives.
+
+        scores : (B, B) raw similarity matrix (no temperature applied yet)
+        labels : (B,)  indices of positive pairs (diagonal)
+        Returns per-sample loss tensor of shape (B,).
         """
-        In-batch self-adversarial loss per sample.
-        scores: (B, B), diagonal are positives and off-diagonals are negatives.
-        Returns: (B,) per-sample loss
-        """
-        bsz = scores.size(0)
-        diag_idx = torch.arange(bsz, device=scores.device)
+        B = scores.size(0)
+        gamma = self.struct_margin
+        adv_temp = self.struct_adv_temperature
 
-        pos_scores = scores[diag_idx, diag_idx]  # (B,)
-        neg_mask = ~torch.eye(bsz, dtype=torch.bool, device=scores.device)
-        neg_scores = scores[neg_mask].view(bsz, bsz - 1)  # (B, B-1)
+        pos_scores = scores[torch.arange(B, device=scores.device), labels]  # (B,)
 
-        adv_logits = neg_scores / max(self.struct_adv_temperature, 1e-6)
-        adv_weights = torch.softmax(adv_logits, dim=-1)
-        if self.struct_adv_detach_weights:
-            adv_weights = adv_weights.detach()
+        # Build a mask that zeros out the positive position for each row.
+        neg_mask = torch.ones_like(scores, dtype=torch.bool)
+        neg_mask[torch.arange(B, device=scores.device), labels] = False
 
-        # -log(sigmoid(pos)) + E_w[-log(sigmoid(-neg))]
-        pos_term = F.softplus(-pos_scores)
-        neg_term = (adv_weights * F.softplus(neg_scores)).sum(dim=-1)
-        return pos_term + neg_term
+        # Adversarial weights: softmax over current negative scores.
+        neg_scores_for_weights = scores.detach().masked_fill(~neg_mask, float('-inf'))
+        neg_weights = torch.softmax(adv_temp * neg_scores_for_weights, dim=1)  # (B, B)
+
+        # Positive term: -log sigma(gamma + s_pos)
+        pos_loss = -F.logsigmoid(gamma + pos_scores)  # (B,)
+
+        # Negative term: -sum_j w_j * log sigma(-gamma - s_j_neg)
+        neg_log = -F.logsigmoid(-gamma - scores)  # (B, B); undefined at pos positions
+        neg_log = neg_log.masked_fill(~neg_mask, 0.0)
+        neg_loss = (neg_weights * neg_log).sum(dim=1)  # (B,)
+
+        return pos_loss + neg_loss
 
     def forward(self, h_batch, r_batch, context_batch):
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
@@ -400,16 +416,14 @@ class GWM(nn.Module):
         scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
         self._record_alpha(alpha)
 
-        loss_text_per_sample = F.cross_entropy(scores_text, labels, reduction='none')
-        if self.struct_loss_type == 'self_adversarial':
-            loss_struct_per_sample = self._self_adversarial_inbatch_loss(scores_struct)
-        elif self.struct_loss_type == 'infonce':
-            loss_struct_per_sample = F.cross_entropy(scores_struct, labels, reduction='none')
-        else:
-            raise ValueError(
-                f"Unsupported struct_loss_type: {self.struct_loss_type}. "
-                "Use 'self_adversarial' or 'infonce'."
-            )
+        # --- Text path: InfoNCE (in-batch cross-entropy) ---
+        loss_text_per_sample = F.cross_entropy(scores_text, labels, reduction='none')  # (B,)
+
+        # --- Struct path: Self-Adversarial Margin Loss ---
+        # Pass raw (un-temperature-scaled) scores so the margin is in the
+        # original dot-product space; temperature is not meaningful for SAML.
+        scores_struct_raw = torch.mm(query_struct, target_struct.t())
+        loss_struct_per_sample = self._self_adversarial_margin_loss(scores_struct_raw, labels)  # (B,)
 
         balance = alpha.squeeze(-1)
         if self.balance_floor > 0.0:
@@ -417,7 +431,25 @@ class GWM(nn.Module):
 
         loss_text = loss_text_per_sample.mean()
         loss_struct = loss_struct_per_sample.mean()
-        loss_main = (balance * loss_text_per_sample + (1.0 - balance) * loss_struct_per_sample).mean()
+
+        # EMA-normalize so alpha works on comparable scales across the two
+        # heterogeneous loss functions.
+        if self.training:
+            self._ema_loss_text = (
+                self._ema_decay * self._ema_loss_text
+                + (1.0 - self._ema_decay) * max(loss_text.item(), 1e-8)
+            )
+            self._ema_loss_struct = (
+                self._ema_decay * self._ema_loss_struct
+                + (1.0 - self._ema_decay) * max(loss_struct.item(), 1e-8)
+            )
+        scale_text = max(self._ema_loss_text, 1e-8)
+        scale_struct = max(self._ema_loss_struct, 1e-8)
+
+        loss_text_norm = loss_text_per_sample / scale_text
+        loss_struct_norm = loss_struct_per_sample / scale_struct
+
+        loss_main = (balance * loss_text_norm + (1.0 - balance) * loss_struct_norm).mean()
 
         alpha_mean = balance.mean()
         alpha_prior = (alpha_mean - self.alpha_target).pow(2)

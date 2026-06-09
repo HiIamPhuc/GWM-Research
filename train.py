@@ -94,6 +94,23 @@ def _sync_device(device):
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
 
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
+    torch.save(
+        {
+            'epoch': epoch,
+            'best_mrr': best_mrr,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'early_stopping_state': {
+                'best_value': early_stopping.best_value,
+                'counter': early_stopping.counter,
+                'should_stop': early_stopping.should_stop,
+            },
+        },
+        path,
+    )
+
 def train(args):
     # Load Config
     config = get_config(args)
@@ -156,20 +173,21 @@ def train(args):
     )
     print("Loaded text embeddings into text embedding tables...")
 
-    # Load Structural Prior Caches (if specified in config)
+    # Structural priors are required because the model always uses this path.
     structural_entity_source = os.path.join(config.data_dir, 'structural_entities.pt')
     structural_relation_source = os.path.join(config.data_dir, 'structural_relations.pt')
-    if structural_entity_source and structural_relation_source:
-        if os.path.exists(structural_entity_source) and os.path.exists(structural_relation_source):
-            model.load_embeddings(
-                entity_source=structural_entity_source,
-                relation_source=structural_relation_source,
-                kind='structural',
-                freeze=True,
-            )
-            print("Loaded structural embeddings into structural embedding tables...")
-        else:
-            print(f"Warning: Structural priors not found at {structural_entity_source} or {structural_relation_source}")
+    if not os.path.exists(structural_entity_source) or not os.path.exists(structural_relation_source):
+        raise FileNotFoundError(
+            "Missing precomputed structural prior files. Expected "
+            "structural_entities.pt and structural_relations.pt in data_dir."
+        )
+    model.load_embeddings(
+        entity_source=structural_entity_source,
+        relation_source=structural_relation_source,
+        kind='structural',
+        freeze=True,
+    )
+    print("Loaded structural embeddings into structural embedding tables...")
     
     # Save effective config (including inferred dimensions, CLI overrides, and model params).
     save_training_config(config, config.output_dir, args=args, model=model)
@@ -239,7 +257,7 @@ def train(args):
     
     print("Starting training...")
     train_start_time = time.perf_counter()
-    best_mrr = 0.0
+    best_mrr = float('-inf')
     
     early_stopping = EarlyStopping(
         patience=getattr(config, 'early_stopping_patience', getattr(config, 'early_stopping', 10)),
@@ -281,6 +299,7 @@ def train(args):
             loss_text, loss_struct, loss, _, _, alpha_prior, alpha_entropy_reg = model.compute_loss(
                 query_vector,
                 t_fused,
+                target_ids=t_batch['id'],
             )
 
             if not torch.isfinite(loss):
@@ -388,17 +407,28 @@ def train(args):
             with open(log_path, 'w') as f:
                 json.dump(history, f, indent=2)
             
-            if val_mrr > best_mrr:
+            is_best = val_mrr > best_mrr
+            if is_best:
                 best_mrr = val_mrr
-                torch.save(model.state_dict(), os.path.join(config.output_dir, 'best_checkpoint.pt'))
             
             # Check early stopping
-            if early_stopping(val_mrr):
+            should_stop = early_stopping(val_mrr)
+            if is_best:
+                save_checkpoint(
+                    os.path.join(config.output_dir, 'best_checkpoint.pt'),
+                    model,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    best_mrr,
+                    early_stopping,
+                )
+            if should_stop:
                 print(f"\n✓ Early stopping triggered at epoch {epoch + 1}")
                 print(f"  Best MRR: {early_stopping.best_value:.4f}")
                 print(f"  No improvement for {early_stopping.patience} epochs")
-                break
         else:
+            should_stop = False
              # Log train only
             epoch_log = {
                 'epoch': epoch + 1,
@@ -412,8 +442,17 @@ def train(args):
             with open(log_path, 'w') as f:
                   json.dump(history, f, indent=2)
         
-        # Save Checkpoint
-        torch.save(model.state_dict(), os.path.join(config.output_dir, 'latest_checkpoint.pt'))
+        save_checkpoint(
+            os.path.join(config.output_dir, 'latest_checkpoint.pt'),
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            best_mrr,
+            early_stopping,
+        )
+        if should_stop:
+            break
 
     _sync_device(device)
     total_train_seconds = time.perf_counter() - train_start_time

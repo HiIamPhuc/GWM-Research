@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +12,7 @@ class CompGCN(nn.Module):
         self.lin_self = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.lin_msg = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.lin_out = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, head_feat, nbr_entity_feat, nbr_relation_feat, nbr_batch_index):
@@ -37,8 +37,9 @@ class CompGCN(nn.Module):
         denom = denom.clamp(min=1.0)
         agg = agg / denom
 
-        # Pure residual fix: preserve anchor head state, add learned neighbor delta.
-        return self.dropout(self.lin_out(agg))
+        self_state = self.lin_self(head_feat)
+        neighbor_delta = self.dropout(self.lin_out(agg))
+        return self.norm(self_state + neighbor_delta)
 
 
 class MLPAdapter(nn.Module):
@@ -98,12 +99,14 @@ class GWM(nn.Module):
 
         self.text_dynamics_mixer = DynamicsMixer(self.text_emb_dim, dropout=self.dropout)
 
+        dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
+
         self.text_lstm = nn.LSTM(
             input_size=self.text_emb_dim,
             hidden_size=self.text_emb_dim,
-            num_layers=int(getattr(config, 'dynamics_layers', 1)),
+            num_layers=dynamics_layers,
             batch_first=True,
-            dropout=self.dropout
+            dropout=self.dropout if dynamics_layers > 1 else 0.0,
         )
 
         self.text_output_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
@@ -129,9 +132,9 @@ class GWM(nn.Module):
         self.struct_lstm = nn.LSTM(
             input_size=self.struct_emb_dim, 
             hidden_size=self.struct_emb_dim,
-            num_layers=int(getattr(config, 'dynamics_layers', 1)), 
+            num_layers=dynamics_layers,
             batch_first=True,
-            dropout=self.dropout
+            dropout=self.dropout if dynamics_layers > 1 else 0.0,
         )
 
         self.struct_output_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
@@ -145,22 +148,12 @@ class GWM(nn.Module):
         self._alpha_sum = 0.0
         self._alpha_count = 0
         
-        self.balance_floor = float(getattr(config, 'balance_floor', 0.0))
         self.alpha_target = float(getattr(config, 'alpha_target', 0.5))
         self.alpha_prior_weight = float(getattr(config, 'alpha_prior_weight', 0.0))
         self.alpha_entropy_weight = float(getattr(config, 'alpha_entropy_weight', 0.0))
         self.alpha_entropy_min = float(getattr(config, 'alpha_entropy_min', 0.0))
-
-        # SAML hyperparameters for the structural path.
-        self.struct_margin = float(getattr(config, 'struct_margin', 9.0))
-        self.struct_adv_temperature = float(getattr(config, 'struct_adv_temperature', 1.0))
-
-        # EMA running estimates for heterogeneous loss scale normalization.
-        # Both are stored as plain Python floats (not nn.Parameters) so they
-        # are not included in the optimizer update.
-        self._ema_decay = float(getattr(config, 'loss_ema_decay', 0.99))
-        self._ema_loss_text = 1.0
-        self._ema_loss_struct = 1.0
+        self.text_aux_weight = float(getattr(config, 'text_aux_weight', 0.25))
+        self.struct_aux_weight = float(getattr(config, 'struct_aux_weight', 0.25))
 
         self.temperature = float(getattr(config, 'temperature'))
 
@@ -168,34 +161,23 @@ class GWM(nn.Module):
         context_entity_ids = context_batch['id']
         context_relation_ids = context_batch.get('rel_id')
         context_batch_index = context_batch.get('batch_index')
-        context_mask = context_batch.get('sequence_mask')
-        if context_mask is None:
-            context_mask = context_batch.get('mask')
-        if context_mask is not None:
-            context_mask = context_mask.bool()
-
-        context_seq_entity_ids = context_batch.get('sequence_id')
-        context_seq_relation_ids = context_batch.get('sequence_rel_id')
-
-        if context_seq_entity_ids is not None and context_mask is not None:
-            valid_idx = context_mask.nonzero(as_tuple=False)
-            context_batch_index = valid_idx[:, 0]
-            flat_entity_ids = context_seq_entity_ids[context_mask]
-            flat_relation_ids = context_seq_relation_ids[context_mask]
-        elif context_entity_ids.dim() == 2:
-            if context_mask is None:
-                raise ValueError("context_batch['mask'] is required for padded context format.")
-            valid_idx = context_mask.nonzero(as_tuple=False)
-            context_batch_index = valid_idx[:, 0]
-            flat_entity_ids = context_entity_ids[context_mask]
-            flat_relation_ids = context_relation_ids[context_mask]
-        else:
-            flat_entity_ids = context_entity_ids
-            flat_relation_ids = context_relation_ids
-            if context_batch_index is None:
-                raise ValueError("context_batch['batch_index'] is required for ragged context format.")
-
-        return flat_entity_ids, flat_relation_ids, context_batch_index
+        if context_relation_ids is None or context_batch_index is None:
+            raise ValueError(
+                "context_batch requires 'id', 'rel_id', and 'batch_index'."
+            )
+        if (
+            context_entity_ids.dim() != 1
+            or context_relation_ids.dim() != 1
+            or context_batch_index.dim() != 1
+        ):
+            raise ValueError("Ragged context tensors must all be one-dimensional.")
+        if not (
+            context_entity_ids.numel()
+            == context_relation_ids.numel()
+            == context_batch_index.numel()
+        ):
+            raise ValueError("Ragged context tensors must have equal lengths.")
+        return context_entity_ids, context_relation_ids, context_batch_index
 
     def _run_dynamics(self, world_state, head_emb, relation_emb, mixer, lstm, h0_proj, c0_proj):
         """
@@ -291,15 +273,15 @@ class GWM(nn.Module):
         relation_table.weight.data.copy_(relation_cache)
 
         if freeze:
-            self.text_ent_embs.weight.requires_grad = False
-            self.text_rel_embs.weight.requires_grad = False
+            entity_table.weight.requires_grad = False
+            relation_table.weight.requires_grad = False
 
     def reset_alpha_stats(self):
         self._alpha_sum = 0.0
         self._alpha_count = 0
 
     def _record_alpha(self, alpha):
-        self._alpha_sum += alpha.sum().item()
+        self._alpha_sum += alpha.detach().sum().item()
         self._alpha_count += alpha.numel()
 
     def get_alpha_mean(self, reset=False):
@@ -315,36 +297,26 @@ class GWM(nn.Module):
         entropy = -(alpha * alpha.log() + (1.0 - alpha) * (1.0 - alpha).log())
         return entropy.mean()
 
-    def _self_adversarial_margin_loss(self, scores, labels):
-        """Self-adversarial margin loss (RotatE, Sun et al. 2019) for in-batch negatives.
+    @staticmethod
+    def _multi_positive_contrastive_loss(scores, target_ids=None):
+        batch_size = scores.size(0)
+        if target_ids is None:
+            positive_mask = torch.eye(
+                batch_size, dtype=torch.bool, device=scores.device
+            )
+        else:
+            target_ids = target_ids.reshape(-1)
+            if target_ids.numel() != batch_size:
+                raise ValueError(
+                    "target_ids must contain one entity ID per score row."
+                )
+            positive_mask = target_ids[:, None].eq(target_ids[None, :])
 
-        scores : (B, B) raw similarity matrix (no temperature applied yet)
-        labels : (B,)  indices of positive pairs (diagonal)
-        Returns per-sample loss tensor of shape (B,).
-        """
-        B = scores.size(0)
-        gamma = self.struct_margin
-        adv_temp = self.struct_adv_temperature
-
-        pos_scores = scores[torch.arange(B, device=scores.device), labels]  # (B,)
-
-        # Build a mask that zeros out the positive position for each row.
-        neg_mask = torch.ones_like(scores, dtype=torch.bool)
-        neg_mask[torch.arange(B, device=scores.device), labels] = False
-
-        # Adversarial weights: softmax over current negative scores.
-        neg_scores_for_weights = scores.detach().masked_fill(~neg_mask, float('-inf'))
-        neg_weights = torch.softmax(adv_temp * neg_scores_for_weights, dim=1)  # (B, B)
-
-        # Positive term: -log sigma(gamma + s_pos)
-        pos_loss = -F.logsigmoid(gamma + pos_scores)  # (B,)
-
-        # Negative term: -sum_j w_j * log sigma(-gamma - s_j_neg)
-        neg_log = -F.logsigmoid(-gamma - scores)  # (B, B); undefined at pos positions
-        neg_log = neg_log.masked_fill(~neg_mask, 0.0)
-        neg_loss = (neg_weights * neg_log).sum(dim=1)  # (B,)
-
-        return pos_loss + neg_loss
+        positive_scores = scores.masked_fill(~positive_mask, float('-inf'))
+        return -(
+            torch.logsumexp(positive_scores, dim=1)
+            - torch.logsumexp(scores, dim=1)
+        )
 
     def forward(self, h_batch, r_batch, context_batch):
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
@@ -372,7 +344,7 @@ class GWM(nn.Module):
         )
 
         query_text = self.text_output_projection(query_text)
-        query_text = torch.nn.functional.normalize(query_text, p=2, dim=1)
+        query_text = F.normalize(query_text, p=2, dim=1)
 
         # -- Struct Pathway --
         world_state_struct = self.struct_compgcn(
@@ -388,7 +360,7 @@ class GWM(nn.Module):
         )
 
         query_struct = self.struct_output_projection(query_struct)
-        query_struct = torch.nn.functional.normalize(query_struct, p=2, dim=1)
+        query_struct = F.normalize(query_struct, p=2, dim=1)
 
         return query_text, query_struct, r_text, r_struct
 
@@ -396,18 +368,16 @@ class GWM(nn.Module):
         t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
         t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
         
-        t_text = torch.nn.functional.normalize(self.text_output_projection(t_text), p=2, dim=1)
-        t_struct = torch.nn.functional.normalize(self.struct_output_projection(t_struct), p=2, dim=1)
+        t_text = F.normalize(self.text_output_projection(t_text), p=2, dim=1)
+        t_struct = F.normalize(self.struct_output_projection(t_struct), p=2, dim=1)
         return t_text, t_struct
 
-    def compute_loss(self, query_vectors, target_vectors):
+    def compute_loss(self, query_vectors, target_vectors, target_ids=None):
         query_text, query_struct, relation_text, relation_struct = query_vectors
         target_text, target_struct = target_vectors
 
         scores_text = torch.mm(query_text, target_text.t())
         scores_struct = torch.mm(query_struct, target_struct.t())
-        labels = torch.arange(scores_text.size(0), device=scores_text.device)
-
         scores_text = scores_text / self.temperature
         scores_struct = scores_struct / self.temperature
 
@@ -416,49 +386,34 @@ class GWM(nn.Module):
         scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
         self._record_alpha(alpha)
 
-        # --- Text path: InfoNCE (in-batch cross-entropy) ---
-        loss_text_per_sample = F.cross_entropy(scores_text, labels, reduction='none')  # (B,)
-
-        # --- Struct path: Self-Adversarial Margin Loss ---
-        # Pass raw (un-temperature-scaled) scores so the margin is in the
-        # original dot-product space; temperature is not meaningful for SAML.
-        scores_struct_raw = torch.mm(query_struct, target_struct.t())
-        loss_struct_per_sample = self._self_adversarial_margin_loss(scores_struct_raw, labels)  # (B,)
-
-        balance = alpha.squeeze(-1)
-        if self.balance_floor > 0.0:
-            balance = balance.clamp(min=self.balance_floor, max=1.0 - self.balance_floor)
+        loss_fused_per_sample = self._multi_positive_contrastive_loss(
+            scores_fused, target_ids
+        )
+        loss_text_per_sample = self._multi_positive_contrastive_loss(
+            scores_text, target_ids
+        )
+        loss_struct_per_sample = self._multi_positive_contrastive_loss(
+            scores_struct, target_ids
+        )
 
         loss_text = loss_text_per_sample.mean()
         loss_struct = loss_struct_per_sample.mean()
+        loss_fused = loss_fused_per_sample.mean()
 
-        # EMA-normalize so alpha works on comparable scales across the two
-        # heterogeneous loss functions.
-        if self.training:
-            self._ema_loss_text = (
-                self._ema_decay * self._ema_loss_text
-                + (1.0 - self._ema_decay) * max(loss_text.item(), 1e-8)
-            )
-            self._ema_loss_struct = (
-                self._ema_decay * self._ema_loss_struct
-                + (1.0 - self._ema_decay) * max(loss_struct.item(), 1e-8)
-            )
-        scale_text = max(self._ema_loss_text, 1e-8)
-        scale_struct = max(self._ema_loss_struct, 1e-8)
-
-        loss_text_norm = loss_text_per_sample / scale_text
-        loss_struct_norm = loss_struct_per_sample / scale_struct
-
-        loss_main = (balance * loss_text_norm + (1.0 - balance) * loss_struct_norm).mean()
-
-        alpha_mean = balance.mean()
+        alpha_mean = alpha.mean()
         alpha_prior = (alpha_mean - self.alpha_target).pow(2)
 
-        alpha_entropy = self._alpha_entropy(balance)
-        alpha_entropy_floor = balance.new_tensor(self.alpha_entropy_min)
+        alpha_entropy = self._alpha_entropy(alpha)
+        alpha_entropy_floor = alpha.new_tensor(self.alpha_entropy_min)
         alpha_entropy_reg = torch.relu(alpha_entropy_floor - alpha_entropy)
 
-        loss = loss_main + self.alpha_prior_weight * alpha_prior + self.alpha_entropy_weight * alpha_entropy_reg
+        loss = (
+            loss_fused
+            + self.text_aux_weight * loss_text
+            + self.struct_aux_weight * loss_struct
+            + self.alpha_prior_weight * alpha_prior
+            + self.alpha_entropy_weight * alpha_entropy_reg
+        )
 
         return loss_text, loss_struct, loss, scores_fused, alpha, alpha_prior, alpha_entropy_reg
 

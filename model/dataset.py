@@ -12,17 +12,24 @@ class GWMDataset(Dataset):
         self.data_dir = data_dir
         self.split = split
 
+        with open(os.path.join(data_dir, 'entity2id.json'), 'r', encoding='utf-8') as f:
+            self.num_entities = len(json.load(f))
         with open(os.path.join(data_dir, 'relation2id.json'), 'r', encoding='utf-8') as f:
             self.num_relations = len(json.load(f))
         
         # Load triples
         triples_path = os.path.join(data_dir, f'{split}_triples.pt')
         if not os.path.exists(triples_path):
-             # Fallback for WN18RR dev vs valid naming if needed, but preprocess handles it
-             if split == 'valid' and not os.path.exists(triples_path):
-                 triples_path = os.path.join(data_dir, 'dev_triples.pt')
+            if split == 'valid':
+                triples_path = os.path.join(data_dir, 'dev_triples.pt')
+        if not os.path.exists(triples_path):
+            raise FileNotFoundError(f"Triple tensor not found: {triples_path}")
                  
-        self.triples = torch.load(triples_path)
+        self.triples = torch.load(triples_path, map_location='cpu').long()
+        if self.triples.dim() != 2 or self.triples.size(1) != 3:
+            raise ValueError(
+                f"Expected triples with shape (N, 3), got {tuple(self.triples.shape)}"
+            )
         
         # Load compact relation-aware context artifact.
         context_pack_path = os.path.join(data_dir, 'context_neighbors.pt')
@@ -33,11 +40,37 @@ class GWMDataset(Dataset):
         self.context_pad_value = -1
 
         if os.path.exists(context_pack_path):
-            context_pack = torch.load(context_pack_path)
+            context_pack = torch.load(context_pack_path, map_location='cpu')
             self.context_entity_ids = context_pack['entity_ids'].long()
             self.context_relation_ids = context_pack['relation_ids'].long()
             self.context_mask = context_pack['mask'].bool()
             self.context_pad_value = int(context_pack.get('pad_value', -1))
+            expected_shape = self.context_entity_ids.shape
+            if (
+                self.context_entity_ids.dim() != 2
+                or self.context_relation_ids.shape != expected_shape
+                or self.context_mask.shape != expected_shape
+            ):
+                raise ValueError(
+                    "Context entity IDs, relation IDs, and mask must share "
+                    "the same rank-2 shape."
+                )
+            if self.context_entity_ids.size(0) != self.num_entities:
+                raise ValueError(
+                    "Context artifact row count must equal the entity vocabulary size."
+                )
+            valid_entities = self.context_entity_ids[self.context_mask]
+            valid_relations = self.context_relation_ids[self.context_mask]
+            if valid_entities.numel() and (
+                valid_entities.min() < 0
+                or valid_entities.max() >= self.num_entities
+            ):
+                raise ValueError("Context artifact contains invalid entity IDs.")
+            if valid_relations.numel() and (
+                valid_relations.min() < 0
+                or valid_relations.max() >= self.num_relations
+            ):
+                raise ValueError("Context artifact contains invalid relation IDs.")
         else:
             raise FileNotFoundError(
                 "Error: context files not found "
@@ -82,29 +115,10 @@ class CollateFN:
     """
     ID-only collator; text embeddings are loaded from precomputed caches.
     """
-    def __init__(self):
-        pass
-        
     def __call__(self, batch):
         h_ids = torch.stack([b['h_id'] for b in batch])
         r_ids = torch.stack([b['r_id'] for b in batch])
         t_ids = torch.stack([b['t_id'] for b in batch])
-
-        max_context_len = max((b['context_entity_ids'].numel() for b in batch), default=0)
-        context_entity_ids_seq = torch.full((len(batch), max_context_len), -1, dtype=torch.long)
-        context_relation_ids_seq = torch.full((len(batch), max_context_len), -1, dtype=torch.long)
-        context_mask_seq = torch.zeros((len(batch), max_context_len), dtype=torch.bool)
-
-        for sample_idx, item in enumerate(batch):
-            ent_ids = item['context_entity_ids'].long().reshape(-1)
-            rel_ids = item['context_relation_ids'].long().reshape(-1)
-            mask = item['context_mask'].bool().reshape(-1)
-
-            seq_len = min(ent_ids.numel(), rel_ids.numel(), mask.numel(), max_context_len)
-            if seq_len > 0:
-                context_entity_ids_seq[sample_idx, :seq_len] = ent_ids[:seq_len]
-                context_relation_ids_seq[sample_idx, :seq_len] = rel_ids[:seq_len]
-                context_mask_seq[sample_idx, :seq_len] = mask[:seq_len]
 
         # Build ragged context representation: flattened edges + edge->sample index.
         context_entity_chunks = []
@@ -115,13 +129,13 @@ class CollateFN:
             rel_ids = item['context_relation_ids']
             mask = item['context_mask'].bool()
 
-            if ent_ids.dim() == 1:
-                valid_ent = ent_ids[mask] if mask.numel() == ent_ids.numel() else ent_ids
-                valid_rel = rel_ids[mask] if mask.numel() == rel_ids.numel() else rel_ids
-            else:
-                # Fallback safety; flatten unusual shapes.
-                valid_ent = ent_ids.reshape(-1)
-                valid_rel = rel_ids.reshape(-1)
+            if ent_ids.dim() != 1 or rel_ids.dim() != 1 or mask.dim() != 1:
+                raise ValueError("Each context row must be one-dimensional.")
+            if not (ent_ids.numel() == rel_ids.numel() == mask.numel()):
+                raise ValueError("Context entity, relation, and mask lengths differ.")
+
+            valid_ent = ent_ids[mask]
+            valid_rel = rel_ids[mask]
 
             # Extra guard for sentinel padding values.
             valid_pair_mask = (valid_ent >= 0) & (valid_rel >= 0)
@@ -150,9 +164,5 @@ class CollateFN:
                 'id': context_entity_ids,
                 'rel_id': context_relation_ids,
                 'batch_index': context_batch_index,
-                'sequence_id': context_entity_ids_seq,
-                'sequence_rel_id': context_relation_ids_seq,
-                'sequence_mask': context_mask_seq,
-                'mask': context_mask_seq,
             },
         }

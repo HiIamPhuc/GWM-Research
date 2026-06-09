@@ -21,45 +21,81 @@ def align_and_save_embeddings(pykeen_model, pykeen_tf, our_e2id_path, our_r2id_p
     
     # 1. Extract raw embeddings from PyKEEN
     # Some models like RotatE use complex numbers; we flatten them to real numbers: (num_entities, dim * 2) or (num_entities, dim)
-    ent_emb_full = pykeen_model.entity_representations[0]().detach().cpu()
-    rel_emb_full = pykeen_model.relation_representations[0]().detach().cpu()
-    
-    if torch.is_complex(ent_emb_full):
-        ent_emb_full = torch.view_as_real(ent_emb_full).view(ent_emb_full.shape[0], -1)
-        rel_emb_full = torch.view_as_real(rel_emb_full).view(rel_emb_full.shape[0], -1)
-        
-    actual_dim = ent_emb_full.shape[1]
-    print(f"Extracted PyKEEN embedding dimension: {actual_dim} (Target: {target_dim})")
+    ent_emb_raw = pykeen_model.entity_representations[0]().detach().cpu()
+    rel_emb_raw = pykeen_model.relation_representations[0]().detach().cpu()
+
+    if torch.is_complex(ent_emb_raw):
+        ent_emb_full = torch.view_as_real(ent_emb_raw).reshape(ent_emb_raw.shape[0], -1)
+    else:
+        ent_emb_full = ent_emb_raw
+
+    if torch.is_complex(rel_emb_raw):
+        rel_emb_full = torch.view_as_real(rel_emb_raw).reshape(rel_emb_raw.shape[0], -1)
+        inverse_rel_emb_full = torch.view_as_real(
+            rel_emb_raw.conj().resolve_conj()
+        ).reshape(rel_emb_raw.shape[0], -1)
+    else:
+        rel_emb_full = rel_emb_raw
+        inverse_rel_emb_full = -rel_emb_raw
+
+    entity_dim = ent_emb_full.shape[1]
+    relation_dim = rel_emb_full.shape[1]
+    print(
+        f"Extracted PyKEEN dimensions: entities={entity_dim}, "
+        f"relations={relation_dim} (Target: {target_dim})"
+    )
+    if entity_dim != target_dim or relation_dim != target_dim:
+        raise ValueError(
+            f"Structural prior dimension mismatch. Expected {target_dim}, "
+            f"got entities={entity_dim}, relations={relation_dim}."
+        )
     
     # 2. Create blank tensors for our ordering
     num_our_entities = len(our_e2id)
     num_our_relations = len(our_r2id)
     
-    aligned_entities = torch.zeros((num_our_entities, actual_dim))
-    aligned_relations = torch.zeros((num_our_relations, actual_dim))
+    aligned_entities = torch.zeros((num_our_entities, target_dim))
+    aligned_relations = torch.zeros((num_our_relations, target_dim))
     
     # 3. Align Entities
     pykeen_e2id = pykeen_tf.entity_to_id
-    unmatched_ent = 0
+    assigned_entities = set()
     for str_ent, pykeen_id in pykeen_e2id.items():
         if str_ent in our_e2id:
             our_id = our_e2id[str_ent]
             aligned_entities[our_id] = ent_emb_full[pykeen_id]
-        else:
-            unmatched_ent += 1
+            assigned_entities.add(our_id)
             
     # 4. Align Relations
     pykeen_r2id = pykeen_tf.relation_to_id
-    unmatched_rel = 0
+    assigned_relations = set()
     for str_rel, pykeen_id in pykeen_r2id.items():
         if str_rel in our_r2id:
             our_id = our_r2id[str_rel]
             aligned_relations[our_id] = rel_emb_full[pykeen_id]
-        else:
-            unmatched_rel += 1
+
+            assigned_relations.add(our_id)
+
+        inverse_name = str_rel + '_inv'
+        if inverse_name in our_r2id:
+            inverse_id = our_r2id[inverse_name]
+            aligned_relations[inverse_id] = inverse_rel_emb_full[pykeen_id]
+            assigned_relations.add(inverse_id)
+
+    missing_entities = sorted(set(range(num_our_entities)) - assigned_entities)
+    missing_relations = sorted(set(range(num_our_relations)) - assigned_relations)
+    if missing_entities or missing_relations:
+        raise ValueError(
+            "Could not align all structural priors. "
+            f"Missing entity rows: {missing_entities[:10]}; "
+            f"missing relation rows: {missing_relations[:10]}."
+        )
             
     print(f"Alignment Complete.")
-    print(f"Unmatched Entities: {unmatched_ent} | Unmatched Relations: {unmatched_rel}")
+    print(
+        f"Aligned {len(assigned_entities)} entities and "
+        f"{len(assigned_relations)} relations (including inverses)."
+    )
     
     # 5. Save
     torch.save(aligned_entities, out_ent_path)
@@ -92,9 +128,11 @@ def main():
     tf_test = TriplesFactory.from_path(test_path, entity_to_id=tf_train.entity_to_id, relation_to_id=tf_train.relation_to_id)
 
     seed_everything(args.seed)
-    # For RotatE, the user-facing dimension represents both real and imaginary combined in our PyTorch tensor.
-    # PyKEEN's internal embedding_dim for RotatE is usually dim // 2.
-    internal_dim = args.dim // 2 if args.model == 'RotatE' else args.dim
+    # The saved tensor flattens real and imaginary parts, so complex models
+    # use half the requested output dimension internally.
+    if args.model in {'RotatE', 'ComplEx'} and args.dim % 2 != 0:
+        raise ValueError(f"{args.model} requires an even --dim value.")
+    internal_dim = args.dim // 2 if args.model in {'RotatE', 'ComplEx'} else args.dim
 
     print(f"Training {args.model} on {dataset_upper}...")
     pipeline_result = pipeline(

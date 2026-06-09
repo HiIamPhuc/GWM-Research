@@ -55,33 +55,19 @@ def evaluate(args):
         print(f"Checkpoint not found at {checkpoint_path}, trying latest...")
         checkpoint_path = os.path.join(config.output_dir, 'latest_checkpoint.pt')
     
-    if os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        if isinstance(checkpoint, dict):
-            state_dict = checkpoint.get('state_dict', checkpoint.get('model_state_dict', checkpoint))
-        else:
-            state_dict = checkpoint
-        model.load_state_dict(state_dict, strict=False)
-    else:
-        print("No checkpoint found. Evaluating initialized model (random).")
-
-    entity_emb_path = os.path.join(config.data_dir, 'entity_text_embeddings.pt')
-    relation_emb_path = os.path.join(config.data_dir, 'relation_text_embeddings.pt')
-    if not os.path.exists(entity_emb_path) or not os.path.exists(relation_emb_path):
+    if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
-            "Missing precomputed text embedding cache files. "
-            "Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
+            f"No trained checkpoint found at {checkpoint_path}."
         )
 
-    print("Loading precomputed text embeddings for evaluation...")
-    model.load_embeddings(
-        entity_source=entity_emb_path,
-        relation_source=relation_emb_path,
-        kind='text',
-        freeze=True,
-    )
-    print("Text embeddings ready for evaluation.")
+    print(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
+        raise ValueError(
+            "Unsupported legacy checkpoint. Expected a full training "
+            "checkpoint containing 'model_state_dict'."
+        )
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
 
     model.eval()
 

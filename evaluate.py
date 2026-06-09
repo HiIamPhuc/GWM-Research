@@ -123,14 +123,14 @@ def evaluate(args):
         # Standard test protocol: filter with train+valid
         hr_map = load_hr_map_for_filtering(
             config.data_dir,
-            preferred_ground_truth_file='ground_truth_train_valid.json',
+            preferred_ground_truth_file='ground_truth.json',
             fallback_splits=['train', 'valid']
         )
     else:
         # Validation protocol: filter with train only
         hr_map = load_hr_map_for_filtering(
             config.data_dir,
-            preferred_ground_truth_file='ground_truth_train.json',
+            preferred_ground_truth_file='ground_truth.json',
             fallback_splits=['train']
         )
 

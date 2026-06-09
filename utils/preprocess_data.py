@@ -300,9 +300,8 @@ def process_dataset(
     )
 
     # 5. Ground Truth for Filtered Eval
-    # Save split-aware maps to ensure fair ranking protocols:
-    # - validation: filter with train only
-    # - test: filter with train + valid
+    # Standard filtered KGC ranking removes every other known true answer,
+    # including facts from train, validation, and test.
     def build_ground_truth(*triple_tensors):
         gt = {}
         for tensor in triple_tensors:
@@ -313,19 +312,12 @@ def process_dataset(
                 gt[key].add(t)
         return {k: sorted(list(v)) for k, v in gt.items()}
 
-    ground_truth_train = build_ground_truth(train_tensor)
-    ground_truth_train_valid = build_ground_truth(train_tensor, valid_tensor)
     ground_truth_all = build_ground_truth(train_tensor, valid_tensor, test_tensor)
 
-    # Backward-compatible legacy file
+    # Keep the existing filenames for compatibility. All of them now contain
+    # the complete known-fact map required by filtered validation/test ranking.
     with open(out_path / 'ground_truth.json', 'w') as f:
         json.dump(ground_truth_all, f)
-
-    # Split-aware files used by train/evaluate ranking
-    with open(out_path / 'ground_truth_train.json', 'w') as f:
-        json.dump(ground_truth_train, f)
-    with open(out_path / 'ground_truth_train_valid.json', 'w') as f:
-        json.dump(ground_truth_train_valid, f)
         
     print("Data processing complete.")
 

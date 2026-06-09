@@ -55,7 +55,14 @@ class GWMDataset(Dataset):
         if self.context_entity_ids is not None:
             ctx_entity_ids = self.context_entity_ids[h_idx]
             ctx_relation_ids = self.context_relation_ids[h_idx]
-            ctx_mask = self.context_mask[h_idx]
+            ctx_mask = self.context_mask[h_idx].clone()
+
+            # Do not expose the answer edge while predicting this triple.
+            target_edge = (
+                ctx_entity_ids.eq(int(t.item()))
+                & ctx_relation_ids.eq(int(r.item()))
+            )
+            ctx_mask &= ~target_edge
         else:
             # Dummy fallback with zero neighbors.
             ctx_entity_ids = torch.zeros(0, dtype=torch.long)

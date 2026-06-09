@@ -226,7 +226,7 @@ def train(args):
     if valid_loader is not None:
         hr_map = load_hr_map_for_filtering(
             config.data_dir,
-            preferred_ground_truth_file='ground_truth_train.json',
+            preferred_ground_truth_file='ground_truth.json',
             fallback_splits=['train']
         )
 

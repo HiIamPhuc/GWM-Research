@@ -297,7 +297,7 @@ def resume_training(args):
 	if valid_loader is not None:
 		hr_map = load_hr_map_for_filtering(
 			config.data_dir,
-			preferred_ground_truth_file='ground_truth_train.json',
+			preferred_ground_truth_file='ground_truth.json',
 			fallback_splits=['train'],
 		)
 		candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(int(config.batch_size), 256)))

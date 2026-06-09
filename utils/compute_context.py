@@ -65,60 +65,14 @@ class ContextProcessor:
                 adj[h] = []
             adj[h].append((r, t))
             
-        # Deduplicate relation-tail edges while preserving tuple info.
+        # Deduplicate relation-tail edges with deterministic ordering.
         for h in adj:
-            adj[h] = list(set(adj[h]))
+            adj[h] = sorted(set(adj[h]))
             
         return adj
 
-    def _mmr(self, query_emb, candidate_embs, k, lambda_param=0.5):
-        """
-        Maximal Marginal Relevance selection.
-        query_emb: (H)
-        candidate_embs: (M, H)
-        k: number of items to select
-        lambda_param: 0.5 balances relevance and diversity. 1.0 = standard top-k.
-        """
-        if candidate_embs.size(0) == 0:
-            return []
-            
-        selected_indices = []
-        candidate_indices = list(range(candidate_embs.size(0)))
-        
-        # Ensure tensor is on same device
-        query_emb = query_emb.to(candidate_embs.device)
-        
-        # Precompute similarity of candidates to query
-        sim_to_query = torch.matmul(candidate_embs, query_emb)
-        
-        for _ in range(min(k, len(candidate_indices))):
-            if not selected_indices:
-                # First step: pick most similar to query
-                best_rel_idx = torch.argmax(sim_to_query).item()
-                selected_indices.append(best_rel_idx)
-            else:
-                # MMR step
-                # Compute sim Max(Sim(c, s)) for all s in S
-                selected_embs = candidate_embs[selected_indices] # (num_sel, H)
-                
-                # Sim matrix: (M, num_sel)
-                sim_to_selected = torch.matmul(candidate_embs, selected_embs.t())
-                
-                # Max sim for each candidate to ANY selected context node
-                max_sim_to_selected, _ = torch.max(sim_to_selected, dim=1)
-                
-                # MMR score
-                # Mask out already selected indices with -inf
-                current_scores = lambda_param * sim_to_query - (1 - lambda_param) * max_sim_to_selected
-                current_scores[selected_indices] = -float('inf')
-                
-                best_idx = torch.argmax(current_scores).item()
-                selected_indices.append(best_idx)
-            
-        return selected_indices
-
-    def compute_context_nodes(self, k=10, algorithm='mmr_neighbor', batch_size=64, mmr_lambda=0.5):
-        print(f"Computing context nodes using {algorithm}...")
+    def compute_context_nodes(self, k=10):
+        print("Computing context nodes using random neighbor sampling...")
         num_entities = len(self.entity2id)
         pad_value = -1
         limit = int(k)
@@ -135,75 +89,30 @@ class ContextProcessor:
         context_relation_ids = torch.full((num_entities, max_k), pad_value, dtype=torch.long)
         context_mask = torch.zeros((num_entities, max_k), dtype=torch.bool)
 
-        if algorithm == 'mmr_neighbor':
-            # 1-Hop Neighbor + MMR
-            # Solves "Echo Chamber" by enforcing diversity among context nodes
-            embeddings = self._compute_embeddings(batch_size) # Keep on CPU RAM mostly
-            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-            
-            print("Running MMR selection on neighbors...")
-            for i in tqdm(range(num_entities), desc="MMR Selection"):
-                eid = i
-                neighbors = adj.get(eid, [])  # list[(r, t)]
+        for i in tqdm(range(num_entities), desc="Random context"):
+            neighbors = adj.get(i, [])  # list[(r, t)]
+            if not neighbors:
+                continue
 
-                # If no real neighbors, keep this row fully masked.
-                if not neighbors:
-                    continue
+            neighbor_rel_ids = torch.tensor([r for r, _ in neighbors], dtype=torch.long)
+            neighbor_ent_ids = torch.tensor([t for _, t in neighbors], dtype=torch.long)
 
-                neighbor_rel_ids = torch.tensor([r for r, _ in neighbors], dtype=torch.long)
-                neighbor_ent_ids = torch.tensor([t for _, t in neighbors], dtype=torch.long)
+            if use_all_neighbors:
+                selected_ent_ids = neighbor_ent_ids
+                selected_rel_ids = neighbor_rel_ids
+            elif len(neighbors) > limit:
+                sampled = torch.randperm(len(neighbors))[:limit]
+                selected_ent_ids = neighbor_ent_ids[sampled]
+                selected_rel_ids = neighbor_rel_ids[sampled]
+            else:
+                selected_ent_ids = neighbor_ent_ids
+                selected_rel_ids = neighbor_rel_ids
 
-                if use_all_neighbors:
-                    selected_ent_ids = neighbor_ent_ids
-                    selected_rel_ids = neighbor_rel_ids
-                elif len(neighbors) <= limit:
-                    selected_ent_ids = neighbor_ent_ids
-                    selected_rel_ids = neighbor_rel_ids
-                else:
-                    query_emb = embeddings[eid] # (H)
-                    cand_embs = embeddings[neighbor_ent_ids] # (Num_N, H)
-
-                    selected_local_indices = self._mmr(query_emb, cand_embs, limit, lambda_param=mmr_lambda)
-                    selected_local_indices = torch.tensor(selected_local_indices, dtype=torch.long)
-                    selected_ent_ids = neighbor_ent_ids[selected_local_indices]
-                    selected_rel_ids = neighbor_rel_ids[selected_local_indices]
-
-                count = min(selected_ent_ids.numel(), max_k)
-                if count > 0:
-                    context_entity_ids[i, :count] = selected_ent_ids[:count]
-                    context_relation_ids[i, :count] = selected_rel_ids[:count]
-                    context_mask[i, :count] = True
-
-        elif algorithm == 'random':
-            # Randomly sample only from each node's relation-aware neighbors.
-            print("Generating random neighbor context...")
-            for i in tqdm(range(num_entities)):
-                neighbors = adj.get(i, [])  # list[(r, t)]
-                if not neighbors:
-                    continue
-
-                neighbor_rel_ids = torch.tensor([r for r, _ in neighbors], dtype=torch.long)
-                neighbor_ent_ids = torch.tensor([t for _, t in neighbors], dtype=torch.long)
-
-                if use_all_neighbors:
-                    selected_ent_ids = neighbor_ent_ids
-                    selected_rel_ids = neighbor_rel_ids
-                elif len(neighbors) >= limit:
-                    sampled = torch.randperm(len(neighbors))[:limit]
-                    selected_ent_ids = neighbor_ent_ids[sampled]
-                    selected_rel_ids = neighbor_rel_ids[sampled]
-                else:
-                    selected_ent_ids = neighbor_ent_ids
-                    selected_rel_ids = neighbor_rel_ids
-
-                count = min(selected_ent_ids.numel(), max_k)
-                if count > 0:
-                    context_entity_ids[i, :count] = selected_ent_ids[:count]
-                    context_relation_ids[i, :count] = selected_rel_ids[:count]
-                    context_mask[i, :count] = True
-                 
-        else:
-            raise ValueError(f"Unknown algorithm: {algorithm}. Supported: mmr_neighbor, random")
+            count = min(selected_ent_ids.numel(), max_k)
+            if count > 0:
+                context_entity_ids[i, :count] = selected_ent_ids[:count]
+                context_relation_ids[i, :count] = selected_rel_ids[:count]
+                context_mask[i, :count] = True
 
         # Save one compact artifact.
         output_file = os.path.join(self.data_dir, 'context_neighbors.pt')
@@ -214,14 +123,13 @@ class ContextProcessor:
                 'mask': context_mask,
                 'pad_value': pad_value,
                 'k_requested': limit,
-                'k_effective': max_k,
-                'algorithm': algorithm,
+                'k_effective': max_k
             },
             output_file,
         )
 
         print(f"Context neighbors saved to {output_file}")
-        print(f"  pad_value={pad_value}, k_effective={max_k}, algorithm={algorithm}")
+        print(f"  pad_value={pad_value}, k_effective={max_k}, algorithm=random")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -231,25 +139,6 @@ if __name__ == '__main__':
         type=int,
         default=10,
         help='Max number of context neighbors per entity. Use k<=0 to keep all real neighbors (variable count).',
-    )
-    parser.add_argument(
-        '--algorithm',
-        type=str,
-        default='mmr_neighbor',
-        choices=['mmr_neighbor', 'random'],
-        help='Algorithm for neighbor selection'
-    )
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=32,
-        help='Batch size for similarity computation'
-    )
-    parser.add_argument(
-        '--mmr_lambda',
-        type=float,
-        default=0.5,
-        help='Lambda for MMR (0.5 balances relevance and diversity)'
     )
     parser.add_argument(
         '--device',
@@ -268,9 +157,4 @@ if __name__ == '__main__':
     seed_everything(args.seed)
     
     processor = ContextProcessor(args.data_dir, device=args.device)
-    processor.compute_context_nodes(
-        k=args.k,
-        algorithm=args.algorithm,
-        batch_size=args.batch_size,
-        mmr_lambda=args.mmr_lambda
-    )
+    processor.compute_context_nodes(k=args.k)

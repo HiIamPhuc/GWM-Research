@@ -29,12 +29,11 @@ alpha_target: 0.8
 alpha_prior_weight: 0.3
 alpha_entropy_weight: 0.1
 alpha_entropy_min: 0.5
-# Self-Adversarial Margin Loss for the structural path
-struct_margin: 9.0
-struct_adv_temperature: 1.0
 
-# EMA decay for loss-scale normalisation across heterogeneous losses
-loss_ema_decay: 0.99
+struct_margin: 6.0
+struct_adv_temperature: 2.0
+loss_ema_decay: 0.95
+
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr
     

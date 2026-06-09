@@ -97,6 +97,7 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
+            'architecture': 'early_fusion_v1',
             'epoch': epoch,
             'best_mrr': best_mrr,
             'model_state_dict': model.state_dict(),
@@ -273,12 +274,6 @@ def train(args):
         _sync_device(device)
         model.train()
         total_loss = 0
-        total_alpha_prior = 0.0
-        total_alpha_entropy_reg = 0.0
-        alpha_aux_batches = 0
-
-        if hasattr(model, 'reset_alpha_stats'):
-            model.reset_alpha_stats()
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
@@ -291,12 +286,12 @@ def train(args):
             # Forward: Query Vector (from head, relation, context)
             query_vector = model(h_batch, r_batch, context_batch)
             
-            # Forward: Target Vector (Symmetric Fused Tail)
+            # Forward: Target Vector
             t_fused = model.encode_target(t_batch)
 
             optimizer.zero_grad()
 
-            loss_text, loss_struct, loss, _, _, alpha_prior, alpha_entropy_reg = model.compute_loss(
+            loss, _ = model.compute_loss(
                 query_vector,
                 t_fused,
                 target_ids=t_batch['id'],
@@ -313,38 +308,19 @@ def train(args):
             scheduler.step()
 
             total_loss += loss.item()
-            total_alpha_prior += alpha_prior.item()
-            total_alpha_entropy_reg += alpha_entropy_reg.item()
-            alpha_aux_batches += 1
             pbar.set_postfix({'loss': loss.item()})
 
         _sync_device(device)
         epoch_train_seconds = time.perf_counter() - epoch_start_time
-        train_examples = len(train_loader) * int(config.batch_size)
-        examples_per_second = train_examples / max(epoch_train_seconds, 1e-8)
             
         avg_train_loss = total_loss / len(train_loader)
-        train_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
-        avg_alpha_prior = total_alpha_prior / alpha_aux_batches if alpha_aux_batches > 0 else 0.0
-        avg_alpha_entropy_reg = total_alpha_entropy_reg / alpha_aux_batches if alpha_aux_batches > 0 else 0.0
 
-        print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
-        print(
-            f"Epoch {epoch+1} Train Time: {epoch_train_seconds:.2f}s | "
-            f"Throughput: {examples_per_second:.2f} examples/s"
-        )
-        if train_alpha is not None:
-            print(f"Epoch {epoch+1} Train Alpha (text weight): {train_alpha:.4f}")
-        print(f"Epoch {epoch+1} Train Alpha Prior Reg: {avg_alpha_prior:.6f}")
-        print(f"Epoch {epoch+1} Train Alpha Entropy Reg: {avg_alpha_entropy_reg:.6f}")
+        print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | Train Time: {epoch_train_seconds:.2f}s")
         
         # Validation
         eval_every = getattr(config, 'eval_every', 1)
         if valid_loader and (epoch + 1) % eval_every == 0:
             model.eval()
-
-            if hasattr(model, 'reset_alpha_stats'):
-                model.reset_alpha_stats()
 
             all_entity_embeddings = encode_all_entities_as_targets(
                 model=model,
@@ -352,14 +328,14 @@ def train(args):
                 device=device,
             )
 
-            save_eval_predictions = bool(getattr(config, 'save_eval_predictions', False))
-            eval_topk = int(getattr(config, 'eval_topk', 50))
-            predictions_dir = getattr(config, 'eval_predictions_dir', None)
-            predictions_path = None
-            if save_eval_predictions:
-                if predictions_dir is None:
-                    predictions_dir = os.path.join(config.output_dir, 'predictions')
-                predictions_path = os.path.join(predictions_dir, f'val_epoch_{epoch + 1}.jsonl')
+            # save_eval_predictions = bool(getattr(config, 'save_eval_predictions', False))
+            # eval_topk = int(getattr(config, 'eval_topk', 50))
+            # predictions_dir = getattr(config, 'eval_predictions_dir', None)
+            # predictions_path = None
+            # if save_eval_predictions:
+            #     if predictions_dir is None:
+            #         predictions_dir = os.path.join(config.output_dir, 'predictions')
+            #     predictions_path = os.path.join(predictions_dir, f'val_epoch_{epoch + 1}.jsonl')
 
             val_metrics = compute_filtered_ranking_metrics(
                 model=model,
@@ -368,8 +344,8 @@ def train(args):
                 hr_map=hr_map,
                 device=device,
                 desc="Validation",
-                save_predictions_path=predictions_path,
-                topk=eval_topk,
+                # save_predictions_path=predictions_path,
+                # topk=eval_topk,
             )
 
             val_mrr = val_metrics['MRR']
@@ -377,15 +353,12 @@ def train(args):
             val_h3 = val_metrics['Hits@3']
             val_h10 = val_metrics['Hits@10']
             val_mr = val_metrics['MR']
-            val_alpha = model.get_alpha_mean(reset=True) if hasattr(model, 'get_alpha_mean') else None
             
             print(
                 f"Epoch {epoch+1} Val | "
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
                 f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
             )
-            if val_alpha is not None:
-                print(f"Epoch {epoch+1} Val Alpha (text weight): {val_alpha:.4f}")
             
             # Log metrics
             epoch_log = {
@@ -397,12 +370,6 @@ def train(args):
                 'val_hits3': val_h3,
                 'val_hits10': val_h10
             }
-            if train_alpha is not None:
-                epoch_log['train_alpha'] = train_alpha
-            epoch_log['train_alpha_prior_reg'] = avg_alpha_prior
-            epoch_log['train_alpha_entropy_reg'] = avg_alpha_entropy_reg
-            if val_alpha is not None:
-                epoch_log['val_alpha'] = val_alpha
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                 json.dump(history, f, indent=2)
@@ -434,10 +401,6 @@ def train(args):
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss
             }
-            if train_alpha is not None:
-                epoch_log['train_alpha'] = train_alpha
-            epoch_log['train_alpha_prior_reg'] = avg_alpha_prior
-            epoch_log['train_alpha_entropy_reg'] = avg_alpha_entropy_reg
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                   json.dump(history, f, indent=2)

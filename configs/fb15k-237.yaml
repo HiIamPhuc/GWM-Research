@@ -1,6 +1,7 @@
 # Config for context-aware GWM with precomputed text embeddings
 text_emb_dim: 768
 struct_emb_dim: 896
+fusion_dim: 1024
 
 text_adapter_dim: 768
 struct_adapter_dim: 896
@@ -24,12 +25,6 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
-text_aux_weight: 0.25
-struct_aux_weight: 0.25
-alpha_target: 0.3
-alpha_prior_weight: 0.3
-alpha_entropy_weight: 0.1
-alpha_entropy_min: 0.5
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

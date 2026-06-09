@@ -11,7 +11,7 @@ class CompGCN(nn.Module):
         self.hidden_dim = hidden_dim
         self.lin_self = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.lin_msg = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.lin_out = nn.Linear(hidden_dim, hidden_dim)
+        self.lin_out = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -75,6 +75,29 @@ class DynamicsMixer(nn.Module):
         return self.mixer(torch.cat([head_emb, relation_emb], dim=-1))
 
 
+class GatedFusion(nn.Module):
+    """Project two modalities into one space and combine them feature-wise."""
+
+    def __init__(self, text_dim, struct_dim, fusion_dim, dropout=0.0):
+        super().__init__()
+        self.text_projection = nn.Linear(text_dim, fusion_dim)
+        self.struct_projection = nn.Linear(struct_dim, fusion_dim)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(fusion_dim * 2),
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.Sigmoid(),
+        )
+        self.output_norm = nn.LayerNorm(fusion_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, text_features, struct_features):
+        text_projected = self.text_projection(text_features)
+        struct_projected = self.struct_projection(struct_features)
+        gate = self.gate(torch.cat([text_projected, struct_projected], dim=-1))
+        fused = gate * text_projected + (1.0 - gate) * struct_projected
+        return self.output_norm(self.dropout(fused)), gate
+
+
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -92,25 +115,6 @@ class GWM(nn.Module):
             dropout=self.adapter_dropout
             )
 
-        self.text_compgcn = CompGCN(hidden_dim=self.text_emb_dim, dropout=self.dropout)
-
-        self.text_h0_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
-        self.text_c0_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
-
-        self.text_dynamics_mixer = DynamicsMixer(self.text_emb_dim, dropout=self.dropout)
-
-        dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
-
-        self.text_lstm = nn.LSTM(
-            input_size=self.text_emb_dim,
-            hidden_size=self.text_emb_dim,
-            num_layers=dynamics_layers,
-            batch_first=True,
-            dropout=self.dropout if dynamics_layers > 1 else 0.0,
-        )
-
-        self.text_output_projection = nn.Linear(self.text_emb_dim, self.text_emb_dim)
-
         # 2. Structural Components (Entity/Relation Embeddings)
         self.struct_emb_dim = int(getattr(config, 'struct_emb_dim'))
         self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
@@ -122,40 +126,50 @@ class GWM(nn.Module):
             dropout=self.adapter_dropout
             )
 
-        self.struct_compgcn = CompGCN(hidden_dim=self.struct_emb_dim, dropout=self.dropout)
+        # 3. Early Fusion and Shared Dynamics
+        self.fusion_dim = int(getattr(config, 'fusion_dim'))
+        if self.fusion_dim <= 0:
+            raise ValueError("fusion_dim must be a positive integer.")
+        self.entity_fusion = GatedFusion(
+            self.text_emb_dim,
+            self.struct_emb_dim,
+            self.fusion_dim,
+            dropout=self.dropout,
+        )
+        self.relation_fusion = GatedFusion(
+            self.text_emb_dim,
+            self.struct_emb_dim,
+            self.fusion_dim,
+            dropout=self.dropout,
+        )
 
-        self.struct_h0_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
-        self.struct_c0_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
+        self.fused_compgcn = CompGCN(
+            hidden_dim=self.fusion_dim,
+            dropout=self.dropout,
+        )
+        self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
+        self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
+        self.fused_dynamics_mixer = DynamicsMixer(
+            self.fusion_dim,
+            dropout=self.dropout,
+        )
 
-        self.struct_dynamics_mixer = DynamicsMixer(self.struct_emb_dim, dropout=self.dropout)
-        
-        self.struct_lstm = nn.LSTM(
-            input_size=self.struct_emb_dim, 
-            hidden_size=self.struct_emb_dim,
+        dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
+        self.fused_lstm = nn.LSTM(
+            input_size=self.fusion_dim,
+            hidden_size=self.fusion_dim,
             num_layers=dynamics_layers,
             batch_first=True,
             dropout=self.dropout if dynamics_layers > 1 else 0.0,
         )
-
-        self.struct_output_projection = nn.Linear(self.struct_emb_dim, self.struct_emb_dim)
-
-        self.alpha_mlp = nn.Sequential(
-            nn.Linear(self.text_emb_dim + self.struct_emb_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid(),
+        self.fused_output_projection = nn.Linear(
+            self.fusion_dim,
+            self.fusion_dim,
         )
-        self._alpha_sum = 0.0
-        self._alpha_count = 0
-        
-        self.alpha_target = float(getattr(config, 'alpha_target', 0.5))
-        self.alpha_prior_weight = float(getattr(config, 'alpha_prior_weight', 0.0))
-        self.alpha_entropy_weight = float(getattr(config, 'alpha_entropy_weight', 0.0))
-        self.alpha_entropy_min = float(getattr(config, 'alpha_entropy_min', 0.0))
-        self.text_aux_weight = float(getattr(config, 'text_aux_weight', 0.25))
-        self.struct_aux_weight = float(getattr(config, 'struct_aux_weight', 0.25))
 
         self.temperature = float(getattr(config, 'temperature'))
+        if self.temperature <= 0.0:
+            raise ValueError("temperature must be positive.")
 
     def _prepare_context_batch(self, context_batch):
         context_entity_ids = context_batch['id']
@@ -199,7 +213,7 @@ class GWM(nn.Module):
         mixed_step = mixer(head_emb, relation_emb).unsqueeze(1)
 
         # Run LSTM over the sequence
-        lstm_out, (h_n, c_n) = lstm(mixed_step, (h_0_lstm, c_0_lstm))
+        _, (h_n, _) = lstm(mixed_step, (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
         return query_vector
 
@@ -276,27 +290,6 @@ class GWM(nn.Module):
             entity_table.weight.requires_grad = False
             relation_table.weight.requires_grad = False
 
-    def reset_alpha_stats(self):
-        self._alpha_sum = 0.0
-        self._alpha_count = 0
-
-    def _record_alpha(self, alpha):
-        self._alpha_sum += alpha.detach().sum().item()
-        self._alpha_count += alpha.numel()
-
-    def get_alpha_mean(self, reset=False):
-        if self._alpha_count == 0:
-            return None
-        mean = self._alpha_sum / self._alpha_count
-        if reset:
-            self.reset_alpha_stats()
-        return mean
-
-    def _alpha_entropy(self, alpha):
-        alpha = alpha.clamp(1e-6, 1.0 - 1e-6)
-        entropy = -(alpha * alpha.log() + (1.0 - alpha) * (1.0 - alpha).log())
-        return entropy.mean()
-
     @staticmethod
     def _multi_positive_contrastive_loss(scores, target_ids=None):
         batch_size = scores.size(0)
@@ -323,97 +316,49 @@ class GWM(nn.Module):
         r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
         h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
         r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
+        h_fused, _ = self.entity_fusion(h_text, h_struct)
+        r_fused, _ = self.relation_fusion(r_text, r_struct)
 
         flat_context_entity_ids, flat_context_relation_ids, context_batch_index = self._prepare_context_batch(context_batch)
         ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
         ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
         ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
         ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
+        ctx_ent_fused, _ = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
+        ctx_rel_fused, _ = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
 
-        # -- Text Pathway --
-        world_state_text = self.text_compgcn(
-            head_feat=h_text,
-            nbr_entity_feat=ctx_ent_text,
-            nbr_relation_feat=ctx_rel_text,
+        world_state = self.fused_compgcn(
+            head_feat=h_fused,
+            nbr_entity_feat=ctx_ent_fused,
+            nbr_relation_feat=ctx_rel_fused,
             nbr_batch_index=context_batch_index,
         )
-
-        query_text = self._run_dynamics(
-            world_state_text, h_text, r_text,
-            self.text_dynamics_mixer, self.text_lstm, self.text_h0_projection, self.text_c0_projection
+        query = self._run_dynamics(
+            world_state,
+            h_fused,
+            r_fused,
+            self.fused_dynamics_mixer,
+            self.fused_lstm,
+            self.fused_h0_projection,
+            self.fused_c0_projection,
         )
-
-        query_text = self.text_output_projection(query_text)
-        query_text = F.normalize(query_text, p=2, dim=1)
-
-        # -- Struct Pathway --
-        world_state_struct = self.struct_compgcn(
-            head_feat=h_struct,
-            nbr_entity_feat=ctx_ent_struct,
-            nbr_relation_feat=ctx_rel_struct,
-            nbr_batch_index=context_batch_index,
-        )
-    
-        query_struct = self._run_dynamics(
-            world_state_struct, h_struct, r_struct,
-            self.struct_dynamics_mixer, self.struct_lstm, self.struct_h0_projection, self.struct_c0_projection
-        )
-
-        query_struct = self.struct_output_projection(query_struct)
-        query_struct = F.normalize(query_struct, p=2, dim=1)
-
-        return query_text, query_struct, r_text, r_struct
+        return F.normalize(self.fused_output_projection(query), p=2, dim=1)
 
     def encode_target(self, t_batch):
         t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
         t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
-        
-        t_text = F.normalize(self.text_output_projection(t_text), p=2, dim=1)
-        t_struct = F.normalize(self.struct_output_projection(t_struct), p=2, dim=1)
-        return t_text, t_struct
+        t_fused, _ = self.entity_fusion(t_text, t_struct)
+        return F.normalize(
+            self.fused_output_projection(t_fused),
+            p=2,
+            dim=1,
+        )
 
     def compute_loss(self, query_vectors, target_vectors, target_ids=None):
-        query_text, query_struct, relation_text, relation_struct = query_vectors
-        target_text, target_struct = target_vectors
-
-        scores_text = torch.mm(query_text, target_text.t())
-        scores_struct = torch.mm(query_struct, target_struct.t())
-        scores_text = scores_text / self.temperature
-        scores_struct = scores_struct / self.temperature
-
-        head_combined = torch.cat([relation_text, relation_struct], dim=-1)
-        alpha = self.alpha_mlp(head_combined)
-        scores_fused = alpha * scores_text + (1.0 - alpha) * scores_struct
-        self._record_alpha(alpha)
-
-        loss_fused_per_sample = self._multi_positive_contrastive_loss(
-            scores_fused, target_ids
-        )
-        loss_text_per_sample = self._multi_positive_contrastive_loss(
-            scores_text, target_ids
-        )
-        loss_struct_per_sample = self._multi_positive_contrastive_loss(
-            scores_struct, target_ids
-        )
-
-        loss_text = loss_text_per_sample.mean()
-        loss_struct = loss_struct_per_sample.mean()
-        loss_fused = loss_fused_per_sample.mean()
-
-        alpha_mean = alpha.mean()
-        alpha_prior = (alpha_mean - self.alpha_target).pow(2)
-
-        alpha_entropy = self._alpha_entropy(alpha)
-        alpha_entropy_floor = alpha.new_tensor(self.alpha_entropy_min)
-        alpha_entropy_reg = torch.relu(alpha_entropy_floor - alpha_entropy)
-
-        loss = (
-            loss_fused
-            + self.text_aux_weight * loss_text
-            + self.struct_aux_weight * loss_struct
-            + self.alpha_prior_weight * alpha_prior
-            + self.alpha_entropy_weight * alpha_entropy_reg
-        )
-
-        return loss_text, loss_struct, loss, scores_fused, alpha, alpha_prior, alpha_entropy_reg
+        scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
+        loss = self._multi_positive_contrastive_loss(
+            scores,
+            target_ids,
+        ).mean()
+        return loss, scores
 

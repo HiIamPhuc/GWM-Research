@@ -3,17 +3,63 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class CompGCN(nn.Module):
-    """A lightweight CompGCN for head-centric aggregation."""
+class ContextAggregator(nn.Module):
+    """Pool relation-composed facts, add the head residual, and normalize."""
 
-    def __init__(self, hidden_dim, dropout=0.0):
+    SUPPORTED_REDUCTIONS = {'mean', 'max'}
+
+    def __init__(self, hidden_dim, reduction='mean'):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.lin_self = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.lin_msg = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.lin_out = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.reduction = str(reduction).lower()
+        if self.reduction not in self.SUPPORTED_REDUCTIONS:
+            supported = ', '.join(sorted(self.SUPPORTED_REDUCTIONS))
+            raise ValueError(
+                f"Unsupported context aggregation '{reduction}'. "
+                f"Expected one of: {supported}."
+            )
+
         self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
+
+    def _aggregate(self, messages, batch_index, batch_size, reference):
+        aggregated = torch.zeros_like(reference)
+        if messages.numel() == 0:
+            return aggregated
+
+        if self.reduction == 'mean':
+            aggregated.index_add_(0, batch_index, messages)
+            counts = torch.zeros(
+                batch_size,
+                1,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            counts.index_add_(
+                0,
+                batch_index,
+                torch.ones(
+                    messages.size(0),
+                    1,
+                    device=reference.device,
+                    dtype=reference.dtype,
+                ),
+            )
+            return aggregated / counts.clamp_min(1.0)
+
+        aggregated.fill_(float('-inf'))
+        expanded_index = batch_index.unsqueeze(-1).expand_as(messages)
+        aggregated.scatter_reduce_(
+            0,
+            expanded_index,
+            messages,
+            reduce='amax',
+            include_self=True,
+        )
+        return torch.where(
+            torch.isfinite(aggregated),
+            aggregated,
+            torch.zeros_like(aggregated),
+        )
 
     def forward(self, head_feat, nbr_entity_feat, nbr_relation_feat, nbr_batch_index):
         """
@@ -22,24 +68,30 @@ class CompGCN(nn.Module):
         nbr_relation_feat: (E, H)
         nbr_batch_index: (E,) long, edge -> head index in batch
         """
-        B = head_feat.size(0)
-        composed = nbr_entity_feat * nbr_relation_feat  # (E, H)
-        msg = self.lin_msg(composed)  # (E, H)
+        if nbr_entity_feat.shape != nbr_relation_feat.shape:
+            raise ValueError(
+                "Context entity and relation features must have identical shapes."
+            )
+        if nbr_batch_index.dim() != 1:
+            raise ValueError("Context batch indices must be one-dimensional.")
+        if nbr_batch_index.numel() != nbr_entity_feat.size(0):
+            raise ValueError(
+                "Each context fact must have one corresponding batch index."
+            )
+        if nbr_batch_index.numel() and (
+            nbr_batch_index.min() < 0
+            or nbr_batch_index.max() >= head_feat.size(0)
+        ):
+            raise ValueError("Context batch index is outside the current batch.")
 
-        agg = torch.zeros_like(head_feat)
-        if msg.numel() > 0:
-            agg.index_add_(0, nbr_batch_index, msg)
-
-        denom = torch.zeros(B, 1, device=head_feat.device, dtype=head_feat.dtype)
-        if msg.numel() > 0:
-            ones = torch.ones(msg.size(0), 1, device=head_feat.device, dtype=head_feat.dtype)
-            denom.index_add_(0, nbr_batch_index, ones)
-        denom = denom.clamp(min=1.0)
-        agg = agg / denom
-
-        self_state = self.lin_self(head_feat)
-        neighbor_delta = self.dropout(self.lin_out(agg))
-        return self.norm(self_state + neighbor_delta)
+        composed_facts = nbr_entity_feat * nbr_relation_feat
+        agg = self._aggregate(
+            composed_facts,
+            nbr_batch_index,
+            head_feat.size(0),
+            head_feat,
+        )
+        return self.norm(head_feat + agg)
 
 
 class MLPAdapter(nn.Module):
@@ -128,8 +180,6 @@ class GWM(nn.Module):
 
         # 3. Early Fusion and Shared Dynamics
         self.fusion_dim = int(getattr(config, 'fusion_dim'))
-        if self.fusion_dim <= 0:
-            raise ValueError("fusion_dim must be a positive integer.")
         self.entity_fusion = GatedFusion(
             self.text_emb_dim,
             self.struct_emb_dim,
@@ -143,9 +193,10 @@ class GWM(nn.Module):
             dropout=self.dropout,
         )
 
-        self.fused_compgcn = CompGCN(
+        self.context_agg = str(getattr(config, 'context_agg', 'mean')).lower()
+        self.fused_context_aggregator = ContextAggregator(
             hidden_dim=self.fusion_dim,
-            dropout=self.dropout,
+            reduction=self.context_agg,
         )
         self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
@@ -168,9 +219,7 @@ class GWM(nn.Module):
         )
 
         self.temperature = float(getattr(config, 'temperature'))
-        if self.temperature <= 0.0:
-            raise ValueError("temperature must be positive.")
-
+        
     def _prepare_context_batch(self, context_batch):
         context_entity_ids = context_batch['id']
         context_relation_ids = context_batch.get('rel_id')
@@ -198,7 +247,7 @@ class GWM(nn.Module):
         """
         Run recurrent dynamics over a sequence of steps.
 
-        world_state: (B, compgcn_dim) used to initialise h0/c0
+        world_state: (B, fusion_dim) used to initialise h0/c0
         head_emb: (B, D) head embedding for this path
         relation_emb: (B, D_rel) relation embedding for this path
         """
@@ -328,7 +377,7 @@ class GWM(nn.Module):
         ctx_ent_fused, _ = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
         ctx_rel_fused, _ = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
 
-        world_state = self.fused_compgcn(
+        world_state = self.fused_context_aggregator(
             head_feat=h_fused,
             nbr_entity_feat=ctx_ent_fused,
             nbr_relation_feat=ctx_rel_fused,
@@ -362,4 +411,3 @@ class GWM(nn.Module):
             target_ids,
         ).mean()
         return loss, scores
-

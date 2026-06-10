@@ -214,7 +214,7 @@ class GWM(nn.Module):
         # mixed_step = mixer(head_emb, relation_emb).unsqueeze(1)
 
         # Run LSTM over the sequence
-        _, (h_n, _) = lstm(torch.cat([head_emb, relation_emb], dim=-1).unsqueeze(1), (h_0_lstm, c_0_lstm))
+        _, (h_n, _) = lstm(torch.stack([head_emb, relation_emb], dim=1), (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
         return query_vector
 

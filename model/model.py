@@ -61,18 +61,18 @@ class MLPAdapter(nn.Module):
         return residual + x
 
 
-class DynamicsMixer(nn.Module):
-    def __init__(self, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.mixer = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Dropout(dropout)
-        )
+# class DynamicsMixer(nn.Module):
+#     def __init__(self, hidden_dim, dropout=0.0):
+#         super().__init__()
+#         self.mixer = nn.Sequential(
+#             nn.Linear(hidden_dim * 2, hidden_dim * 2),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim * 2, hidden_dim),
+#             nn.Dropout(dropout)
+#         )
 
-    def forward(self, head_emb, relation_emb):
-        return self.mixer(torch.cat([head_emb, relation_emb], dim=-1))
+#     def forward(self, head_emb, relation_emb):
+#         return self.mixer(torch.cat([head_emb, relation_emb], dim=-1))
 
 
 class GatedFusion(nn.Module):
@@ -149,10 +149,10 @@ class GWM(nn.Module):
         )
         self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
-        self.fused_dynamics_mixer = DynamicsMixer(
-            self.fusion_dim,
-            dropout=self.dropout,
-        )
+        # self.fused_dynamics_mixer = DynamicsMixer(
+        #     self.fusion_dim,
+        #     dropout=self.dropout,
+        # )
 
         dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
         self.fused_lstm = nn.LSTM(
@@ -193,7 +193,8 @@ class GWM(nn.Module):
             raise ValueError("Ragged context tensors must have equal lengths.")
         return context_entity_ids, context_relation_ids, context_batch_index
 
-    def _run_dynamics(self, world_state, head_emb, relation_emb, mixer, lstm, h0_proj, c0_proj):
+    # def _run_dynamics(self, world_state, head_emb, relation_emb, mixer, lstm, h0_proj, c0_proj):
+    def _run_dynamics(self, world_state, head_emb, relation_emb, lstm, h0_proj, c0_proj):
         """
         Run recurrent dynamics over a sequence of steps.
 
@@ -210,10 +211,10 @@ class GWM(nn.Module):
         c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
 
         # Relation-conditioned dynamics mixer on the step inputs
-        mixed_step = mixer(head_emb, relation_emb).unsqueeze(1)
+        # mixed_step = mixer(head_emb, relation_emb).unsqueeze(1)
 
         # Run LSTM over the sequence
-        _, (h_n, _) = lstm(mixed_step, (h_0_lstm, c_0_lstm))
+        _, (h_n, _) = lstm(torch.cat([head_emb, relation_emb], dim=-1).unsqueeze(1), (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
         return query_vector
 
@@ -337,7 +338,7 @@ class GWM(nn.Module):
             world_state,
             h_fused,
             r_fused,
-            self.fused_dynamics_mixer,
+            # self.fused_dynamics_mixer,
             self.fused_lstm,
             self.fused_h0_projection,
             self.fused_c0_projection,

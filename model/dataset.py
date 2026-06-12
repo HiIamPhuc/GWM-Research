@@ -3,6 +3,69 @@ from torch.utils.data import Dataset
 import json
 import os
 
+
+class TrainPositiveIndex:
+    """Build query-aware in-batch positive masks from training triples only."""
+
+    def __init__(self, train_triples):
+        train_triples = torch.as_tensor(train_triples, dtype=torch.long)
+        if train_triples.dim() != 2 or train_triples.size(1) != 3:
+            raise ValueError(
+                "Training triples must have shape (N, 3) to build positives."
+            )
+
+        self.query_tails = {}
+        for h, r, t in train_triples.tolist():
+            self.query_tails.setdefault((h, r), set()).add(t)
+
+    def build_in_batch_mask(
+        self,
+        head_ids,
+        relation_ids,
+        candidate_tail_ids,
+        device=None,
+    ):
+        head_ids = torch.as_tensor(head_ids, dtype=torch.long).reshape(-1).cpu()
+        relation_ids = torch.as_tensor(
+            relation_ids, dtype=torch.long
+        ).reshape(-1).cpu()
+        candidate_tail_ids = torch.as_tensor(
+            candidate_tail_ids, dtype=torch.long
+        ).reshape(-1).cpu()
+
+        batch_size = head_ids.numel()
+        if relation_ids.numel() != batch_size:
+            raise ValueError(
+                "head_ids and relation_ids must contain the same number of rows."
+            )
+        if candidate_tail_ids.numel() != batch_size:
+            raise ValueError(
+                "In-batch loss requires one candidate tail per query row."
+            )
+
+        candidate_columns = {}
+        for column, tail_id in enumerate(candidate_tail_ids.tolist()):
+            candidate_columns.setdefault(tail_id, []).append(column)
+
+        positive_mask = torch.zeros(
+            batch_size, batch_size, dtype=torch.bool
+        )
+        for row, (head_id, relation_id) in enumerate(
+            zip(head_ids.tolist(), relation_ids.tolist())
+        ):
+            for tail_id in self.query_tails.get((head_id, relation_id), ()):
+                columns = candidate_columns.get(tail_id)
+                if columns:
+                    positive_mask[row, columns] = True
+
+        # Every sampled training triple must remain a positive, even if an
+        # externally supplied training tensor is incomplete or malformed.
+        positive_mask.fill_diagonal_(True)
+        if device is not None:
+            positive_mask = positive_mask.to(device)
+        return positive_mask
+
+
 class GWMDataset(Dataset):
     def __init__(self, data_dir, split='train'):
         """

@@ -113,20 +113,6 @@ class MLPAdapter(nn.Module):
         return residual + x
 
 
-# class DynamicsMixer(nn.Module):
-#     def __init__(self, hidden_dim, dropout=0.0):
-#         super().__init__()
-#         self.mixer = nn.Sequential(
-#             nn.Linear(hidden_dim * 2, hidden_dim * 2),
-#             nn.GELU(),
-#             nn.Linear(hidden_dim * 2, hidden_dim),
-#             nn.Dropout(dropout)
-#         )
-
-#     def forward(self, head_emb, relation_emb):
-#         return self.mixer(torch.cat([head_emb, relation_emb], dim=-1))
-
-
 class GatedFusion(nn.Module):
     """Project two modalities into one space and combine them feature-wise."""
 
@@ -145,10 +131,12 @@ class GatedFusion(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, text_features, struct_features):
-        text_features = self.text_layer_norm(text_features)
-        struct_features = self.struct_layer_norm(struct_features)
-        text_projected = self.text_projection(text_features)
-        struct_projected = self.struct_projection(struct_features)
+        text_projected = self.text_projection(
+            self.text_layer_norm(text_features)
+        )
+        struct_projected = self.struct_projection(
+            self.struct_layer_norm(struct_features)
+        )
         gate = self.gate(torch.cat([text_projected, struct_projected], dim=-1))
         fused = gate * text_projected + (1.0 - gate) * struct_projected
         return self.output_norm(self.dropout(fused)), gate
@@ -166,21 +154,21 @@ class GWM(nn.Module):
         self.text_ent_embs = nn.Embedding(config.num_entities, self.text_emb_dim)
         self.text_rel_embs = nn.Embedding(config.num_relations, self.text_emb_dim)
 
-        # self.text_adapter = MLPAdapter(self.text_emb_dim,
-        #     int(getattr(config, 'text_adapter_dim')),
-        #     dropout=self.adapter_dropout
-        #     )
+        self.text_adapter = MLPAdapter(self.text_emb_dim,
+            int(getattr(config, 'text_adapter_dim')),
+            dropout=self.adapter_dropout
+            )
 
         # 2. Structural Components (Entity/Relation Embeddings)
         self.struct_emb_dim = int(getattr(config, 'struct_emb_dim'))
         self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
         self.struct_rel_embs = nn.Embedding(config.num_relations, self.struct_emb_dim)
 
-        # self.struct_adapter = MLPAdapter(
-        #     self.struct_emb_dim, 
-        #     int(getattr(config, 'struct_adapter_dim')),
-        #     dropout=self.adapter_dropout
-        #     )
+        self.struct_adapter = MLPAdapter(
+            self.struct_emb_dim, 
+            int(getattr(config, 'struct_adapter_dim')),
+            dropout=self.adapter_dropout
+            )
 
         # 3. Early Fusion and Shared Dynamics
         self.fusion_dim = int(getattr(config, 'fusion_dim'))
@@ -204,10 +192,6 @@ class GWM(nn.Module):
         )
         self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
-        # self.fused_dynamics_mixer = DynamicsMixer(
-        #     self.fusion_dim,
-        #     dropout=self.dropout,
-        # )
 
         dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
         self.fused_lstm = nn.LSTM(
@@ -262,9 +246,6 @@ class GWM(nn.Module):
         num_layers = lstm.num_layers
         h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
         c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
-
-        # Relation-conditioned dynamics mixer on the step inputs
-        # mixed_step = mixer(head_emb, relation_emb).unsqueeze(1)
 
         # Run LSTM over the sequence
         _, (h_n, _) = lstm(torch.stack([head_emb, relation_emb], dim=1), (h_0_lstm, c_0_lstm))
@@ -345,9 +326,26 @@ class GWM(nn.Module):
             relation_table.weight.requires_grad = False
 
     @staticmethod
-    def _multi_positive_contrastive_loss(scores, target_ids=None):
+    def _multi_positive_contrastive_loss(
+        scores,
+        positive_mask=None,
+        target_ids=None,
+    ):
         batch_size = scores.size(0)
-        if target_ids is None:
+        if scores.dim() != 2 or scores.size(1) != batch_size:
+            raise ValueError(
+                "In-batch contrastive scores must have shape (B, B)."
+            )
+
+        if positive_mask is not None:
+            if positive_mask.shape != scores.shape:
+                raise ValueError(
+                    "positive_mask must have the same shape as scores."
+                )
+            positive_mask = positive_mask.to(
+                device=scores.device, dtype=torch.bool
+            )
+        elif target_ids is None:
             positive_mask = torch.eye(
                 batch_size, dtype=torch.bool, device=scores.device
             )
@@ -359,6 +357,9 @@ class GWM(nn.Module):
                 )
             positive_mask = target_ids[:, None].eq(target_ids[None, :])
 
+        if not positive_mask.any(dim=1).all():
+            raise ValueError("Every query row must contain at least one positive.")
+
         positive_scores = scores.masked_fill(~positive_mask, float('-inf'))
         return -(
             torch.logsumexp(positive_scores, dim=1)
@@ -366,26 +367,18 @@ class GWM(nn.Module):
         )
 
     def forward(self, h_batch, r_batch, context_batch):
-        # h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
-        # r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
-        # h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
-        # r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
-        h_text = self.text_ent_embs(h_batch['id'])
-        r_text = self.text_rel_embs(r_batch['id'])
-        h_struct = self.struct_ent_embs(h_batch['id'])
-        r_struct = self.struct_rel_embs(r_batch['id'])
+        h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
+        r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
+        h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
+        r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
         h_fused, _ = self.entity_fusion(h_text, h_struct)
         r_fused, _ = self.relation_fusion(r_text, r_struct)
 
         flat_context_entity_ids, flat_context_relation_ids, context_batch_index = self._prepare_context_batch(context_batch)
-        # ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
-        # ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
-        # ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
-        # ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
-        ctx_ent_text = self.text_ent_embs(flat_context_entity_ids)
-        ctx_rel_text = self.text_rel_embs(flat_context_relation_ids)
-        ctx_ent_struct = self.struct_ent_embs(flat_context_entity_ids)
-        ctx_rel_struct = self.struct_rel_embs(flat_context_relation_ids)
+        ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
+        ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
+        ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
+        ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
         ctx_ent_fused, _ = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
         ctx_rel_fused, _ = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
 
@@ -399,7 +392,6 @@ class GWM(nn.Module):
             world_state,
             h_fused,
             r_fused,
-            # self.fused_dynamics_mixer,
             self.fused_lstm,
             self.fused_h0_projection,
             self.fused_c0_projection,
@@ -407,10 +399,8 @@ class GWM(nn.Module):
         return F.normalize(self.fused_output_projection(query), p=2, dim=1)
 
     def encode_target(self, t_batch):
-        # t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
-        # t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
-        t_text = self.text_ent_embs(t_batch['id'])
-        t_struct = self.struct_ent_embs(t_batch['id'])
+        t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
+        t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
         t_fused, _ = self.entity_fusion(t_text, t_struct)
         return F.normalize(
             self.fused_output_projection(t_fused),
@@ -418,10 +408,17 @@ class GWM(nn.Module):
             dim=1,
         )
 
-    def compute_loss(self, query_vectors, target_vectors, target_ids=None):
+    def compute_loss(
+        self,
+        query_vectors,
+        target_vectors,
+        positive_mask=None,
+        target_ids=None,
+    ):
         scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
         loss = self._multi_positive_contrastive_loss(
             scores,
-            target_ids,
+            positive_mask=positive_mask,
+            target_ids=target_ids,
         ).mean()
         return loss, scores

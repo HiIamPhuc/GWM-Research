@@ -14,7 +14,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.model import GWM
-from model.dataset import GWMDataset, CollateFN
+from model.dataset import CollateFN, GWMDataset, TrainPositiveIndex
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
     build_entity_loader,
@@ -127,6 +127,7 @@ def train(args):
     # Load Dataset
     print(f"Loading data from {config.data_dir}...")
     train_dataset = GWMDataset(config.data_dir, split='train')
+    train_positive_index = TrainPositiveIndex(train_dataset.triples)
     
     # Infer input dimensions from dataset
     # e.g., number of entities/relations for embedding layers
@@ -189,6 +190,8 @@ def train(args):
         freeze=True,
     )
     print("Loaded structural embeddings into structural embedding tables...")
+
+    config.training_objective = 'query_aware_multi_positive_in_batch'
     
     # Save effective config (including inferred dimensions, CLI overrides, and model params).
     save_training_config(config, config.output_dir, args=args, model=model)
@@ -274,9 +277,25 @@ def train(args):
         _sync_device(device)
         model.train()
         total_loss = 0
+        total_positive_count = 0
+        total_query_rows = 0
+        multi_positive_query_rows = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
+            positive_mask = train_positive_index.build_in_batch_mask(
+                head_ids=batch['h_batch']['id'],
+                relation_ids=batch['r_batch']['id'],
+                candidate_tail_ids=batch['t_batch']['id'],
+                device=device,
+            )
+            positives_per_query = positive_mask.sum(dim=1)
+            total_positive_count += int(positives_per_query.sum().item())
+            total_query_rows += int(positives_per_query.numel())
+            multi_positive_query_rows += int(
+                (positives_per_query > 1).sum().item()
+            )
+
             # Move batch to device (handle nested dicts)
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
@@ -294,7 +313,7 @@ def train(args):
             loss, _ = model.compute_loss(
                 query_vector,
                 t_fused,
-                target_ids=t_batch['id'],
+                positive_mask=positive_mask,
             )
 
             if not torch.isfinite(loss):
@@ -314,8 +333,19 @@ def train(args):
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
+        avg_positives_per_query = (
+            total_positive_count / max(total_query_rows, 1)
+        )
+        multi_positive_query_rate = (
+            multi_positive_query_rows / max(total_query_rows, 1)
+        )
 
-        print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | Train Time: {epoch_train_seconds:.2f}s")
+        print(
+            f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
+            f"Avg Positives/Query: {avg_positives_per_query:.4f} | "
+            f"Multi-Positive Rows: {multi_positive_query_rate:.4f} | "
+            f"Train Time: {epoch_train_seconds:.2f}s"
+        )
         
         # Validation
         eval_every = getattr(config, 'eval_every', 1)
@@ -364,6 +394,8 @@ def train(args):
             epoch_log = {
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
+                'avg_in_batch_positives_per_query': avg_positives_per_query,
+                'multi_positive_query_rate': multi_positive_query_rate,
                 'val_mrr': val_mrr, 
                 'val_mr': val_mr,
                 'val_hits1': val_h1,
@@ -399,7 +431,9 @@ def train(args):
              # Log train only
             epoch_log = {
                 'epoch': epoch + 1,
-                'train_loss': avg_train_loss
+                'train_loss': avg_train_loss,
+                'avg_in_batch_positives_per_query': avg_positives_per_query,
+                'multi_positive_query_rate': multi_positive_query_rate,
             }
             history.append(epoch_log)
             with open(log_path, 'w') as f:

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
-from model.dataset import CollateFN, GWMDataset, TrainPositiveIndex
+from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import ContextAggregator, GWM
 
 
@@ -109,15 +109,8 @@ class ModelTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(output, expected))
 
-    def test_repeated_targets_are_multiple_positives(self):
-        scores = torch.tensor([[1.0, 1.0], [1.0, 1.0]])
-        losses = GWM._multi_positive_contrastive_loss(
-            scores, target_ids=torch.tensor([2, 2])
-        )
-        self.assertTrue(torch.equal(losses, torch.zeros_like(losses)))
-
-    def test_query_aware_positive_mask_supports_distinct_valid_tails(self):
-        positive_index = TrainPositiveIndex(
+    def test_query_aware_truth_mask_finds_distinct_valid_tails(self):
+        truth_index = TrainTruthIndex(
             torch.tensor(
                 [
                     [0, 0, 2],
@@ -126,7 +119,7 @@ class ModelTests(unittest.TestCase):
                 ]
             )
         )
-        mask = positive_index.build_in_batch_mask(
+        mask = truth_index.build_in_batch_truth_mask(
             head_ids=torch.tensor([0, 0, 1]),
             relation_ids=torch.tensor([0, 0, 0]),
             candidate_tail_ids=torch.tensor([2, 3, 4]),
@@ -140,8 +133,8 @@ class ModelTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(mask, expected))
 
-    def test_query_aware_positive_mask_does_not_use_unseen_answers(self):
-        positive_index = TrainPositiveIndex(
+    def test_query_aware_truth_mask_does_not_use_unseen_answers(self):
+        truth_index = TrainTruthIndex(
             torch.tensor(
                 [
                     [0, 0, 2],
@@ -149,7 +142,7 @@ class ModelTests(unittest.TestCase):
                 ]
             )
         )
-        mask = positive_index.build_in_batch_mask(
+        mask = truth_index.build_in_batch_truth_mask(
             head_ids=torch.tensor([0, 1]),
             relation_ids=torch.tensor([0, 0]),
             candidate_tail_ids=torch.tensor([2, 5]),
@@ -157,38 +150,42 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(mask[0, 1].item())
         self.assertFalse(mask[1, 0].item())
 
-    def test_multi_positive_loss_uses_explicit_query_mask(self):
+    def test_filtered_loss_ignores_other_training_truths(self):
         scores = torch.tensor(
             [
-                [2.0, 2.0, 0.0],
-                [2.0, 2.0, 0.0],
+                [2.0, 20.0, 0.0],
+                [20.0, 2.0, 0.0],
                 [0.0, 0.0, 2.0],
             ]
         )
-        positive_mask = torch.tensor(
+        truth_mask = torch.tensor(
             [
                 [True, True, False],
                 [True, True, False],
                 [False, False, True],
             ]
         )
-        losses = GWM._multi_positive_contrastive_loss(
+        losses = GWM._filtered_in_batch_contrastive_loss(
             scores,
-            positive_mask=positive_mask,
+            truth_mask=truth_mask,
         )
-        expected = -torch.log(
-            torch.tensor(
-                [
-                    2 * torch.exp(torch.tensor(2.0))
-                    / (2 * torch.exp(torch.tensor(2.0)) + 1),
-                    2 * torch.exp(torch.tensor(2.0))
-                    / (2 * torch.exp(torch.tensor(2.0)) + 1),
-                    torch.exp(torch.tensor(2.0))
-                    / (torch.exp(torch.tensor(2.0)) + 2),
-                ]
-            )
+        expected = torch.tensor(
+            [
+                torch.log1p(torch.exp(torch.tensor(-2.0))),
+                torch.log1p(torch.exp(torch.tensor(-2.0))),
+                torch.log1p(2 * torch.exp(torch.tensor(-2.0))),
+            ]
         )
         self.assertTrue(torch.allclose(losses, expected))
+
+    def test_filtered_loss_penalizes_unrelated_high_score(self):
+        scores = torch.tensor([[2.0, 20.0], [0.0, 2.0]])
+        truth_mask = torch.eye(2, dtype=torch.bool)
+        losses = GWM._filtered_in_batch_contrastive_loss(
+            scores,
+            truth_mask=truth_mask,
+        )
+        self.assertGreater(losses[0].item(), 17.0)
 
     def test_early_fusion_loss_backpropagates_to_gate(self):
         for reduction in ('mean', 'max'):
@@ -207,7 +204,7 @@ class ModelTests(unittest.TestCase):
                 loss, scores = model.compute_loss(
                     query,
                     targets,
-                    positive_mask=torch.eye(2, dtype=torch.bool),
+                    truth_mask=torch.eye(2, dtype=torch.bool),
                 )
                 self.assertEqual(scores.shape, (2, 2))
                 self.assertEqual(query.shape, (2, 5))

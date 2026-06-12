@@ -326,10 +326,9 @@ class GWM(nn.Module):
             relation_table.weight.requires_grad = False
 
     @staticmethod
-    def _multi_positive_contrastive_loss(
+    def _filtered_in_batch_contrastive_loss(
         scores,
-        positive_mask=None,
-        target_ids=None,
+        truth_mask=None,
     ):
         batch_size = scores.size(0)
         if scores.dim() != 2 or scores.size(1) != batch_size:
@@ -337,33 +336,33 @@ class GWM(nn.Module):
                 "In-batch contrastive scores must have shape (B, B)."
             )
 
-        if positive_mask is not None:
-            if positive_mask.shape != scores.shape:
-                raise ValueError(
-                    "positive_mask must have the same shape as scores."
-                )
-            positive_mask = positive_mask.to(
-                device=scores.device, dtype=torch.bool
-            )
-        elif target_ids is None:
-            positive_mask = torch.eye(
+        if truth_mask is None:
+            truth_mask = torch.eye(
                 batch_size, dtype=torch.bool, device=scores.device
             )
         else:
-            target_ids = target_ids.reshape(-1)
-            if target_ids.numel() != batch_size:
+            if truth_mask.shape != scores.shape:
                 raise ValueError(
-                    "target_ids must contain one entity ID per score row."
+                    "truth_mask must have the same shape as scores."
                 )
-            positive_mask = target_ids[:, None].eq(target_ids[None, :])
+            truth_mask = truth_mask.to(
+                device=scores.device, dtype=torch.bool
+            )
 
-        if not positive_mask.any(dim=1).all():
-            raise ValueError("Every query row must contain at least one positive.")
-
-        positive_scores = scores.masked_fill(~positive_mask, float('-inf'))
-        return -(
-            torch.logsumexp(positive_scores, dim=1)
-            - torch.logsumexp(scores, dim=1)
+        diagonal = torch.eye(
+            batch_size, dtype=torch.bool, device=scores.device
+        )
+        # Keep the sampled diagonal target and all false candidates. Other
+        # known training truths are ignored instead of treated as negatives.
+        denominator_mask = (~truth_mask) | diagonal
+        filtered_scores = scores.masked_fill(
+            ~denominator_mask, float('-inf')
+        )
+        labels = torch.arange(batch_size, device=scores.device)
+        return F.cross_entropy(
+            filtered_scores,
+            labels,
+            reduction='none',
         )
 
     def forward(self, h_batch, r_batch, context_batch):
@@ -412,13 +411,11 @@ class GWM(nn.Module):
         self,
         query_vectors,
         target_vectors,
-        positive_mask=None,
-        target_ids=None,
+        truth_mask=None,
     ):
         scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
-        loss = self._multi_positive_contrastive_loss(
+        loss = self._filtered_in_batch_contrastive_loss(
             scores,
-            positive_mask=positive_mask,
-            target_ids=target_ids,
+            truth_mask=truth_mask,
         ).mean()
         return loss, scores

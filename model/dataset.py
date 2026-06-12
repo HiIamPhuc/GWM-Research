@@ -4,8 +4,8 @@ import json
 import os
 
 
-class TrainPositiveIndex:
-    """Build query-aware in-batch positive masks from training triples only."""
+class TrainTruthIndex:
+    """Build query-aware in-batch truth masks from training triples only."""
 
     def __init__(self, train_triples):
         train_triples = torch.as_tensor(train_triples, dtype=torch.long)
@@ -18,7 +18,7 @@ class TrainPositiveIndex:
         for h, r, t in train_triples.tolist():
             self.query_tails.setdefault((h, r), set()).add(t)
 
-    def build_in_batch_mask(
+    def build_in_batch_truth_mask(
         self,
         head_ids,
         relation_ids,
@@ -47,7 +47,7 @@ class TrainPositiveIndex:
         for column, tail_id in enumerate(candidate_tail_ids.tolist()):
             candidate_columns.setdefault(tail_id, []).append(column)
 
-        positive_mask = torch.zeros(
+        truth_mask = torch.zeros(
             batch_size, batch_size, dtype=torch.bool
         )
         for row, (head_id, relation_id) in enumerate(
@@ -56,14 +56,14 @@ class TrainPositiveIndex:
             for tail_id in self.query_tails.get((head_id, relation_id), ()):
                 columns = candidate_columns.get(tail_id)
                 if columns:
-                    positive_mask[row, columns] = True
+                    truth_mask[row, columns] = True
 
-        # Every sampled training triple must remain a positive, even if an
-        # externally supplied training tensor is incomplete or malformed.
-        positive_mask.fill_diagonal_(True)
+        # The diagonal is the sampled target for each query and must always be
+        # recognized as true, even with an externally malformed triple tensor.
+        truth_mask.fill_diagonal_(True)
         if device is not None:
-            positive_mask = positive_mask.to(device)
-        return positive_mask
+            truth_mask = truth_mask.to(device)
+        return truth_mask
 
 
 class GWMDataset(Dataset):

@@ -8,9 +8,11 @@ import torch
 
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import ContextAggregator, GWM
+from evaluate import validate_checkpoint_compatibility
+from utils.eval import compute_filtered_ranking_metrics
 
 
-def make_config(context_agg='mean'):
+def make_config(context_agg='mean', num_particles=1):
     return SimpleNamespace(
         num_entities=4,
         num_relations=4,
@@ -24,6 +26,10 @@ def make_config(context_agg='mean'):
         adapter_dropout=0.0,
         temperature=0.1,
         context_agg=context_agg,
+        num_particles=num_particles,
+        particle_temperature=0.2,
+        particle_diversity_weight=0.01,
+        particle_diversity_margin=0.5,
     )
 
 
@@ -187,32 +193,137 @@ class ModelTests(unittest.TestCase):
         )
         self.assertGreater(losses[0].item(), 17.0)
 
+    def test_single_particle_scoring_matches_dot_product(self):
+        model = GWM(make_config(num_particles=1))
+        particles = torch.nn.functional.normalize(
+            torch.randn(2, 1, 5), dim=-1
+        )
+        targets = torch.nn.functional.normalize(
+            torch.randn(3, 5), dim=-1
+        )
+        scores = model.score_candidates(particles, targets)
+        expected = torch.mm(particles[:, 0], targets.t())
+        self.assertTrue(torch.allclose(scores, expected))
+
+    def test_smooth_particle_scoring_matches_logsumexp(self):
+        model = GWM(make_config(num_particles=2))
+        particles = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0, 0.0],
+              [0.0, 1.0, 0.0, 0.0, 0.0]]]
+        )
+        targets = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0, 0.0]]
+        )
+        scores = model.score_candidates(particles, targets)
+        raw = torch.tensor([[1.0, 0.0]])
+        expected = model.particle_temperature * torch.logsumexp(
+            raw / model.particle_temperature,
+            dim=1,
+        )
+        self.assertTrue(torch.allclose(scores[:, 0], expected))
+
+    def test_particle_diversity_penalizes_collapsed_particles(self):
+        model = GWM(make_config(num_particles=2))
+        collapsed = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0, 0.0],
+              [1.0, 0.0, 0.0, 0.0, 0.0]]]
+        )
+        separated = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0, 0.0],
+              [0.0, 1.0, 0.0, 0.0, 0.0]]]
+        )
+        self.assertGreater(
+            model.particle_diversity_loss(collapsed).item(),
+            model.particle_diversity_loss(separated).item(),
+        )
+
+    def test_checkpoint_rejects_incompatible_particle_count(self):
+        model = GWM(make_config(num_particles=2))
+        with self.assertRaises(ValueError):
+            validate_checkpoint_compatibility(
+                model,
+                {'num_particles': 4},
+            )
+
     def test_early_fusion_loss_backpropagates_to_gate(self):
         for reduction in ('mean', 'max'):
-            with self.subTest(reduction=reduction):
-                model = GWM(make_config(reduction))
-                h_batch = {'id': torch.tensor([0, 1])}
-                r_batch = {'id': torch.tensor([0, 1])}
-                t_batch = {'id': torch.tensor([2, 3])}
-                context_batch = {
-                    'id': torch.tensor([1, 2]),
-                    'rel_id': torch.tensor([0, 1]),
-                    'batch_index': torch.tensor([0, 1]),
-                }
-                query = model(h_batch, r_batch, context_batch)
-                targets = model.encode_target(t_batch)
-                loss, scores = model.compute_loss(
-                    query,
-                    targets,
-                    truth_mask=torch.eye(2, dtype=torch.bool),
-                )
-                self.assertEqual(scores.shape, (2, 2))
-                self.assertEqual(query.shape, (2, 5))
-                self.assertEqual(targets.shape, (2, 5))
-                self.assertTrue(torch.isfinite(loss))
-                loss.backward()
-                self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
-                self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
+            for num_particles in (1, 2):
+                with self.subTest(
+                    reduction=reduction,
+                    num_particles=num_particles,
+                ):
+                    model = GWM(
+                        make_config(reduction, num_particles=num_particles)
+                    )
+                    h_batch = {'id': torch.tensor([0, 1])}
+                    r_batch = {'id': torch.tensor([0, 1])}
+                    t_batch = {'id': torch.tensor([2, 3])}
+                    context_batch = {
+                        'id': torch.tensor([1, 2]),
+                        'rel_id': torch.tensor([0, 1]),
+                        'batch_index': torch.tensor([0, 1]),
+                    }
+                    query = model(h_batch, r_batch, context_batch)
+                    targets = model.encode_target(t_batch)
+                    loss, scores, components = model.compute_loss(
+                        query,
+                        targets,
+                        truth_mask=torch.eye(2, dtype=torch.bool),
+                    )
+                    self.assertEqual(scores.shape, (2, 2))
+                    self.assertEqual(query.shape, (2, num_particles, 5))
+                    self.assertEqual(targets.shape, (2, 5))
+                    self.assertTrue(torch.isfinite(loss))
+                    self.assertTrue(
+                        torch.isfinite(components['ranking_loss'])
+                    )
+                    self.assertTrue(
+                        torch.isfinite(components['diversity_loss'])
+                    )
+                    loss.backward()
+                    self.assertIsNotNone(
+                        model.entity_fusion.gate[1].weight.grad
+                    )
+                    self.assertIsNotNone(
+                        model.relation_fusion.gate[1].weight.grad
+                    )
+
+    def test_chunked_particle_evaluation_matches_full_scoring(self):
+        model = GWM(make_config(num_particles=2))
+        model.eval()
+        batch = {
+            'h_batch': {'id': torch.tensor([0, 1])},
+            'r_batch': {'id': torch.tensor([0, 1])},
+            't_batch': {'id': torch.tensor([2, 3])},
+            'context_batch': {
+                'id': torch.zeros(0, dtype=torch.long),
+                'rel_id': torch.zeros(0, dtype=torch.long),
+                'batch_index': torch.zeros(0, dtype=torch.long),
+            },
+        }
+        with torch.no_grad():
+            all_entities = model.encode_target(
+                {'id': torch.arange(4)}
+            )
+        hr_map = {(0, 0): {2}, (1, 1): {3}}
+        full = compute_filtered_ranking_metrics(
+            model,
+            [batch],
+            all_entities,
+            hr_map,
+            torch.device('cpu'),
+            candidate_batch_size=4,
+        )
+        chunked = compute_filtered_ranking_metrics(
+            model,
+            [batch],
+            all_entities,
+            hr_map,
+            torch.device('cpu'),
+            candidate_batch_size=1,
+        )
+        for metric in ('MRR', 'MR', 'Hits@1', 'Hits@3', 'Hits@10'):
+            self.assertAlmostEqual(full[metric], chunked[metric])
 
 
 class DatasetTests(unittest.TestCase):
@@ -228,7 +339,7 @@ class DatasetTests(unittest.TestCase):
         torch.save(
             {
                 'entity_ids': torch.tensor([[1, 2], [0, -1], [-1, -1]]),
-                'relation_ids': torch.tensor([[0, 0], [1, -1], [-1, -1]]),
+                'relation_ids': torch.tensor([[0, 1], [1, -1], [-1, -1]]),
                 'mask': torch.tensor(
                     [[True, True], [True, False], [False, False]]
                 ),
@@ -237,7 +348,7 @@ class DatasetTests(unittest.TestCase):
             root / 'context_neighbors.pt',
         )
 
-    def test_answer_edge_removed_and_collated_as_ragged_context(self):
+    def test_query_relation_edges_removed_and_collated_as_ragged_context(self):
         with tempfile.TemporaryDirectory() as root:
             self._write_data(root)
             item = GWMDataset(root, split='train')[0]
@@ -247,6 +358,20 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(
                 set(batch['context_batch']),
                 {'id', 'rel_id', 'batch_index'},
+            )
+
+    def test_context_is_identical_for_tails_sharing_query(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_data(root)
+            torch.save(
+                torch.tensor([[0, 0, 1], [0, 0, 2]]),
+                Path(root) / 'train_triples.pt',
+            )
+            dataset = GWMDataset(root, split='train')
+            first = dataset[0]
+            second = dataset[1]
+            self.assertTrue(
+                torch.equal(first['context_mask'], second['context_mask'])
             )
 
 

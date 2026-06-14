@@ -130,18 +130,21 @@ def evaluate(args):
         device=device,
         desc="Evaluating",
         save_predictions_path=predictions_path,
+        candidate_batch_size=candidate_batch_size,
     )
 
     final_mrr = metrics['MRR']
     final_h1 = metrics['Hits@1']
     final_h3 = metrics['Hits@3']
     final_h10 = metrics['Hits@10']
+    particle_usage = metrics['ParticleUsage']
 
     print(f"\n--- Evaluation Results ({split}) ---")
     print(f"MRR       : {final_mrr:.4f}")
     print(f"Hits@1    : {final_h1:.4f}")
     print(f"Hits@3    : {final_h3:.4f}")
     print(f"Hits@10   : {final_h10:.4f}")
+    print(f"Particles : {particle_usage}")
     print("-------------------------------")
     
     # Save results
@@ -149,7 +152,8 @@ def evaluate(args):
         'mrr': final_mrr,
         'hits1': final_h1,
         'hits3': final_h3,
-        'hits10': final_h10
+        'hits10': final_h10,
+        'particle_usage': particle_usage,
     }
     with open(os.path.join(config.output_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)

@@ -97,9 +97,17 @@ def compute_filtered_ranking_metrics(
     desc="Filtered Ranking",
     save_predictions_path=None,
     topk=50,
+    candidate_batch_size=None,
 ):
     hits1, hits3, hits10, mrr, mr = 0, 0, 0, 0.0, 0.0
     total = 0
+    particle_usage = torch.zeros(
+        model.num_particles, dtype=torch.long
+    )
+    num_candidates = all_entity_embeddings.size(0)
+    if candidate_batch_size is None:
+        candidate_batch_size = num_candidates
+    candidate_batch_size = max(1, int(candidate_batch_size))
 
     writer = None
     if save_predictions_path is not None:
@@ -113,43 +121,103 @@ def compute_filtered_ranking_metrics(
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             t_ids = batch['t_batch']['id'].to(device)
-            h_ids = batch['h_batch']['id'].cpu().numpy()
-            r_ids = batch['r_batch']['id'].cpu().numpy()
+            h_ids = batch['h_batch']['id'].cpu().tolist()
+            r_ids = batch['r_batch']['id'].cpu().tolist()
 
-            query_vectors = model(h_batch, r_batch, context_batch)
-            scores = torch.mm(query_vectors, all_entity_embeddings.t())
-            scores = scores / model.temperature
+            query_particles = model(h_batch, r_batch, context_batch)
+            target_vectors = all_entity_embeddings.index_select(0, t_ids)
+            target_scores = (
+                model.score_aligned_targets(query_particles, target_vectors)
+                / model.temperature
+            )
+            target_scores = torch.nan_to_num(
+                target_scores,
+                nan=-1e9,
+                posinf=1e9,
+                neginf=-1e9,
+            )
+            winning_particles = model.winning_particle_ids(
+                query_particles,
+                target_vectors,
+            ).cpu()
+            particle_usage += torch.bincount(
+                winning_particles,
+                minlength=model.num_particles,
+            )
 
-            # Prevent NaNs/Infs from masquerading as perfect ranks.
-            scores = torch.nan_to_num(scores, nan=-1e9, posinf=1e9, neginf=-1e9)
+            ranks = torch.ones(
+                query_particles.size(0),
+                dtype=torch.long,
+                device=device,
+            )
+            top_scores = None
+            top_indices = None
+            topk_val = min(topk, num_candidates)
 
-            for i in range(scores.size(0)):
-                h_id = h_ids[i]
-                r_id = r_ids[i]
-                true_t = t_ids[i].item()
+            for start in range(0, num_candidates, candidate_batch_size):
+                end = min(start + candidate_batch_size, num_candidates)
+                candidate_vectors = all_entity_embeddings[start:end]
+                chunk_scores = (
+                    model.score_candidates(
+                        query_particles,
+                        candidate_vectors,
+                    )
+                    / model.temperature
+                )
+                chunk_scores = torch.nan_to_num(
+                    chunk_scores,
+                    nan=-1e9,
+                    posinf=1e9,
+                    neginf=-1e9,
+                )
 
-                filter_mask_indices = list(hr_map.get((h_id, r_id), []))
-                if true_t in filter_mask_indices:
-                    filter_mask_indices.remove(true_t)
+                for i in range(chunk_scores.size(0)):
+                    true_t = int(t_ids[i].item())
+                    for filtered_t in hr_map.get(
+                        (int(h_ids[i]), int(r_ids[i])),
+                        (),
+                    ):
+                        if filtered_t != true_t and start <= filtered_t < end:
+                            chunk_scores[i, filtered_t - start] = -float('inf')
 
-                if filter_mask_indices:
-                    scores[i, filter_mask_indices] = -float('inf')
+                ranks += (chunk_scores > target_scores.unsqueeze(1)).sum(dim=1)
 
-            target_scores = scores.gather(1, t_ids.unsqueeze(1))
-            ranks = (scores > target_scores).sum(dim=1) + 1
+                if writer is not None:
+                    chunk_k = min(topk_val, end - start)
+                    chunk_top_scores, chunk_top_local = torch.topk(
+                        chunk_scores,
+                        k=chunk_k,
+                        dim=1,
+                    )
+                    chunk_top_indices = chunk_top_local + start
+                    if top_scores is None:
+                        top_scores = chunk_top_scores
+                        top_indices = chunk_top_indices
+                    else:
+                        merged_scores = torch.cat(
+                            [top_scores, chunk_top_scores], dim=1
+                        )
+                        merged_indices = torch.cat(
+                            [top_indices, chunk_top_indices], dim=1
+                        )
+                        top_scores, selected = torch.topk(
+                            merged_scores,
+                            k=min(topk_val, merged_scores.size(1)),
+                            dim=1,
+                        )
+                        top_indices = merged_indices.gather(1, selected)
 
             if writer is not None:
-                topk_val = min(topk, scores.size(1))
-                fused_scores, fused_indices = torch.topk(scores, k=topk_val, dim=1)
 
-                for row_idx in range(scores.size(0)):
+                for row_idx in range(query_particles.size(0)):
                     record = {
                         'h': int(h_ids[row_idx]),
                         'r': int(r_ids[row_idx]),
                         't': int(t_ids[row_idx].item()),
                         'rank': int(ranks[row_idx].item()),
-                        'topk': fused_indices[row_idx].tolist(),
-                        'topk_scores': fused_scores[row_idx].tolist(),
+                        'winning_particle': int(winning_particles[row_idx]),
+                        'topk': top_indices[row_idx].tolist(),
+                        'topk_scores': top_scores[row_idx].tolist(),
                     }
                     writer.write(json.dumps(record) + '\n')
 
@@ -163,10 +231,14 @@ def compute_filtered_ranking_metrics(
     if writer is not None:
         writer.close()
 
-    return {
+    metrics = {
         'MRR': mrr / total,
         'MR': mr / total,
         'Hits@1': hits1 / total,
         'Hits@3': hits3 / total,
         'Hits@10': hits10 / total
     }
+    metrics['ParticleUsage'] = (
+        particle_usage.float() / max(total, 1)
+    ).tolist()
+    return metrics

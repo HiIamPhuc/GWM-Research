@@ -153,12 +153,10 @@ class GWMDataset(Dataset):
             ctx_relation_ids = self.context_relation_ids[h_idx]
             ctx_mask = self.context_mask[h_idx].clone()
 
-            # Do not expose the answer edge while predicting this triple.
-            target_edge = (
-                ctx_entity_ids.eq(int(t.item()))
-                & ctx_relation_ids.eq(int(r.item()))
-            )
-            ctx_mask &= ~target_edge
+            # All triples sharing (head, relation) must receive the same
+            # context. Remove the complete answer-relation family, not only
+            # the currently sampled answer edge.
+            ctx_mask &= ~ctx_relation_ids.eq(int(r.item()))
         else:
             # Dummy fallback with zero neighbors.
             ctx_entity_ids = torch.zeros(0, dtype=torch.long)

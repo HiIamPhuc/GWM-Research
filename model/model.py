@@ -201,12 +201,36 @@ class GWM(nn.Module):
             batch_first=True,
             dropout=self.dropout if dynamics_layers > 1 else 0.0,
         )
+        self.num_particles = int(getattr(config, 'num_particles', 1))
+        if self.num_particles <= 0:
+            raise ValueError("num_particles must be positive.")
         self.fused_output_projection = nn.Linear(
             self.fusion_dim,
             self.fusion_dim,
         )
+        self.particle_projection = (
+            nn.Linear(
+                self.fusion_dim,
+                self.num_particles * self.fusion_dim,
+            )
+            if self.num_particles > 1
+            else None
+        )
 
         self.temperature = float(getattr(config, 'temperature'))
+        if self.temperature <= 0.0:
+            raise ValueError("temperature must be positive.")
+        self.particle_temperature = float(
+            getattr(config, 'particle_temperature', 0.1)
+        )
+        if self.particle_temperature <= 0.0:
+            raise ValueError("particle_temperature must be positive.")
+        self.particle_diversity_weight = float(
+            getattr(config, 'particle_diversity_weight', 0.0)
+        )
+        self.particle_diversity_margin = float(
+            getattr(config, 'particle_diversity_margin', 0.5)
+        )
         
     def _prepare_context_batch(self, context_batch):
         context_entity_ids = context_batch['id']
@@ -365,6 +389,74 @@ class GWM(nn.Module):
             reduction='none',
         )
 
+    def score_candidates(self, query_particles, target_vectors):
+        """Score targets against a set of successor-state particles."""
+        if query_particles.dim() != 3:
+            raise ValueError("query_particles must have shape (B, K, D).")
+        if target_vectors.dim() != 2:
+            raise ValueError("target_vectors must have shape (N, D).")
+        if query_particles.size(1) != self.num_particles:
+            raise ValueError("Particle count does not match model configuration.")
+        if query_particles.size(2) != target_vectors.size(1):
+            raise ValueError("Query and target embedding dimensions differ.")
+
+        particle_scores = torch.einsum(
+            'bkd,nd->bkn',
+            query_particles,
+            target_vectors,
+        )
+        if self.num_particles == 1:
+            return particle_scores[:, 0, :]
+        return self.particle_temperature * torch.logsumexp(
+            particle_scores / self.particle_temperature,
+            dim=1,
+        )
+
+    def particle_diversity_loss(self, query_particles):
+        if self.num_particles <= 1:
+            return query_particles.new_zeros(())
+
+        similarities = torch.bmm(
+            query_particles,
+            query_particles.transpose(1, 2),
+        )
+        off_diagonal = ~torch.eye(
+            self.num_particles,
+            dtype=torch.bool,
+            device=query_particles.device,
+        )
+        pairwise_similarities = similarities[:, off_diagonal]
+        return F.relu(
+            pairwise_similarities - self.particle_diversity_margin
+        ).mean()
+
+    def winning_particle_ids(self, query_particles, target_vectors):
+        """Return the highest-scoring particle for aligned query/target rows."""
+        if query_particles.size(0) != target_vectors.size(0):
+            raise ValueError("Aligned particle diagnostics require equal rows.")
+        aligned_scores = torch.einsum(
+            'bkd,bd->bk',
+            query_particles,
+            target_vectors,
+        )
+        return aligned_scores.argmax(dim=1)
+
+    def score_aligned_targets(self, query_particles, target_vectors):
+        """Score one aligned target for each query row."""
+        if query_particles.size(0) != target_vectors.size(0):
+            raise ValueError("Aligned scoring requires equal query/target rows.")
+        particle_scores = torch.einsum(
+            'bkd,bd->bk',
+            query_particles,
+            target_vectors,
+        )
+        if self.num_particles == 1:
+            return particle_scores[:, 0]
+        return self.particle_temperature * torch.logsumexp(
+            particle_scores / self.particle_temperature,
+            dim=1,
+        )
+
     def forward(self, h_batch, r_batch, context_batch):
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
         r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
@@ -395,7 +487,15 @@ class GWM(nn.Module):
             self.fused_h0_projection,
             self.fused_c0_projection,
         )
-        return F.normalize(self.fused_output_projection(query), p=2, dim=1)
+        if self.particle_projection is None:
+            particles = self.fused_output_projection(query).unsqueeze(1)
+        else:
+            particles = self.particle_projection(query).reshape(
+                query.size(0),
+                self.num_particles,
+                self.fusion_dim,
+            )
+        return F.normalize(particles, p=2, dim=-1)
 
     def encode_target(self, t_batch):
         t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
@@ -409,13 +509,24 @@ class GWM(nn.Module):
 
     def compute_loss(
         self,
-        query_vectors,
+        query_particles,
         target_vectors,
         truth_mask=None,
     ):
-        scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
-        loss = self._filtered_in_batch_contrastive_loss(
+        scores = (
+            self.score_candidates(query_particles, target_vectors)
+            / self.temperature
+        )
+        ranking_loss = self._filtered_in_batch_contrastive_loss(
             scores,
             truth_mask=truth_mask,
         ).mean()
-        return loss, scores
+        diversity_loss = self.particle_diversity_loss(query_particles)
+        loss = (
+            ranking_loss
+            + self.particle_diversity_weight * diversity_loss
+        )
+        return loss, scores, {
+            'ranking_loss': ranking_loss.detach(),
+            'diversity_loss': diversity_loss.detach(),
+        }

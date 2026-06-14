@@ -81,6 +81,15 @@ def get_config(args):
     # Override with args
     if args.data_dir: config_dict['data_dir'] = args.data_dir
     if args.output_dir: config_dict['output_dir'] = args.output_dir
+    for name in (
+        'num_particles',
+        'particle_temperature',
+        'particle_diversity_weight',
+        'particle_diversity_margin',
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            config_dict[name] = value
     
     # Convert to SimpleNamespace (object with attributes)
     class Config:
@@ -97,12 +106,16 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'early_fusion_v1',
+            'architecture': 'early_fusion_particles_v1',
             'training_objective': getattr(
                 model.config,
                 'training_objective',
                 'single_positive_unfiltered_in_batch',
             ),
+            'num_particles': model.num_particles,
+            'particle_temperature': model.particle_temperature,
+            'particle_diversity_weight': model.particle_diversity_weight,
+            'particle_diversity_margin': model.particle_diversity_margin,
             'epoch': epoch,
             'best_mrr': best_mrr,
             'model_state_dict': model.state_dict(),
@@ -148,6 +161,11 @@ def train(args):
     # Init Model
     print("Initializing model...")
     model = GWM(config).to(device)
+    print(
+        f"Particles: K={model.num_particles}, "
+        f"temperature={model.particle_temperature}, "
+        f"diversity_weight={model.particle_diversity_weight}"
+    )
     
     # Collater
     collate_fn = CollateFN()
@@ -282,6 +300,8 @@ def train(args):
         _sync_device(device)
         model.train()
         total_loss = 0
+        total_ranking_loss = 0
+        total_diversity_loss = 0
         total_filtered_truth_count = 0
         total_query_rows = 0
         filtered_query_rows = 0
@@ -310,15 +330,15 @@ def train(args):
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             # Forward: Query Vector (from head, relation, context)
-            query_vector = model(h_batch, r_batch, context_batch)
+            query_particles = model(h_batch, r_batch, context_batch)
             
             # Forward: Target Vector
             t_fused = model.encode_target(t_batch)
 
             optimizer.zero_grad()
 
-            loss, _ = model.compute_loss(
-                query_vector,
+            loss, _, loss_components = model.compute_loss(
+                query_particles,
                 t_fused,
                 truth_mask=truth_mask,
             )
@@ -334,12 +354,26 @@ def train(args):
             scheduler.step()
 
             total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            total_ranking_loss += float(
+                loss_components['ranking_loss'].item()
+            )
+            total_diversity_loss += float(
+                loss_components['diversity_loss'].item()
+            )
+            pbar.set_postfix(
+                {
+                    'loss': loss.item(),
+                    'rank': loss_components['ranking_loss'].item(),
+                    'div': loss_components['diversity_loss'].item(),
+                }
+            )
 
         _sync_device(device)
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
+        avg_ranking_loss = total_ranking_loss / len(train_loader)
+        avg_diversity_loss = total_diversity_loss / len(train_loader)
         avg_filtered_truths_per_query = (
             total_filtered_truth_count / max(total_query_rows, 1)
         )
@@ -349,6 +383,8 @@ def train(args):
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
+            f"Ranking: {avg_ranking_loss:.4f} | "
+            f"Diversity: {avg_diversity_loss:.4f} | "
             f"Filtered Truths/Query: {avg_filtered_truths_per_query:.4f} | "
             f"Rows with Filtered Truths: {filtered_query_rate:.4f} | "
             f"Train Time: {epoch_train_seconds:.2f}s"
@@ -381,6 +417,7 @@ def train(args):
                 hr_map=hr_map,
                 device=device,
                 desc="Validation",
+                candidate_batch_size=candidate_batch_size,
                 # save_predictions_path=predictions_path,
                 # topk=eval_topk,
             )
@@ -401,13 +438,16 @@ def train(args):
             epoch_log = {
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
+                'ranking_loss': avg_ranking_loss,
+                'diversity_loss': avg_diversity_loss,
                 'avg_filtered_truths_per_query': avg_filtered_truths_per_query,
                 'filtered_query_rate': filtered_query_rate,
                 'val_mrr': val_mrr, 
                 'val_mr': val_mr,
                 'val_hits1': val_h1,
                 'val_hits3': val_h3,
-                'val_hits10': val_h10
+                'val_hits10': val_h10,
+                'val_particle_usage': val_metrics['ParticleUsage'],
             }
             history.append(epoch_log)
             with open(log_path, 'w') as f:
@@ -439,6 +479,8 @@ def train(args):
             epoch_log = {
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
+                'ranking_loss': avg_ranking_loss,
+                'diversity_loss': avg_diversity_loss,
                 'avg_filtered_truths_per_query': avg_filtered_truths_per_query,
                 'filtered_query_rate': filtered_query_rate,
             }
@@ -474,6 +516,10 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, required=True, help='Path to yaml config')
     parser.add_argument('--data_dir', type=str, help='Override data directory')
     parser.add_argument('--output_dir', type=str, help='Override output directory')
+    parser.add_argument('--num_particles', type=int)
+    parser.add_argument('--particle_temperature', type=float)
+    parser.add_argument('--particle_diversity_weight', type=float)
+    parser.add_argument('--particle_diversity_margin', type=float)
     
     args = parser.parse_args()
     train(args)

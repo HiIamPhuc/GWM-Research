@@ -208,7 +208,7 @@ class GWM(nn.Module):
             self.fusion_dim,
             self.fusion_dim,
         )
-        self.particle_projection = (
+        self.particle_residual_projection = (
             nn.Linear(
                 self.fusion_dim,
                 self.num_particles * self.fusion_dim,
@@ -216,6 +216,11 @@ class GWM(nn.Module):
             if self.num_particles > 1
             else None
         )
+        self.particle_residual_scale = float(
+            getattr(config, 'particle_residual_scale', 0.1)
+        )
+        if self.particle_residual_scale < 0.0:
+            raise ValueError("particle_residual_scale must be non-negative.")
 
         self.temperature = float(getattr(config, 'temperature'))
         if self.temperature <= 0.0:
@@ -487,13 +492,17 @@ class GWM(nn.Module):
             self.fused_h0_projection,
             self.fused_c0_projection,
         )
-        if self.particle_projection is None:
-            particles = self.fused_output_projection(query).unsqueeze(1)
+        base_query = self.fused_output_projection(query)
+        if self.particle_residual_projection is None:
+            particles = base_query.unsqueeze(1)
         else:
-            particles = self.particle_projection(query).reshape(
+            residuals = self.particle_residual_projection(query).reshape(
                 query.size(0),
                 self.num_particles,
                 self.fusion_dim,
+            )
+            particles = base_query.unsqueeze(1) + (
+                self.particle_residual_scale * residuals
             )
         return F.normalize(particles, p=2, dim=-1)
 

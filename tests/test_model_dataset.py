@@ -28,6 +28,7 @@ def make_config(context_agg='mean', num_particles=1):
         context_agg=context_agg,
         num_particles=num_particles,
         particle_temperature=0.2,
+        particle_residual_scale=0.1,
         particle_diversity_weight=0.01,
         particle_diversity_margin=0.5,
     )
@@ -235,6 +236,28 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(
             model.particle_diversity_loss(collapsed).item(),
             model.particle_diversity_loss(separated).item(),
+        )
+
+    def test_residual_particles_preserve_base_query_when_offsets_are_zero(self):
+        model = GWM(make_config(num_particles=3))
+        torch.nn.init.zeros_(model.particle_residual_projection.weight)
+        torch.nn.init.zeros_(model.particle_residual_projection.bias)
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        context_batch = {
+            'id': torch.tensor([1, 2]),
+            'rel_id': torch.tensor([0, 1]),
+            'batch_index': torch.tensor([0, 1]),
+        }
+
+        query_particles = model(h_batch, r_batch, context_batch)
+
+        self.assertEqual(query_particles.shape, (2, 3, 5))
+        self.assertTrue(
+            torch.allclose(query_particles[:, 0], query_particles[:, 1])
+        )
+        self.assertTrue(
+            torch.allclose(query_particles[:, 1], query_particles[:, 2])
         )
 
     def test_checkpoint_rejects_incompatible_particle_count(self):

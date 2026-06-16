@@ -26,10 +26,10 @@ candidate_batch_size: 2048
 
 temperature: 0.07
 num_particles: 2
-particle_temperature: 0.4
-particle_residual_scale: 0.1
-particle_diversity_weight: 0.0
-particle_diversity_margin: 0.5
+particle_temperature: 0.02
+particle_residual_scale: 0.05
+particle_diversity_weight: 0.02
+particle_diversity_margin: 0.2
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr

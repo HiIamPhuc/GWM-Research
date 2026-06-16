@@ -25,6 +25,7 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
+transition_scale_max: 2.0
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr

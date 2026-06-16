@@ -97,7 +97,7 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'early_fusion_v1',
+            'architecture': 'early_fusion_affine_transition_v1',
             'training_objective': getattr(
                 model.config,
                 'training_objective',

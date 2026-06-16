@@ -205,8 +205,19 @@ class GWM(nn.Module):
             self.fusion_dim,
             self.fusion_dim,
         )
+        self.affine_transition_projection = nn.Linear(
+            self.fusion_dim,
+            self.fusion_dim * 2,
+        )
+        self.transition_scale_max = float(
+            getattr(config, 'transition_scale_max', 2.0)
+        )
+        if self.transition_scale_max <= 0.0:
+            raise ValueError("transition_scale_max must be positive.")
 
         self.temperature = float(getattr(config, 'temperature'))
+        if self.temperature <= 0.0:
+            raise ValueError("temperature must be positive.")
         
     def _prepare_context_batch(self, context_batch):
         context_entity_ids = context_batch['id']
@@ -251,6 +262,12 @@ class GWM(nn.Module):
         _, (h_n, _) = lstm(torch.stack([head_emb, relation_emb], dim=1), (h_0_lstm, c_0_lstm))
         query_vector = h_n[-1]
         return query_vector
+
+    def _apply_affine_transition(self, head_state, transition_state):
+        transition = self.affine_transition_projection(transition_state)
+        scale_raw, shift = transition.chunk(2, dim=-1)
+        scale = self.transition_scale_max * torch.sigmoid(scale_raw)
+        return (head_state * scale) + shift
 
     def _load_embedding_tensor(self, source, expected_rows, name):
         if isinstance(source, str):
@@ -395,7 +412,12 @@ class GWM(nn.Module):
             self.fused_h0_projection,
             self.fused_c0_projection,
         )
-        return F.normalize(self.fused_output_projection(query), p=2, dim=1)
+        head_state = self.fused_output_projection(h_fused)
+        next_state = self._apply_affine_transition(
+            head_state=head_state,
+            transition_state=query,
+        )
+        return F.normalize(next_state, p=2, dim=1)
 
     def encode_target(self, t_batch):
         t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))

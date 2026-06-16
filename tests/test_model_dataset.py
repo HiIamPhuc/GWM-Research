@@ -23,6 +23,7 @@ def make_config(context_agg='mean'):
         dropout=0.0,
         adapter_dropout=0.0,
         temperature=0.1,
+        transition_scale_max=2.0,
         context_agg=context_agg,
     )
 
@@ -186,6 +187,20 @@ class ModelTests(unittest.TestCase):
             truth_mask=truth_mask,
         )
         self.assertGreater(losses[0].item(), 17.0)
+
+    def test_affine_transition_can_preserve_head_state(self):
+        model = GWM(make_config())
+        torch.nn.init.zeros_(model.affine_transition_projection.weight)
+        torch.nn.init.zeros_(model.affine_transition_projection.bias)
+        head_state = torch.randn(3, 5)
+        transition_state = torch.randn(3, 5)
+
+        next_state = model._apply_affine_transition(
+            head_state=head_state,
+            transition_state=transition_state,
+        )
+
+        self.assertTrue(torch.allclose(next_state, head_state))
 
     def test_early_fusion_loss_backpropagates_to_gate(self):
         for reduction in ('mean', 'max'):

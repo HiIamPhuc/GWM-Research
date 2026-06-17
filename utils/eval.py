@@ -100,6 +100,9 @@ def compute_filtered_ranking_metrics(
 ):
     hits1, hits3, hits10, mrr, mr = 0, 0, 0, 0.0, 0.0
     total = 0
+    transition_sums = {}
+    transition_mins = {}
+    transition_maxes = {}
 
     writer = None
     if save_predictions_path is not None:
@@ -116,7 +119,12 @@ def compute_filtered_ranking_metrics(
             h_ids = batch['h_batch']['id'].cpu().numpy()
             r_ids = batch['r_batch']['id'].cpu().numpy()
 
-            query_vectors = model(h_batch, r_batch, context_batch)
+            query_vectors, transition_stats = model(
+                h_batch,
+                r_batch,
+                context_batch,
+                return_transition_stats=True,
+            )
             scores = torch.mm(query_vectors, all_entity_embeddings.t())
             scores = scores / model.temperature
 
@@ -158,15 +166,43 @@ def compute_filtered_ranking_metrics(
             hits10 += (ranks <= 10).sum().item()
             mrr += (1.0 / ranks.float()).sum().item()
             mr += ranks.float().sum().item()
-            total += ranks.size(0)
+            batch_total = ranks.size(0)
+            total += batch_total
+
+            for key, value in transition_stats.items():
+                numeric_value = float(value.item())
+                if key.endswith('_min'):
+                    previous = transition_mins.get(key)
+                    transition_mins[key] = (
+                        numeric_value
+                        if previous is None
+                        else min(previous, numeric_value)
+                    )
+                elif key.endswith('_max'):
+                    previous = transition_maxes.get(key)
+                    transition_maxes[key] = (
+                        numeric_value
+                        if previous is None
+                        else max(previous, numeric_value)
+                    )
+                else:
+                    transition_sums[key] = (
+                        transition_sums.get(key, 0.0)
+                        + numeric_value * batch_total
+                    )
 
     if writer is not None:
         writer.close()
 
-    return {
+    metrics = {
         'MRR': mrr / total,
         'MR': mr / total,
         'Hits@1': hits1 / total,
         'Hits@3': hits3 / total,
         'Hits@10': hits10 / total
     }
+    for key, value in transition_sums.items():
+        metrics[key] = value / total
+    metrics.update(transition_mins)
+    metrics.update(transition_maxes)
+    return metrics

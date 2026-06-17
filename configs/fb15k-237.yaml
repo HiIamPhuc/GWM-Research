@@ -9,10 +9,10 @@ struct_adapter_dim: 896
 dynamics_layers: 2
 
 adapter_dropout: 0.1
-dropout: 0.25
+dropout: 0.2
 
-learning_rate: 3e-4
-weight_decay: 0.0005
+learning_rate: 5e-4
+weight_decay: 0.0001
 min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
@@ -25,7 +25,8 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
-transition_scale_max: 3.0
+transition_scale_max: 5.0
+transition_shift_scale: 0.1
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

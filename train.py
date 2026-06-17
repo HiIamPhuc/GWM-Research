@@ -394,7 +394,9 @@ def train(args):
             print(
                 f"Epoch {epoch+1} Val | "
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
-                f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
+                f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f} | "
+                f"ScaleMean: {val_metrics['transition_scale_mean']:.4f} | "
+                f"ShiftNorm: {val_metrics['transition_shift_norm_mean']:.4f}"
             )
             
             # Log metrics
@@ -407,7 +409,15 @@ def train(args):
                 'val_mr': val_mr,
                 'val_hits1': val_h1,
                 'val_hits3': val_h3,
-                'val_hits10': val_h10
+                'val_hits10': val_h10,
+                'transition_scale_mean': val_metrics['transition_scale_mean'],
+                'transition_scale_std': val_metrics['transition_scale_std'],
+                'transition_scale_min': val_metrics['transition_scale_min'],
+                'transition_scale_max': val_metrics['transition_scale_max'],
+                'transition_shift_abs_mean': val_metrics['transition_shift_abs_mean'],
+                'transition_shift_abs_max': val_metrics['transition_shift_abs_max'],
+                'transition_shift_norm_mean': val_metrics['transition_shift_norm_mean'],
+                'transition_raw_shift_norm_mean': val_metrics['transition_raw_shift_norm_mean'],
             }
             history.append(epoch_log)
             with open(log_path, 'w') as f:

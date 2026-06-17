@@ -142,6 +142,8 @@ def evaluate(args):
     print(f"Hits@1    : {final_h1:.4f}")
     print(f"Hits@3    : {final_h3:.4f}")
     print(f"Hits@10   : {final_h10:.4f}")
+    print(f"ScaleMean : {metrics['transition_scale_mean']:.4f}")
+    print(f"ShiftNorm : {metrics['transition_shift_norm_mean']:.4f}")
     print("-------------------------------")
     
     # Save results
@@ -149,7 +151,15 @@ def evaluate(args):
         'mrr': final_mrr,
         'hits1': final_h1,
         'hits3': final_h3,
-        'hits10': final_h10
+        'hits10': final_h10,
+        'transition_scale_mean': metrics['transition_scale_mean'],
+        'transition_scale_std': metrics['transition_scale_std'],
+        'transition_scale_min': metrics['transition_scale_min'],
+        'transition_scale_max': metrics['transition_scale_max'],
+        'transition_shift_abs_mean': metrics['transition_shift_abs_mean'],
+        'transition_shift_abs_max': metrics['transition_shift_abs_max'],
+        'transition_shift_norm_mean': metrics['transition_shift_norm_mean'],
+        'transition_raw_shift_norm_mean': metrics['transition_raw_shift_norm_mean'],
     }
     with open(os.path.join(config.output_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)

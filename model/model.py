@@ -209,15 +209,10 @@ class GWM(nn.Module):
             self.fusion_dim,
             self.fusion_dim * 2,
         )
-        self.transition_scale_max = float(
-            getattr(config, 'transition_scale_max', 2.0)
-        )
-        if self.transition_scale_max <= 0.0:
-            raise ValueError("transition_scale_max must be positive.")
+        self.transition_scale_max = float(getattr(config, 'transition_scale_max', 2.0))
+        self.transition_shift_scale = float(getattr(config, 'transition_shift_scale', 1.0))
 
         self.temperature = float(getattr(config, 'temperature'))
-        if self.temperature <= 0.0:
-            raise ValueError("temperature must be positive.")
         
     def _prepare_context_batch(self, context_batch):
         context_entity_ids = context_batch['id']
@@ -263,11 +258,31 @@ class GWM(nn.Module):
         query_vector = h_n[-1]
         return query_vector
 
-    def _apply_affine_transition(self, head_state, transition_state):
+    def _transition_components(self, transition_state):
         transition = self.affine_transition_projection(transition_state)
-        scale_raw, shift = transition.chunk(2, dim=-1)
+        scale_raw, shift_raw = transition.chunk(2, dim=-1)
         scale = self.transition_scale_max * torch.sigmoid(scale_raw)
+        shift = self.transition_shift_scale * shift_raw
+        return scale, shift_raw, shift
+
+    def _apply_affine_transition(self, head_state, transition_state):
+        scale, _, shift = self._transition_components(transition_state)
         return (head_state * scale) + shift
+
+    @staticmethod
+    def _summarize_transition(scale, shift_raw, shift):
+        return {
+            'transition_scale_mean': scale.mean().detach(),
+            'transition_scale_std': scale.std(unbiased=False).detach(),
+            'transition_scale_min': scale.min().detach(),
+            'transition_scale_max': scale.max().detach(),
+            'transition_shift_abs_mean': shift.abs().mean().detach(),
+            'transition_shift_abs_max': shift.abs().max().detach(),
+            'transition_shift_norm_mean': shift.norm(p=2, dim=1).mean().detach(),
+            'transition_raw_shift_norm_mean': (
+                shift_raw.norm(p=2, dim=1).mean().detach()
+            ),
+        }
 
     def _load_embedding_tensor(self, source, expected_rows, name):
         if isinstance(source, str):
@@ -382,7 +397,7 @@ class GWM(nn.Module):
             reduction='none',
         )
 
-    def forward(self, h_batch, r_batch, context_batch):
+    def forward(self, h_batch, r_batch, context_batch, return_transition_stats=False):
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
         r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
         h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
@@ -413,11 +428,16 @@ class GWM(nn.Module):
             self.fused_c0_projection,
         )
         head_state = self.fused_output_projection(h_fused)
-        next_state = self._apply_affine_transition(
-            head_state=head_state,
-            transition_state=query,
-        )
-        return F.normalize(next_state, p=2, dim=1)
+        scale, shift_raw, shift = self._transition_components(query)
+        next_state = (head_state * scale) + shift
+        query_vector = F.normalize(next_state, p=2, dim=1)
+        if return_transition_stats:
+            return query_vector, self._summarize_transition(
+                scale=scale,
+                shift_raw=shift_raw,
+                shift=shift,
+            )
+        return query_vector
 
     def encode_target(self, t_batch):
         t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))

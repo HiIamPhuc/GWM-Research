@@ -24,6 +24,7 @@ def make_config(context_agg='mean'):
         adapter_dropout=0.0,
         temperature=0.1,
         transition_scale_max=2.0,
+        transition_shift_scale=1.0,
         context_agg=context_agg,
     )
 
@@ -201,6 +202,24 @@ class ModelTests(unittest.TestCase):
         )
 
         self.assertTrue(torch.allclose(next_state, head_state))
+
+    def test_affine_shift_scale_dampens_shift_component(self):
+        config = make_config()
+        config.transition_shift_scale = 0.25
+        model = GWM(config)
+        torch.nn.init.zeros_(model.affine_transition_projection.weight)
+        with torch.no_grad():
+            model.affine_transition_projection.bias[:5].zero_()
+            model.affine_transition_projection.bias[5:].fill_(4.0)
+        head_state = torch.zeros(2, 5)
+        transition_state = torch.randn(2, 5)
+
+        next_state = model._apply_affine_transition(
+            head_state=head_state,
+            transition_state=transition_state,
+        )
+
+        self.assertTrue(torch.allclose(next_state, torch.ones_like(next_state)))
 
     def test_early_fusion_loss_backpropagates_to_gate(self):
         for reduction in ('mean', 'max'):

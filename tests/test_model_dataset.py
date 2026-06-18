@@ -23,8 +23,10 @@ def make_config(context_agg='mean'):
         dropout=0.0,
         adapter_dropout=0.0,
         temperature=0.1,
-        transition_scale_max=2.0,
+        transition_scale_delta=0.5,
         transition_shift_scale=1.0,
+        transition_shift_reg_weight=0.0,
+        transition_scale_identity_reg_weight=0.0,
         context_agg=context_agg,
     )
 
@@ -219,7 +221,26 @@ class ModelTests(unittest.TestCase):
             transition_state=transition_state,
         )
 
-        self.assertTrue(torch.allclose(next_state, torch.ones_like(next_state)))
+        expected_shift = 0.25 * torch.tanh(torch.tensor(4.0))
+        self.assertTrue(
+            torch.allclose(
+                next_state,
+                torch.full_like(next_state, expected_shift),
+            )
+        )
+
+    def test_identity_centered_scale_is_bounded(self):
+        config = make_config()
+        config.transition_scale_delta = 0.25
+        model = GWM(config)
+        torch.nn.init.zeros_(model.affine_transition_projection.weight)
+        with torch.no_grad():
+            model.affine_transition_projection.bias[:5].fill_(100.0)
+            model.affine_transition_projection.bias[5:].zero_()
+        scale, shift = model._transition_components(torch.randn(2, 5))
+
+        self.assertTrue(torch.allclose(scale, torch.full_like(scale, 1.25)))
+        self.assertTrue(torch.equal(shift, torch.zeros_like(shift)))
 
     def test_early_fusion_loss_backpropagates_to_gate(self):
         for reduction in ('mean', 'max'):

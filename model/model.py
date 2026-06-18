@@ -209,9 +209,10 @@ class GWM(nn.Module):
             self.fusion_dim,
             self.fusion_dim * 2,
         )
-        self.transition_scale_max = float(getattr(config, 'transition_scale_max', 2.0))
-        self.transition_shift_scale = float(getattr(config, 'transition_shift_scale', 1.0))
-
+        self.transition_scale_delta = float(getattr(config, 'transition_scale_delta', 0.5))
+        self.transition_shift_scale = float(getattr(config, 'transition_shift_scale', 0.1))
+        self.transition_shift_reg_weight = float(getattr(config, 'transition_shift_reg_weight', 0.0))
+        self.transition_scale_identity_reg_weight = float(getattr(config, 'transition_scale_identity_reg_weight', 0.0))
         self.temperature = float(getattr(config, 'temperature'))
         
     def _prepare_context_batch(self, context_batch):
@@ -261,27 +262,28 @@ class GWM(nn.Module):
     def _transition_components(self, transition_state):
         transition = self.affine_transition_projection(transition_state)
         scale_raw, shift_raw = transition.chunk(2, dim=-1)
-        scale = self.transition_scale_max * torch.sigmoid(scale_raw)
-        shift = self.transition_shift_scale * shift_raw
-        return scale, shift_raw, shift
+        scale = 1.0 + self.transition_scale_delta * torch.tanh(scale_raw)
+        shift = self.transition_shift_scale * torch.tanh(shift_raw)
+        return scale, shift
 
     def _apply_affine_transition(self, head_state, transition_state):
-        scale, _, shift = self._transition_components(transition_state)
+        scale, shift = self._transition_components(transition_state)
         return (head_state * scale) + shift
 
     @staticmethod
-    def _summarize_transition(scale, shift_raw, shift):
+    def _summarize_transition(scale, shift, head_component):
+        head_norm = head_component.norm(p=2, dim=1)
+        shift_norm = shift.norm(p=2, dim=1)
         return {
             'transition_scale_mean': scale.mean().detach(),
             'transition_scale_std': scale.std(unbiased=False).detach(),
-            'transition_scale_min': scale.min().detach(),
-            'transition_scale_max': scale.max().detach(),
-            'transition_shift_abs_mean': shift.abs().mean().detach(),
-            'transition_shift_abs_max': shift.abs().max().detach(),
-            'transition_shift_norm_mean': shift.norm(p=2, dim=1).mean().detach(),
-            'transition_raw_shift_norm_mean': (
-                shift_raw.norm(p=2, dim=1).mean().detach()
-            ),
+            'transition_head_norm_mean': head_norm.mean().detach(),
+            'transition_shift_norm_mean': shift_norm.mean().detach(),
+            'transition_shift_to_head_ratio': (
+                shift_norm / head_norm.clamp_min(1e-8)
+            ).mean().detach(),
+            '_transition_shift_reg': shift.pow(2).mean(),
+            '_transition_scale_identity_reg': (scale - 1.0).pow(2).mean(),
         }
 
     def _load_embedding_tensor(self, source, expected_rows, name):
@@ -428,14 +430,15 @@ class GWM(nn.Module):
             self.fused_c0_projection,
         )
         head_state = self.fused_output_projection(h_fused)
-        scale, shift_raw, shift = self._transition_components(query)
-        next_state = (head_state * scale) + shift
+        scale, shift = self._transition_components(query)
+        head_component = head_state * scale
+        next_state = head_component + shift
         query_vector = F.normalize(next_state, p=2, dim=1)
         if return_transition_stats:
             return query_vector, self._summarize_transition(
                 scale=scale,
-                shift_raw=shift_raw,
                 shift=shift,
+                head_component=head_component,
             )
         return query_vector
 
@@ -454,10 +457,21 @@ class GWM(nn.Module):
         query_vectors,
         target_vectors,
         truth_mask=None,
+        transition_stats=None,
     ):
         scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
-        loss = self._filtered_in_batch_contrastive_loss(
+        ranking_loss = self._filtered_in_batch_contrastive_loss(
             scores,
             truth_mask=truth_mask,
         ).mean()
+        loss = ranking_loss
+        if transition_stats is not None:
+            loss = loss + (
+                self.transition_shift_reg_weight
+                * transition_stats['_transition_shift_reg']
+            )
+            loss = loss + (
+                self.transition_scale_identity_reg_weight
+                * transition_stats['_transition_scale_identity_reg']
+            )
         return loss, scores

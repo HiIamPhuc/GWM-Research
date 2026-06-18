@@ -101,8 +101,6 @@ def compute_filtered_ranking_metrics(
     hits1, hits3, hits10, mrr, mr = 0, 0, 0, 0.0, 0.0
     total = 0
     transition_sums = {}
-    transition_mins = {}
-    transition_maxes = {}
 
     writer = None
     if save_predictions_path is not None:
@@ -170,26 +168,13 @@ def compute_filtered_ranking_metrics(
             total += batch_total
 
             for key, value in transition_stats.items():
+                if key.startswith('_'):
+                    continue
                 numeric_value = float(value.item())
-                if key.endswith('_min'):
-                    previous = transition_mins.get(key)
-                    transition_mins[key] = (
-                        numeric_value
-                        if previous is None
-                        else min(previous, numeric_value)
-                    )
-                elif key.endswith('_max'):
-                    previous = transition_maxes.get(key)
-                    transition_maxes[key] = (
-                        numeric_value
-                        if previous is None
-                        else max(previous, numeric_value)
-                    )
-                else:
-                    transition_sums[key] = (
-                        transition_sums.get(key, 0.0)
-                        + numeric_value * batch_total
-                    )
+                transition_sums[key] = (
+                    transition_sums.get(key, 0.0)
+                    + numeric_value * batch_total
+                )
 
     if writer is not None:
         writer.close()
@@ -203,6 +188,4 @@ def compute_filtered_ranking_metrics(
     }
     for key, value in transition_sums.items():
         metrics[key] = value / total
-    metrics.update(transition_mins)
-    metrics.update(transition_maxes)
     return metrics

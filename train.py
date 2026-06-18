@@ -97,7 +97,7 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'early_fusion_affine_transition_v1',
+            'architecture': 'early_fusion_identity_affine_transition_v2',
             'training_objective': getattr(
                 model.config,
                 'training_objective',
@@ -310,7 +310,12 @@ def train(args):
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             # Forward: Query Vector (from head, relation, context)
-            query_vector = model(h_batch, r_batch, context_batch)
+            query_vector, transition_stats = model(
+                h_batch,
+                r_batch,
+                context_batch,
+                return_transition_stats=True,
+            )
             
             # Forward: Target Vector
             t_fused = model.encode_target(t_batch)
@@ -321,6 +326,7 @@ def train(args):
                 query_vector,
                 t_fused,
                 truth_mask=truth_mask,
+                transition_stats=transition_stats,
             )
 
             if not torch.isfinite(loss):
@@ -396,7 +402,9 @@ def train(args):
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
                 f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f} | "
                 f"ScaleMean: {val_metrics['transition_scale_mean']:.4f} | "
-                f"ShiftNorm: {val_metrics['transition_shift_norm_mean']:.4f}"
+                f"HeadNorm: {val_metrics['transition_head_norm_mean']:.4f} | "
+                f"ShiftNorm: {val_metrics['transition_shift_norm_mean']:.4f} | "
+                f"Shift/Head: {val_metrics['transition_shift_to_head_ratio']:.4f}"
             )
             
             # Log metrics
@@ -412,12 +420,9 @@ def train(args):
                 'val_hits10': val_h10,
                 'transition_scale_mean': val_metrics['transition_scale_mean'],
                 'transition_scale_std': val_metrics['transition_scale_std'],
-                'transition_scale_min': val_metrics['transition_scale_min'],
-                'transition_scale_max': val_metrics['transition_scale_max'],
-                'transition_shift_abs_mean': val_metrics['transition_shift_abs_mean'],
-                'transition_shift_abs_max': val_metrics['transition_shift_abs_max'],
+                'transition_head_norm_mean': val_metrics['transition_head_norm_mean'],
                 'transition_shift_norm_mean': val_metrics['transition_shift_norm_mean'],
-                'transition_raw_shift_norm_mean': val_metrics['transition_raw_shift_norm_mean'],
+                'transition_shift_to_head_ratio': val_metrics['transition_shift_to_head_ratio'],
             }
             history.append(epoch_log)
             with open(log_path, 'w') as f:

@@ -25,8 +25,10 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
-transition_scale_max: 5.0
-transition_shift_scale: 0.0
+transition_scale_delta: 0.5
+transition_shift_scale: 0.2
+transition_shift_reg_weight: 0.001
+transition_scale_identity_reg_weight: 0.0005
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

@@ -94,6 +94,72 @@ def _sync_device(device):
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
 
+
+def _as_bool(value, name):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'true', '1', 'yes', 'y'}:
+            return True
+        if normalized in {'false', '0', 'no', 'n'}:
+            return False
+    raise ValueError(f"{name} must be a boolean value. Got: {value!r}")
+
+
+def configure_structural_embeddings(model, config):
+    load_structural = _as_bool(
+        getattr(config, 'load_structural_embeddings', True),
+        'load_structural_embeddings',
+    )
+    freeze_structural = _as_bool(
+        getattr(config, 'freeze_structural_embeddings', load_structural),
+        'freeze_structural_embeddings',
+    )
+    config.load_structural_embeddings = load_structural
+    config.freeze_structural_embeddings = freeze_structural
+
+    if not load_structural:
+        if freeze_structural:
+            raise ValueError(
+                "freeze_structural_embeddings=True is not valid when "
+                "load_structural_embeddings=False. Randomly initialized "
+                "structural embeddings should be trainable for the end-to-end "
+                "capacity test."
+            )
+        model.struct_ent_embs.weight.requires_grad = True
+        model.struct_rel_embs.weight.requires_grad = True
+        print(
+            "Using randomly initialized trainable structural embeddings "
+            "(precomputed structural priors are not loaded)."
+        )
+        return
+
+    structural_entity_source = os.path.join(
+        config.data_dir, 'structural_entities.pt'
+    )
+    structural_relation_source = os.path.join(
+        config.data_dir, 'structural_relations.pt'
+    )
+    if (
+        not os.path.exists(structural_entity_source)
+        or not os.path.exists(structural_relation_source)
+    ):
+        raise FileNotFoundError(
+            "Missing precomputed structural prior files. Expected "
+            "structural_entities.pt and structural_relations.pt in data_dir. "
+            "Set load_structural_embeddings: false to train structural "
+            "embeddings from random initialization instead."
+        )
+    model.load_embeddings(
+        entity_source=structural_entity_source,
+        relation_source=structural_relation_source,
+        kind='structural',
+        freeze=freeze_structural,
+    )
+    status = 'frozen' if freeze_structural else 'trainable'
+    print(f"Loaded structural embeddings into structural embedding tables ({status})...")
+
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
@@ -180,21 +246,7 @@ def train(args):
     )
     print("Loaded text embeddings into text embedding tables...")
 
-    # Structural priors are required because the model always uses this path.
-    structural_entity_source = os.path.join(config.data_dir, 'structural_entities.pt')
-    structural_relation_source = os.path.join(config.data_dir, 'structural_relations.pt')
-    if not os.path.exists(structural_entity_source) or not os.path.exists(structural_relation_source):
-        raise FileNotFoundError(
-            "Missing precomputed structural prior files. Expected "
-            "structural_entities.pt and structural_relations.pt in data_dir."
-        )
-    model.load_embeddings(
-        entity_source=structural_entity_source,
-        relation_source=structural_relation_source,
-        kind='structural',
-        freeze=True,
-    )
-    print("Loaded structural embeddings into structural embedding tables...")
+    configure_structural_embeddings(model, config)
 
     config.training_objective = 'single_positive_filtered_in_batch'
     

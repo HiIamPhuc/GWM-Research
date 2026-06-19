@@ -6,6 +6,9 @@ fusion_dim: 1024
 text_adapter_dim: 768
 struct_adapter_dim: 896
 
+load_structural_embeddings: false
+freeze_structural_embeddings: false
+
 dynamics_layers: 2
 
 adapter_dropout: 0.1

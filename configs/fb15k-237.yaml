@@ -12,12 +12,12 @@ adapter_dropout: 0.1
 dropout: 0.2
 
 learning_rate: 5e-4
-weight_decay: 0.0001
+weight_decay: 0.001
 min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
 num_epochs: 500
-early_stopping_patience: 15
+early_stopping_patience: 5
 eval_every: 1
 
 batch_size: 2048

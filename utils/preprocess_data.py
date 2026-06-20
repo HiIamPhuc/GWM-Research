@@ -81,6 +81,51 @@ def load_nell995_dataset(data_dir, add_inverse=True):
     test_triples = load_nell995_triples(data_path / 'test.txt', id_to_entity, id_to_relation)
     return train_triples, valid_triples, test_triples, entity2id, relation2id
 
+def load_ordered_tokens(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return [line.strip() for line in f if line.strip()]
+
+def load_umls_triples(file_path):
+    triples = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) != 3:
+                continue
+            triples.append(tuple(parts))
+    return triples
+
+def load_umls_dataset(data_dir, add_inverse=True):
+    data_path = Path(data_dir)
+    entities = load_ordered_tokens(data_path / 'entities.txt')
+    relations = load_ordered_tokens(data_path / 'relations.txt')
+
+    entity2id = {entity: idx for idx, entity in enumerate(entities)}
+    relation2id = {relation: idx for idx, relation in enumerate(relations)}
+    if add_inverse:
+        num_original_relations = len(relation2id)
+        for relation, rid in list(relation2id.items()):
+            relation2id[relation + '_inv'] = rid + num_original_relations
+
+    train_triples = load_umls_triples(data_path / 'train.tsv')
+    valid_triples = load_umls_triples(data_path / 'valid.tsv')
+    test_triples = load_umls_triples(data_path / 'test.tsv')
+
+    known_entities = set(entity2id)
+    known_relations = set(relations)
+    for split_name, triples in (
+        ('train', train_triples),
+        ('valid', valid_triples),
+        ('test', test_triples),
+    ):
+        for h, r, t in triples:
+            if h not in known_entities or t not in known_entities:
+                raise ValueError(f"Unknown entity in UMLS {split_name} triple: {(h, r, t)}")
+            if r not in known_relations:
+                raise ValueError(f"Unknown relation in UMLS {split_name} triple: {(h, r, t)}")
+
+    return train_triples, valid_triples, test_triples, entity2id, relation2id
+
 def create_vocabularies(train_triples, valid_triples, test_triples, add_inverse=True):
     """Create entity and relation mappings."""
     entities = set()
@@ -235,6 +280,42 @@ def process_text_nell995(data_dir, entity2id, relation2id):
 
     return entity_text, relation_text
 
+def process_text_umls(data_dir, entity2id, relation2id):
+    data_path = Path(data_dir)
+    entity_text = {}
+    relation_text = {}
+
+    def load_text_map(filename):
+        path = data_path / filename
+        text_map = {}
+        if not path.exists():
+            return text_map
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                parts = line.rstrip('\n').split('\t', 1)
+                if len(parts) == 2:
+                    text_map[parts[0]] = parts[1].strip()
+        return text_map
+
+    # Prefer longer descriptions when present; otherwise use concise labels.
+    e_map = load_text_map('entity2textlong.txt')
+    if not e_map:
+        e_map = load_text_map('entity2text.txt')
+    r_map = load_text_map('relation2text.txt')
+
+    for entity, eid in entity2id.items():
+        entity_text[str(eid)] = e_map.get(entity, entity.replace('_', ' '))
+
+    for relation, rid in relation2id.items():
+        if relation.endswith('_inv'):
+            base_relation = relation[:-4]
+            base_text = r_map.get(base_relation, base_relation.replace('_', ' '))
+            relation_text[str(rid)] = 'inverse of ' + base_text
+        else:
+            relation_text[str(rid)] = r_map.get(relation, relation.replace('_', ' '))
+
+    return entity_text, relation_text
+
 def precompute_text_embeddings(
     entity_text_dict,
     relation_text_dict,
@@ -326,6 +407,11 @@ def process_dataset(
             data_path,
             add_inverse=add_inverse,
         )
+    elif 'umls' in dataset_key:
+        train_triples, valid_triples, test_triples, entity2id, relation2id = load_umls_dataset(
+            data_path,
+            add_inverse=add_inverse,
+        )
     else:
         train_triples = load_triples(data_path / 'train.txt')
         valid_triples = load_triples(data_path / 'valid.txt')
@@ -371,6 +457,8 @@ def process_dataset(
         entity_text_dict, relation_text_dict = process_text_wn18rr(data_dir, entity2id, relation2id)
     elif 'nell' in dataset_key:
         entity_text_dict, relation_text_dict = process_text_nell995(data_dir, entity2id, relation2id)
+    elif 'umls' in dataset_key:
+        entity_text_dict, relation_text_dict = process_text_umls(data_dir, entity2id, relation2id)
     else:
         raise ValueError(f"Error: Unknown dataset {dataset_name}. Please provide text descriptions for this dataset.")
 

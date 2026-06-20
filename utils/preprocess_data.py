@@ -3,6 +3,7 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+import re
 from transformers import AutoModel, AutoTokenizer
 
 def load_triples(file_path):
@@ -13,6 +14,72 @@ def load_triples(file_path):
             h, r, t = line.strip().split('\t')
             triples.append((h, r, t))
     return triples
+
+def load_counted_id_map(file_path):
+    """Load files with first-line count followed by token<TAB>id rows."""
+    token_to_id = {}
+    id_to_token = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        first = f.readline().strip()
+        expected_count = int(first) if first else 0
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) != 2:
+                continue
+            token, raw_id = parts
+            idx = int(raw_id)
+            token_to_id[token] = idx
+            id_to_token[idx] = token
+
+    if expected_count != len(token_to_id):
+        raise ValueError(
+            f"{file_path} declares {expected_count} rows but "
+            f"{len(token_to_id)} rows were loaded."
+        )
+    return token_to_id, id_to_token
+
+def load_nell995_triples(file_path, id_to_entity, id_to_relation):
+    """
+    Load NELL-995 split files.
+
+    Format: first line is count; each triple line is `head_id tail_id relation_id`.
+    """
+    triples = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        first = f.readline().strip()
+        expected_count = int(first) if first else 0
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != 3:
+                continue
+            h_id, t_id, r_id = map(int, parts)
+            triples.append((
+                id_to_entity[h_id],
+                id_to_relation[r_id],
+                id_to_entity[t_id],
+            ))
+
+    if expected_count != len(triples):
+        raise ValueError(
+            f"{file_path} declares {expected_count} triples but "
+            f"{len(triples)} triples were loaded."
+        )
+    return triples
+
+def load_nell995_dataset(data_dir, add_inverse=True):
+    data_path = Path(data_dir)
+    entity2id, id_to_entity = load_counted_id_map(data_path / 'entity2id.txt')
+    relation2id, id_to_relation = load_counted_id_map(data_path / 'relation2id.txt')
+
+    if add_inverse:
+        num_original_relations = len(relation2id)
+        for relation, rid in list(relation2id.items()):
+            relation2id[relation + '_inv'] = rid + num_original_relations
+
+    train_triples = load_nell995_triples(data_path / 'train.txt', id_to_entity, id_to_relation)
+    valid_triples = load_nell995_triples(data_path / 'valid.txt', id_to_entity, id_to_relation)
+    test_triples = load_nell995_triples(data_path / 'test.txt', id_to_entity, id_to_relation)
+    return train_triples, valid_triples, test_triples, entity2id, relation2id
 
 def create_vocabularies(train_triples, valid_triples, test_triples, add_inverse=True):
     """Create entity and relation mappings."""
@@ -137,6 +204,37 @@ def process_text_wn18rr(data_dir, entity2id, relation2id):
             
     return entity_text, relation_text
 
+def process_text_nell995(data_dir, entity2id, relation2id):
+    """Create readable text from NELL concept identifiers."""
+    entity_text = {}
+    relation_text = {}
+
+    def clean_entity(entity):
+        text = entity
+        if text.startswith('concept_'):
+            text = text[len('concept_'):]
+        text = text.replace('_', ' ')
+        return text.strip()
+
+    def clean_relation(relation):
+        text = relation
+        if text.endswith('_inv'):
+            base = clean_relation(text[:-4])
+            return 'inverse of ' + base
+        if text.startswith('concept:'):
+            text = text[len('concept:'):]
+        text = text.replace('_', ' ')
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    for entity, eid in entity2id.items():
+        entity_text[str(eid)] = clean_entity(entity)
+
+    for relation, rid in relation2id.items():
+        relation_text[str(rid)] = clean_relation(relation)
+
+    return entity_text, relation_text
+
 def precompute_text_embeddings(
     entity_text_dict,
     relation_text_dict,
@@ -221,13 +319,23 @@ def process_dataset(
     
     print(f"Processing data from {data_path} for {dataset_name}...")
     
-    # 1. Load Triples
-    train_triples = load_triples(data_path / 'train.txt')
-    valid_triples = load_triples(data_path / 'valid.txt')
-    test_triples = load_triples(data_path / 'test.txt')
-    
-    # 2. Vocabularies
-    entity2id, relation2id = create_vocabularies(train_triples, valid_triples, test_triples, add_inverse)
+    # 1. Load triples and vocabularies
+    dataset_key = dataset_name.lower()
+    if 'nell' in dataset_key:
+        train_triples, valid_triples, test_triples, entity2id, relation2id = load_nell995_dataset(
+            data_path,
+            add_inverse=add_inverse,
+        )
+    else:
+        train_triples = load_triples(data_path / 'train.txt')
+        valid_triples = load_triples(data_path / 'valid.txt')
+        test_triples = load_triples(data_path / 'test.txt')
+        entity2id, relation2id = create_vocabularies(
+            train_triples,
+            valid_triples,
+            test_triples,
+            add_inverse,
+        )
     
     # Save Vocabs
     with open(out_path / 'entity2id.json', 'w') as f:
@@ -256,11 +364,13 @@ def process_dataset(
     
     # 4. Process Text Descriptions
     print(f"Generating descriptions for {dataset_name}...")
-    if 'fb15k' in dataset_name.lower():
+    if 'fb15k' in dataset_key:
         # Requires mid2description.txt
         entity_text_dict, relation_text_dict = process_text_fb15k237(data_dir, entity2id, relation2id)
-    elif 'wn18' in dataset_name.lower():
+    elif 'wn18' in dataset_key:
         entity_text_dict, relation_text_dict = process_text_wn18rr(data_dir, entity2id, relation2id)
+    elif 'nell' in dataset_key:
+        entity_text_dict, relation_text_dict = process_text_nell995(data_dir, entity2id, relation2id)
     else:
         raise ValueError(f"Error: Unknown dataset {dataset_name}. Please provide text descriptions for this dataset.")
 

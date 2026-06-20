@@ -8,7 +8,6 @@ import torch
 
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import ContextAggregator, GWM
-from train import configure_structural_embeddings
 
 
 def make_config(context_agg='mean'):
@@ -29,41 +28,22 @@ def make_config(context_agg='mean'):
 
 
 class ModelTests(unittest.TestCase):
-    def test_structural_freeze_targets_structural_tables(self):
+    def test_text_embedding_load_and_freeze_targets_text_tables(self):
         model = GWM(make_config())
-        model.load_embeddings(
-            torch.randn(4, 4),
-            torch.randn(4, 4),
-            kind='structural',
+        model.load_text_embeddings(
+            torch.randn(4, 6),
+            torch.randn(4, 6),
             freeze=True,
         )
-        self.assertFalse(model.struct_ent_embs.weight.requires_grad)
-        self.assertFalse(model.struct_rel_embs.weight.requires_grad)
-        self.assertTrue(model.text_ent_embs.weight.requires_grad)
-
-    def test_random_structural_embeddings_remain_trainable_when_not_loaded(self):
-        config = make_config()
-        config.data_dir = 'unused'
-        config.load_structural_embeddings = False
-        config.freeze_structural_embeddings = False
-        model = GWM(config)
-
-        configure_structural_embeddings(model, config)
-
+        self.assertFalse(model.text_ent_embs.weight.requires_grad)
+        self.assertFalse(model.text_rel_embs.weight.requires_grad)
         self.assertTrue(model.struct_ent_embs.weight.requires_grad)
         self.assertTrue(model.struct_rel_embs.weight.requires_grad)
-        self.assertFalse(config.load_structural_embeddings)
-        self.assertFalse(config.freeze_structural_embeddings)
 
-    def test_cannot_freeze_random_structural_embeddings(self):
-        config = make_config()
-        config.data_dir = 'unused'
-        config.load_structural_embeddings = False
-        config.freeze_structural_embeddings = True
-        model = GWM(config)
-
-        with self.assertRaises(ValueError):
-            configure_structural_embeddings(model, config)
+    def test_structural_embeddings_are_trainable_by_default(self):
+        model = GWM(make_config())
+        self.assertTrue(model.struct_ent_embs.weight.requires_grad)
+        self.assertTrue(model.struct_rel_embs.weight.requires_grad)
 
     def test_isolated_head_preserves_self_state(self):
         for reduction in ('mean', 'max'):

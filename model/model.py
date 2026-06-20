@@ -252,7 +252,7 @@ class GWM(nn.Module):
         query_vector = h_n[-1]
         return query_vector
 
-    def _load_embedding_tensor(self, source, expected_rows, name):
+    def _load_text_embedding_tensor(self, source, expected_rows, expected_dim, name):
         if isinstance(source, str):
             loaded = torch.load(source, map_location='cpu')
         elif torch.is_tensor(source):
@@ -278,52 +278,38 @@ class GWM(nn.Module):
             raise ValueError(
                 f"{name} cache row count mismatch. Expected {expected_rows}, got {loaded.size(0)}"
             )
+        if loaded.size(1) != expected_dim:
+            raise ValueError(
+                f"{name} cache dimension mismatch. Expected {expected_dim}, got {loaded.size(1)}"
+            )
         return loaded      
 
-    def load_embeddings(self, entity_source, relation_source, kind='text', freeze=False):
-        if kind == 'text':
-            entity_table = self.text_ent_embs
-            relation_table = self.text_rel_embs
-            expected_dim = self.text_emb_dim
-            entity_name = 'text_entity'
-            relation_name = 'text_relation'
-        elif kind == 'structural':
-            entity_table = self.struct_ent_embs
-            relation_table = self.struct_rel_embs
-            expected_dim = self.struct_emb_dim
-            entity_name = 'structural_entity'
-            relation_name = 'structural_relation'
-        else:
-            raise ValueError(f"Unsupported embedding kind: {kind}")
-
-        entity_cache = self._load_embedding_tensor(
+    def load_text_embeddings(self, entity_source, relation_source, freeze=True):
+        entity_cache = self._load_text_embedding_tensor(
             source=entity_source,
-            expected_rows=entity_table.num_embeddings,
-            name=entity_name,
+            expected_rows=self.text_ent_embs.num_embeddings,
+            expected_dim=self.text_emb_dim,
+            name='text_entity',
         )
-        relation_cache = self._load_embedding_tensor(
+        relation_cache = self._load_text_embedding_tensor(
             source=relation_source,
-            expected_rows=relation_table.num_embeddings,
-            name=relation_name,
+            expected_rows=self.text_rel_embs.num_embeddings,
+            expected_dim=self.text_emb_dim,
+            name='text_relation',
         )
 
         if entity_cache.size(1) != relation_cache.size(1):
             raise ValueError(
-                f"{entity_name} and {relation_name} embeddings must share the same embedding dimension. "
+                "text_entity and text_relation embeddings must share the same embedding dimension. "
                 f"Got {entity_cache.size(1)} and {relation_cache.size(1)}"
             )
 
-        if entity_cache.size(1) != expected_dim:
-            raise ValueError(
-                f"Embedding dimension mismatch. Expected {expected_dim}, got {entity_cache.size(1)}"
-            )
-
-        entity_table.weight.data.copy_(entity_cache)
-        relation_table.weight.data.copy_(relation_cache)
+        self.text_ent_embs.weight.data.copy_(entity_cache)
+        self.text_rel_embs.weight.data.copy_(relation_cache)
 
         if freeze:
-            entity_table.weight.requires_grad = False
-            relation_table.weight.requires_grad = False
+            self.text_ent_embs.weight.requires_grad = False
+            self.text_rel_embs.weight.requires_grad = False
 
     @staticmethod
     def _filtered_in_batch_contrastive_loss(

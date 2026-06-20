@@ -1,13 +1,10 @@
-# Config for context-aware GWM with precomputed text embeddings
+# Config for context-aware GWM with frozen text embeddings and trainable structural ID embeddings
 text_emb_dim: 768
 struct_emb_dim: 896
 fusion_dim: 1024
 
 text_adapter_dim: 768
 struct_adapter_dim: 896
-
-load_structural_embeddings: true
-freeze_structural_embeddings: false
 
 dynamics_layers: 2
 

@@ -67,8 +67,8 @@ class GatedFusion(nn.Module):
         self.text_projection = nn.Linear(text_dim, fusion_dim)
         self.struct_projection = nn.Linear(struct_dim, fusion_dim)
         self.gate = nn.Sequential(
-            nn.LayerNorm(text_dim + struct_dim),
-            nn.Linear(text_dim + struct_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim * 2),
+            nn.Linear(fusion_dim * 2, fusion_dim),
             nn.Sigmoid(),
         )
         self.output_norm = nn.LayerNorm(fusion_dim)

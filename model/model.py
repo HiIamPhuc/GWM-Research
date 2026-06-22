@@ -6,19 +6,9 @@ import torch.nn.functional as F
 class ContextAggregator(nn.Module):
     """Pool relation-composed facts, add the head residual, and normalize."""
 
-    SUPPORTED_REDUCTIONS = {'mean', 'max'}
-
-    def __init__(self, hidden_dim, reduction='mean'):
+    def __init__(self, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.reduction = str(reduction).lower()
-        if self.reduction not in self.SUPPORTED_REDUCTIONS:
-            supported = ', '.join(sorted(self.SUPPORTED_REDUCTIONS))
-            raise ValueError(
-                f"Unsupported context aggregation '{reduction}'. "
-                f"Expected one of: {supported}."
-            )
-
         self.norm = nn.LayerNorm(hidden_dim)
 
     def _aggregate(self, messages, batch_index, batch_size, reference):
@@ -26,40 +16,11 @@ class ContextAggregator(nn.Module):
         if messages.numel() == 0:
             return aggregated
 
-        if self.reduction == 'mean':
-            aggregated.index_add_(0, batch_index, messages)
-            counts = torch.zeros(
-                batch_size,
-                1,
-                device=reference.device,
-                dtype=reference.dtype,
-            )
-            counts.index_add_(
-                0,
-                batch_index,
-                torch.ones(
-                    messages.size(0),
-                    1,
-                    device=reference.device,
-                    dtype=reference.dtype,
-                ),
-            )
-            return aggregated / counts.clamp_min(1.0)
+        aggregated.index_add_(0, batch_index, messages)
+        counts = torch.zeros(batch_size, 1, device=reference.device, dtype=reference.dtype)
+        counts.index_add_(0, batch_index, torch.ones(messages.size(0), 1, device=reference.device, dtype=reference.dtype))
 
-        aggregated.fill_(float('-inf'))
-        expanded_index = batch_index.unsqueeze(-1).expand_as(messages)
-        aggregated.scatter_reduce_(
-            0,
-            expanded_index,
-            messages,
-            reduce='amax',
-            include_self=True,
-        )
-        return torch.where(
-            torch.isfinite(aggregated),
-            aggregated,
-            torch.zeros_like(aggregated),
-        )
+        return aggregated / counts.clamp_min(1.0)
 
     def forward(self, head_feat, nbr_entity_feat, nbr_relation_feat, nbr_batch_index):
         """
@@ -68,22 +29,7 @@ class ContextAggregator(nn.Module):
         nbr_relation_feat: (E, H)
         nbr_batch_index: (E,) long, edge -> head index in batch
         """
-        if nbr_entity_feat.shape != nbr_relation_feat.shape:
-            raise ValueError(
-                "Context entity and relation features must have identical shapes."
-            )
-        if nbr_batch_index.dim() != 1:
-            raise ValueError("Context batch indices must be one-dimensional.")
-        if nbr_batch_index.numel() != nbr_entity_feat.size(0):
-            raise ValueError(
-                "Each context fact must have one corresponding batch index."
-            )
-        if nbr_batch_index.numel() and (
-            nbr_batch_index.min() < 0
-            or nbr_batch_index.max() >= head_feat.size(0)
-        ):
-            raise ValueError("Context batch index is outside the current batch.")
-
+        
         composed_facts = nbr_entity_feat * nbr_relation_feat
         agg = self._aggregate(
             composed_facts,
@@ -118,10 +64,6 @@ class GatedFusion(nn.Module):
 
     def __init__(self, text_dim, struct_dim, fusion_dim, dropout=0.0):
         super().__init__()
-        self.text_layer_norm = nn.LayerNorm(text_dim)
-        self.struct_layer_norm = nn.LayerNorm(struct_dim)
-        self.text_projection = nn.Linear(text_dim, fusion_dim)
-        self.struct_projection = nn.Linear(struct_dim, fusion_dim)
         self.gate = nn.Sequential(
             nn.LayerNorm(fusion_dim * 2),
             nn.Linear(fusion_dim * 2, fusion_dim),
@@ -131,15 +73,10 @@ class GatedFusion(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, text_features, struct_features):
-        text_projected = self.text_projection(
-            self.text_layer_norm(text_features)
-        )
-        struct_projected = self.struct_projection(
-            self.struct_layer_norm(struct_features)
-        )
-        gate = self.gate(torch.cat([text_projected, struct_projected], dim=-1))
-        fused = gate * text_projected + (1.0 - gate) * struct_projected
-        return self.output_norm(self.dropout(fused)), gate
+        gate = self.gate(torch.cat([text_features, struct_features], dim=-1))
+        fused = gate * text_features + (1.0 - gate) * struct_features
+        fused = self.dropout(fused)
+        return self.output_norm(fused), gate
 
 
 class GWM(nn.Module):

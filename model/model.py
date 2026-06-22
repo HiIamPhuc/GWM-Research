@@ -64,6 +64,8 @@ class GatedFusion(nn.Module):
 
     def __init__(self, text_dim, struct_dim, fusion_dim, dropout=0.0):
         super().__init__()
+        self.text_projection = nn.Linear(text_dim, fusion_dim)
+        self.struct_projection = nn.Linear(struct_dim, fusion_dim)
         self.gate = nn.Sequential(
             nn.LayerNorm(text_dim + struct_dim),
             nn.Linear(text_dim + struct_dim, fusion_dim),
@@ -73,8 +75,10 @@ class GatedFusion(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, text_features, struct_features):
-        gate = self.gate(torch.cat([text_features, struct_features], dim=-1))
-        fused = gate * text_features + (1.0 - gate) * struct_features
+        text_projected = self.text_projection(text_features)
+        struct_projected = self.struct_projection(struct_features)
+        gate = self.gate(torch.cat([text_projected, struct_projected], dim=-1))
+        fused = gate * text_projected + (1.0 - gate) * struct_projected
         fused = self.dropout(fused)
         return self.output_norm(fused), gate
 

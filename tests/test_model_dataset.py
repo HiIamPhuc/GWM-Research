@@ -17,7 +17,7 @@ def make_config(context_agg='mean'):
         num_relations=4,
         text_emb_dim=6,
         struct_emb_dim=4,
-        fusion_dim=5,
+        fusion_dim=10,
         text_adapter_dim=6,
         struct_adapter_dim=4,
         dynamics_layers=1,
@@ -213,12 +213,18 @@ class ModelTests(unittest.TestCase):
                     truth_mask=torch.eye(2, dtype=torch.bool),
                 )
                 self.assertEqual(scores.shape, (2, 2))
-                self.assertEqual(query.shape, (2, 5))
-                self.assertEqual(targets.shape, (2, 5))
+                self.assertEqual(query.shape, (2, 10))
+                self.assertEqual(targets.shape, (2, 10))
                 self.assertTrue(torch.isfinite(loss))
                 loss.backward()
                 self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
                 self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
+
+    def test_no_projection_fusion_requires_concatenated_dimension(self):
+        config = make_config()
+        config.fusion_dim = 5
+        with self.assertRaisesRegex(ValueError, 'text_emb_dim \\+ struct_emb_dim'):
+            GWM(config)
 
 
 class DatasetTests(unittest.TestCase):

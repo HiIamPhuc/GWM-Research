@@ -60,6 +60,54 @@ def load_hr_map_for_filtering(data_dir, preferred_ground_truth_file=None, fallba
     return hr_map
 
 
+def load_inverse_relation_id_map(data_dir):
+    with open(os.path.join(data_dir, 'relation2id.json'), 'r', encoding='utf-8') as f:
+        relation2id = json.load(f)
+
+    inverse_relation_ids = {}
+    missing = []
+    for relation, relation_id in relation2id.items():
+        inverse_relation = (
+            relation[:-4] if relation.endswith('_inv') else relation + '_inv'
+        )
+        if inverse_relation not in relation2id:
+            missing.append(relation)
+            continue
+        inverse_relation_ids[int(relation_id)] = int(relation2id[inverse_relation])
+
+    if missing:
+        preview = ', '.join(missing[:10])
+        raise ValueError(
+            "Strict bidirectional evaluation requires every relation to have "
+            f"an inverse relation ID. Missing inverse entries for: {preview}"
+        )
+
+    return inverse_relation_ids
+
+
+def assert_bidirectional_split(data_dir, split):
+    """Require an evaluation split to contain each triple and its inverse."""
+    inverse_relation_ids = load_inverse_relation_id_map(data_dir)
+    path = os.path.join(data_dir, f'{split}_triples.pt')
+    triples = torch.load(path, map_location='cpu').long()
+    triple_set = {tuple(row) for row in triples.tolist()}
+
+    missing = []
+    for h, r, t in triple_set:
+        inverse = (t, inverse_relation_ids[r], h)
+        if inverse not in triple_set:
+            missing.append((h, r, t))
+            if len(missing) >= 5:
+                break
+
+    if missing:
+        raise ValueError(
+            f"{split}_triples.pt is not bidirectional. Re-run preprocessing "
+            "with add_inverse enabled so validation/test contain inverse "
+            f"triples. Example missing inverse for: {missing[0]}"
+        )
+
+
 def build_entity_loader(data_dir, batch_size, num_workers=2):
     entity_dataset = EntityDataset(data_dir)
 

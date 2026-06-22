@@ -8,6 +8,7 @@ import torch
 
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import ContextAggregator, GWM
+from utils.eval import assert_bidirectional_split
 
 
 def make_config(context_agg='mean'):
@@ -253,6 +254,23 @@ class DatasetTests(unittest.TestCase):
                 set(batch['context_batch']),
                 {'id', 'rel_id', 'batch_index'},
             )
+
+    def test_bidirectional_split_guard_rejects_tail_only_eval_split(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            (root_path / 'relation2id.json').write_text(
+                json.dumps({'r': 0, 'r_inv': 1}), encoding='utf-8'
+            )
+            torch.save(torch.tensor([[0, 0, 1]]), root_path / 'valid_triples.pt')
+
+            with self.assertRaisesRegex(ValueError, 'not bidirectional'):
+                assert_bidirectional_split(root, 'valid')
+
+            torch.save(
+                torch.tensor([[0, 0, 1], [1, 1, 0]]),
+                root_path / 'valid_triples.pt',
+            )
+            assert_bidirectional_split(root, 'valid')
 
 
 if __name__ == '__main__':

@@ -17,6 +17,7 @@ from model.model import GWM
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
+    assert_bidirectional_split,
     build_entity_loader,
     compute_filtered_ranking_metrics,
     encode_all_entities_as_targets,
@@ -175,8 +176,6 @@ def train(args):
     print("Loaded text embeddings into text embedding tables...")
 
     print("Using trainable structural ID embeddings initialized by the model...")
-
-    config.training_objective = 'single_positive_filtered_in_batch'
     
     # Save effective config (including inferred dimensions, CLI overrides, and model params).
     save_training_config(config, config.output_dir, args=args, model=model)
@@ -212,6 +211,7 @@ def train(args):
     # Validation Loader
     if os.path.exists(os.path.join(config.data_dir, 'valid_triples.pt')):
         print("Loading validation data...")
+        assert_bidirectional_split(config.data_dir, 'valid')
         valid_dataset = GWMDataset(config.data_dir, split='valid')
         valid_loader = DataLoader(
             valid_dataset, 

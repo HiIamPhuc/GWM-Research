@@ -316,6 +316,16 @@ def process_text_umls(data_dir, entity2id, relation2id):
 
     return entity_text, relation_text
 
+def triples_to_ids(triples, entity2id, relation2id, add_inverse=False):
+    ids = []
+    for h, r, t in triples:
+        h_id, r_id, t_id = entity2id[h], relation2id[r], entity2id[t]
+        ids.append((h_id, r_id, t_id))
+        if add_inverse:
+            r_inv_id = relation2id[r + '_inv']
+            ids.append((t_id, r_inv_id, h_id))
+    return torch.tensor(ids, dtype=torch.long)
+
 def precompute_text_embeddings(
     entity_text_dict,
     relation_text_dict,
@@ -428,21 +438,10 @@ def process_dataset(
         json.dump(entity2id, f, indent=2)
     with open(out_path / 'relation2id.json', 'w') as f:
         json.dump(relation2id, f, indent=2)
-        
-    # 3. Convert Triples to IDs
-    def triples_to_ids(triples, add_inv=False):
-        ids = []
-        for h, r, t in triples:
-            h_id, r_id, t_id = entity2id[h], relation2id[r], entity2id[t]
-            ids.append((h_id, r_id, t_id))
-            if add_inv:
-                r_inv_id = relation2id[r + '_inv']
-                ids.append((t_id, r_inv_id, h_id))
-        return torch.tensor(ids, dtype=torch.long)
 
-    train_tensor = triples_to_ids(train_triples, add_inv=add_inverse)
-    valid_tensor = triples_to_ids(valid_triples, add_inv=False)
-    test_tensor = triples_to_ids(test_triples, add_inv=False)
+    train_tensor = triples_to_ids(train_triples, entity2id, relation2id, add_inverse=add_inverse)
+    valid_tensor = triples_to_ids(valid_triples, entity2id, relation2id, add_inverse=add_inverse)
+    test_tensor = triples_to_ids(test_triples, entity2id, relation2id, add_inverse=add_inverse)
     
     torch.save(train_tensor, out_path / 'train_triples.pt')
     torch.save(valid_tensor, out_path / 'valid_triples.pt')

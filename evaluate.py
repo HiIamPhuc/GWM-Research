@@ -12,6 +12,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model.model import GWM
 from model.dataset import GWMDataset, CollateFN
 from utils.eval import (
+    assert_bidirectional_split,
     build_entity_loader,
     compute_filtered_ranking_metrics,
     encode_all_entities_as_targets,
@@ -92,6 +93,7 @@ def evaluate(args):
     if not os.path.exists(os.path.join(config.data_dir, f'{split}_triples.pt')):
         print(f"Test triples not found, using 'valid' set.")
         split = 'valid'
+    assert_bidirectional_split(config.data_dir, split)
 
     test_dataset = GWMDataset(config.data_dir, split=split)
     collate_fn = CollateFN()
@@ -149,7 +151,7 @@ def evaluate(args):
         'mrr': final_mrr,
         'hits1': final_h1,
         'hits3': final_h3,
-        'hits10': final_h10
+        'hits10': final_h10,
     }
     with open(os.path.join(config.output_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)

@@ -7,7 +7,24 @@ from utils.preprocess_data import (
     load_umls_dataset,
     process_text_nell995,
     process_text_umls,
+    triples_to_ids,
 )
+
+
+class TripleConversionTests(unittest.TestCase):
+    def test_triples_to_ids_can_emit_inverse_rows_for_eval_splits(self):
+        triples = [('a', 'r', 'b')]
+        entity2id = {'a': 0, 'b': 1}
+        relation2id = {'r': 0, 'r_inv': 1}
+
+        tensor = triples_to_ids(
+            triples,
+            entity2id,
+            relation2id,
+            add_inverse=True,
+        )
+
+        self.assertEqual(tensor.tolist(), [[0, 0, 1], [1, 1, 0]])
 
 
 class NELLPreprocessTests(unittest.TestCase):

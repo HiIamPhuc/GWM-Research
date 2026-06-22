@@ -65,8 +65,8 @@ class GatedFusion(nn.Module):
     def __init__(self, text_dim, struct_dim, fusion_dim, dropout=0.0):
         super().__init__()
         self.gate = nn.Sequential(
-            nn.LayerNorm(fusion_dim * 2),
-            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.LayerNorm(text_dim + struct_dim),
+            nn.Linear(text_dim + struct_dim, fusion_dim),
             nn.Sigmoid(),
         )
         self.output_norm = nn.LayerNorm(fusion_dim)

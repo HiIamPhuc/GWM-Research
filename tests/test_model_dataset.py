@@ -47,44 +47,32 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(model.struct_rel_embs.weight.requires_grad)
 
     def test_isolated_head_preserves_self_state(self):
-        for reduction in ('mean', 'max'):
-            with self.subTest(reduction=reduction):
-                layer = ContextAggregator(
-                    hidden_dim=4,
-                    reduction=reduction,
-                )
-                output = layer(
-                    head_feat=torch.randn(2, 4),
-                    nbr_entity_feat=torch.empty(0, 4),
-                    nbr_relation_feat=torch.empty(0, 4),
-                    nbr_batch_index=torch.empty(0, dtype=torch.long),
-                )
-                self.assertEqual(output.shape, (2, 4))
-                self.assertTrue(torch.isfinite(output).all())
-                self.assertFalse(torch.equal(output, torch.zeros_like(output)))
+        layer = ContextAggregator(hidden_dim=4)
+        output = layer(
+            head_feat=torch.randn(2, 4),
+            nbr_entity_feat=torch.empty(0, 4),
+            nbr_relation_feat=torch.empty(0, 4),
+            nbr_batch_index=torch.empty(0, dtype=torch.long),
+        )
+        self.assertEqual(output.shape, (2, 4))
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertFalse(torch.equal(output, torch.zeros_like(output)))
 
-    def test_context_aggregator_mean_and_max_reductions(self):
+    def test_context_aggregator_mean_reduction(self):
         messages = torch.tensor(
             [[1.0, 3.0], [5.0, 2.0], [7.0, 9.0]]
         )
         batch_index = torch.tensor([0, 0, 1])
         reference = torch.zeros(2, 2)
 
-        mean_layer = ContextAggregator(2, reduction='mean')
-        max_layer = ContextAggregator(2, reduction='max')
+        mean_layer = ContextAggregator(2)
 
         mean_result = mean_layer._aggregate(
-            messages, batch_index, batch_size=2, reference=reference
-        )
-        max_result = max_layer._aggregate(
             messages, batch_index, batch_size=2, reference=reference
         )
 
         self.assertTrue(
             torch.equal(mean_result, torch.tensor([[3.0, 2.5], [7.0, 9.0]]))
-        )
-        self.assertTrue(
-            torch.equal(max_result, torch.tensor([[5.0, 3.0], [7.0, 9.0]]))
         )
 
     def test_context_aggregator_forward_is_residual_pooling_then_norm(self):
@@ -97,7 +85,7 @@ class ModelTests(unittest.TestCase):
         )
         batch_index = torch.tensor([0, 0, 1])
 
-        layer = ContextAggregator(2, reduction='mean')
+        layer = ContextAggregator(2)
         output = layer(
             head,
             neighbor_entities,
@@ -194,37 +182,58 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(losses[0].item(), 17.0)
 
     def test_early_fusion_loss_backpropagates_to_gate(self):
-        for reduction in ('mean', 'max'):
-            with self.subTest(reduction=reduction):
-                model = GWM(make_config(reduction))
-                h_batch = {'id': torch.tensor([0, 1])}
-                r_batch = {'id': torch.tensor([0, 1])}
-                t_batch = {'id': torch.tensor([2, 3])}
-                context_batch = {
-                    'id': torch.tensor([1, 2]),
-                    'rel_id': torch.tensor([0, 1]),
-                    'batch_index': torch.tensor([0, 1]),
-                }
-                query = model(h_batch, r_batch, context_batch)
-                targets = model.encode_target(t_batch)
-                loss, scores = model.compute_loss(
-                    query,
-                    targets,
-                    truth_mask=torch.eye(2, dtype=torch.bool),
-                )
-                self.assertEqual(scores.shape, (2, 2))
-                self.assertEqual(query.shape, (2, 10))
-                self.assertEqual(targets.shape, (2, 10))
-                self.assertTrue(torch.isfinite(loss))
-                loss.backward()
-                self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
-                self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
+        model = GWM(make_config())
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        t_batch = {'id': torch.tensor([2, 3])}
+        context_batch = {
+            'id': torch.tensor([1, 2]),
+            'rel_id': torch.tensor([0, 1]),
+            'batch_index': torch.tensor([0, 1]),
+        }
+        query = model(h_batch, r_batch, context_batch)
+        targets = model.encode_target(t_batch)
+        loss, scores = model.compute_loss(
+            query,
+            targets,
+            truth_mask=torch.eye(2, dtype=torch.bool),
+        )
+        self.assertEqual(scores.shape, (2, 2))
+        self.assertEqual(query.shape, (2, 10))
+        self.assertEqual(targets.shape, (2, 10))
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
+        self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
 
-    def test_no_projection_fusion_requires_concatenated_dimension(self):
-        config = make_config()
-        config.fusion_dim = 5
-        with self.assertRaisesRegex(ValueError, 'text_emb_dim \\+ struct_emb_dim'):
-            GWM(config)
+    def test_gate_statistics_are_recorded_and_consumed(self):
+        model = GWM(make_config())
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        t_batch = {'id': torch.tensor([2, 3])}
+        context_batch = {
+            'id': torch.tensor([1, 2]),
+            'rel_id': torch.tensor([0, 1]),
+            'batch_index': torch.tensor([0, 1]),
+        }
+
+        model(h_batch, r_batch, context_batch)
+        model.encode_target(t_batch)
+        stats = model.pop_gate_stats()
+
+        self.assertEqual(
+            set(stats),
+            {
+                'head_gate',
+                'relation_gate',
+                'context_entity_gate',
+                'context_relation_gate',
+                'target_gate',
+            },
+        )
+        self.assertGreaterEqual(stats['head_gate'], 0.0)
+        self.assertLessEqual(stats['head_gate'], 1.0)
+        self.assertEqual(model.pop_gate_stats(), {})
 
 
 class DatasetTests(unittest.TestCase):

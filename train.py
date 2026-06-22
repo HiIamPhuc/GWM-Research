@@ -63,6 +63,22 @@ def _get_model_parameter_info(model):
     }
 
 
+def _update_metric_sums(sums, counts, values):
+    for key, value in values.items():
+        if value is None:
+            continue
+        sums[key] = sums.get(key, 0.0) + float(value)
+        counts[key] = counts.get(key, 0) + 1
+
+
+def _average_metric_sums(sums, counts, prefix=''):
+    return {
+        f'{prefix}{key}': sums[key] / counts[key]
+        for key in sorted(sums)
+        if counts.get(key, 0) > 0
+    }
+
+
 def save_training_config(config, output_dir, args=None, model=None):
     """Persist the effective training config used for this run."""
     config_dict = {k: _to_serializable(v) for k, v in vars(config).items()}
@@ -268,6 +284,8 @@ def train(args):
         total_filtered_truth_count = 0
         total_query_rows = 0
         filtered_query_rows = 0
+        gate_stat_sums = {}
+        gate_stat_counts = {}
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
@@ -297,6 +315,7 @@ def train(args):
             
             # Forward: Target Vector
             t_fused = model.encode_target(t_batch)
+            gate_stats = model.pop_gate_stats()
 
             optimizer.zero_grad()
 
@@ -317,23 +336,21 @@ def train(args):
             scheduler.step()
 
             total_loss += loss.item()
+            _update_metric_sums(gate_stat_sums, gate_stat_counts, gate_stats)
             pbar.set_postfix({'loss': loss.item()})
 
         _sync_device(device)
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
-        avg_filtered_truths_per_query = (
-            total_filtered_truth_count / max(total_query_rows, 1)
-        )
-        filtered_query_rate = (
-            filtered_query_rows / max(total_query_rows, 1)
+        avg_gate_stats = _average_metric_sums(
+            gate_stat_sums,
+            gate_stat_counts,
+            prefix='train_',
         )
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-            f"Filtered Truths/Query: {avg_filtered_truths_per_query:.4f} | "
-            f"Rows with Filtered Truths: {filtered_query_rate:.4f} | "
             f"Train Time: {epoch_train_seconds:.2f}s"
         )
         
@@ -389,8 +406,6 @@ def train(args):
             epoch_log = {
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
-                'avg_filtered_truths_per_query': avg_filtered_truths_per_query,
-                'filtered_query_rate': filtered_query_rate,
                 'val_mrr': val_mrr, 
                 'val_mr': val_mr,
                 'val_hits1': val_h1,
@@ -403,6 +418,7 @@ def train(args):
                 'val_micro_mrr': val_metrics['micro']['MRR'],
                 'val_micro_hits10': val_metrics['micro']['Hits@10'],
             }
+            epoch_log.update(avg_gate_stats)
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                 json.dump(history, f, indent=2)
@@ -432,10 +448,9 @@ def train(args):
              # Log train only
             epoch_log = {
                 'epoch': epoch + 1,
-                'train_loss': avg_train_loss,
-                'avg_filtered_truths_per_query': avg_filtered_truths_per_query,
-                'filtered_query_rate': filtered_query_rate,
+                'train_loss': avg_train_loss
             }
+            epoch_log.update(avg_gate_stats)
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                   json.dump(history, f, indent=2)

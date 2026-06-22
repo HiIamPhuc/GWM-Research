@@ -144,6 +144,21 @@ class GWM(nn.Module):
         )
 
         self.temperature = float(getattr(config, 'temperature'))
+        self._last_gate_stats = {}
+
+    def reset_gate_stats(self):
+        self._last_gate_stats = {}
+
+    def _record_gate_stats(self, name, gate):
+        if gate.numel() == 0:
+            return
+
+        self._last_gate_stats[name] = gate.detach().float().mean().item()
+
+    def pop_gate_stats(self):
+        stats = dict(self._last_gate_stats)
+        self.reset_gate_stats()
+        return stats
         
     def _prepare_context_batch(self, context_batch):
         context_entity_ids = context_batch['id']
@@ -289,20 +304,25 @@ class GWM(nn.Module):
         )
 
     def forward(self, h_batch, r_batch, context_batch):
+        self.reset_gate_stats()
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
         r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
         h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
         r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
-        h_fused, _ = self.entity_fusion(h_text, h_struct)
-        r_fused, _ = self.relation_fusion(r_text, r_struct)
+        h_fused, h_gate = self.entity_fusion(h_text, h_struct)
+        r_fused, r_gate = self.relation_fusion(r_text, r_struct)
+        self._record_gate_stats('head_gate', h_gate)
+        self._record_gate_stats('relation_gate', r_gate)
 
         flat_context_entity_ids, flat_context_relation_ids, context_batch_index = self._prepare_context_batch(context_batch)
         ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
         ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
         ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
         ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
-        ctx_ent_fused, _ = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
-        ctx_rel_fused, _ = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
+        ctx_ent_fused, ctx_ent_gate = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
+        ctx_rel_fused, ctx_rel_gate = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
+        self._record_gate_stats('context_entity_gate', ctx_ent_gate)
+        self._record_gate_stats('context_relation_gate', ctx_rel_gate)
 
         world_state = self.fused_context_aggregator(
             head_feat=h_fused,
@@ -323,7 +343,8 @@ class GWM(nn.Module):
     def encode_target(self, t_batch):
         t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
         t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
-        t_fused, _ = self.entity_fusion(t_text, t_struct)
+        t_fused, t_gate = self.entity_fusion(t_text, t_struct)
+        self._record_gate_stats('target_gate', t_gate)
         return F.normalize(
             self.fused_output_projection(t_fused),
             p=2,

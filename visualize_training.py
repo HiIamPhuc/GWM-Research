@@ -1,253 +1,307 @@
 """
-Visualize training metrics from training_log.json
+Visualize current GWM training logs.
+
+The script is intentionally tolerant of missing fields so it can read older
+training_log.json files as well as the current logs with bidirectional metrics
+and GatedFusion gate statistics.
 """
 
-import json
 import argparse
-import matplotlib.pyplot as plt
-import numpy as np
+import json
 from pathlib import Path
+
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 
 def load_training_log(log_path):
-    """Load training log from JSON file."""
-    with open(log_path, 'r') as f:
+    with open(log_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
-def plot_training_curves(log_data, output_path=None):
-    """Create comprehensive training visualization."""
-    
-    epochs = [entry['epoch'] for entry in log_data if 'epoch' in entry]
-    train_loss = [entry['train_loss'] for entry in log_data if 'train_loss' in entry]
-    
-    val_mrr = [entry.get('val_mrr', None) for entry in log_data]
-    val_mr = [entry.get('val_mr', None) for entry in log_data]
-    val_hits1 = [entry.get('val_hits1', None) for entry in log_data]
-    val_hits3 = [entry.get('val_hits3', None) for entry in log_data]
-    val_hits10 = [entry.get('val_hits10', None) for entry in log_data]
-    
-    train_alpha = [entry.get('train_alpha', None) for entry in log_data]
-    val_alpha = [entry.get('val_alpha', None) for entry in log_data]
-    train_sigreg = [entry.get('train_sigreg', None) for entry in log_data]
-    
-    # Create figure with subplots
-    fig = plt.figure(figsize=(16, 12))
-    
-    # 1. Loss Plot
-    ax1 = plt.subplot(3, 3, 1)
-    ax1.plot(epochs, train_loss, 'b', markersize=1, label='Train Loss')
-    ax1.set_xlabel('Epoch', fontsize=11)
-    ax1.set_ylabel('Loss', fontsize=11)
-    ax1.set_title('Training Loss', fontsize=12, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-    
-    # 2. MRR Plot
-    ax2 = plt.subplot(3, 3, 2)
-    valid_mrr = [(e, m) for e, m in zip(epochs, val_mrr) if m is not None]
-    if valid_mrr:
-        e_vals, m_vals = zip(*valid_mrr)
-        ax2.plot(e_vals, m_vals, 'g-o', markersize=1, label='Val MRR')
-        ax2.set_xlabel('Epoch', fontsize=11)
-        ax2.set_ylabel('MRR', fontsize=11)
-        ax2.set_title('Validation MRR (Higher is Better)', fontsize=12, fontweight='bold')
-        ax2.grid(True, alpha=0.3)
-        ax2.legend()
-        ax2.set_ylim(bottom=0)
-    
-    # 3. Mean Rank Plot
-    ax3 = plt.subplot(3, 3, 3)
-    valid_mr = [(e, m) for e, m in zip(epochs, val_mr) if m is not None]
-    if valid_mr:
-        e_vals, m_vals = zip(*valid_mr)
-        ax3.plot(e_vals, m_vals, 'r-o', markersize=1, label='Val MR')
-        ax3.set_xlabel('Epoch', fontsize=11)
-        ax3.set_ylabel('Mean Rank', fontsize=11)
-        ax3.set_title('Validation Mean Rank (Lower is Better)', fontsize=12, fontweight='bold')
-        ax3.grid(True, alpha=0.3)
-        ax3.legend()
-        ax3.set_ylim(bottom=0)
-    
-    # 4. Hits@1 Plot
-    ax4 = plt.subplot(3, 3, 4)
-    valid_h1 = [(e, h) for e, h in zip(epochs, val_hits1) if h is not None]
-    if valid_h1:
-        e_vals, h_vals = zip(*valid_h1)
-        ax4.plot(e_vals, h_vals, 'purple', marker='o', markersize=1, label='Hits@1')
-        ax4.set_xlabel('Epoch', fontsize=11)
-        ax4.set_ylabel('Hits@1', fontsize=11)
-        ax4.set_title('Validation Hits@1', fontsize=12, fontweight='bold')
-        ax4.grid(True, alpha=0.3)
-        ax4.legend()
-        ax4.set_ylim([0, 1])
-    
-    # 5. Hits@3 Plot
-    ax5 = plt.subplot(3, 3, 5)
-    valid_h3 = [(e, h) for e, h in zip(epochs, val_hits3) if h is not None]
-    if valid_h3:
-        e_vals, h_vals = zip(*valid_h3)
-        ax5.plot(e_vals, h_vals, 'orange', marker='o', markersize=1, label='Hits@3')
-        ax5.set_xlabel('Epoch', fontsize=11)
-        ax5.set_ylabel('Hits@3', fontsize=11)
-        ax5.set_title('Validation Hits@3', fontsize=12, fontweight='bold')
-        ax5.grid(True, alpha=0.3)
-        ax5.legend()
-        ax5.set_ylim([0, 1])
-    
-    # 6. Hits@10 Plot
-    ax6 = plt.subplot(3, 3, 6)
-    valid_h10 = [(e, h) for e, h in zip(epochs, val_hits10) if h is not None]
-    if valid_h10:
-        e_vals, h_vals = zip(*valid_h10)
-        ax6.plot(e_vals, h_vals, 'brown', marker='o', markersize=1, label='Hits@10')
-        ax6.set_xlabel('Epoch', fontsize=11)
-        ax6.set_ylabel('Hits@10', fontsize=11)
-        ax6.set_title('Validation Hits@10', fontsize=12, fontweight='bold')
-        ax6.grid(True, alpha=0.3)
-        ax6.legend()
-        ax6.set_ylim([0, 1])
-    
-    # 7. All Metrics Together
-    ax7 = plt.subplot(3, 3, 7)
-    valid_mrr_data = [(e, m) for e, m in zip(epochs, val_mrr) if m is not None]
-    valid_h1_data = [(e, h) for e, h in zip(epochs, val_hits1) if h is not None]
-    valid_h3_data = [(e, h) for e, h in zip(epochs, val_hits3) if h is not None]
-    valid_h10_data = [(e, h) for e, h in zip(epochs, val_hits10) if h is not None]
-    
-    if valid_mrr_data:
-        e_vals, m_vals = zip(*valid_mrr_data)
-        ax7.plot(e_vals, m_vals, 'g-o', markersize=1, label='MRR')
-    if valid_h1_data:
-        e_vals, h_vals = zip(*valid_h1_data)
-        ax7.plot(e_vals, h_vals, 'purple', marker='s', markersize=1, label='Hits@1')
-    if valid_h3_data:
-        e_vals, h_vals = zip(*valid_h3_data)
-        ax7.plot(e_vals, h_vals, 'orange', marker='^', markersize=1, label='Hits@3')
-    if valid_h10_data:
-        e_vals, h_vals = zip(*valid_h10_data)
-        ax7.plot(e_vals, h_vals, 'brown', marker='x', markersize=1, label='Hits@10')
-    
-    ax7.set_xlabel('Epoch', fontsize=11)
-    ax7.set_ylabel('Score', fontsize=11)
-    ax7.set_title('All Ranking Metrics', fontsize=12, fontweight='bold')
-    ax7.legend(fontsize=9)
-    ax7.grid(True, alpha=0.3)
-    ax7.set_ylim([0, 1])
-    
-    # 8. Text Weight (Alpha) - Train
-    ax8 = plt.subplot(3, 3, 8)
-    valid_train_alpha = [(e, a) for e, a in zip(epochs, train_alpha) if a is not None]
-    if valid_train_alpha:
-        e_vals, a_vals = zip(*valid_train_alpha)
-        ax8.plot(e_vals, a_vals, 'b-o', markersize=1, label='Train Alpha')
-        ax8.set_xlabel('Epoch', fontsize=11)
-        ax8.set_ylabel('Alpha (Text Weight)', fontsize=11)
-        ax8.set_title('Training Gate Weight (α)', fontsize=12, fontweight='bold')
-        ax8.grid(True, alpha=0.3)
-        ax8.legend()
-        ax8.set_ylim([0, 1])
+def epoch_entries(log_data):
+    return [entry for entry in log_data if 'epoch' in entry]
 
-    # 9. SIGReg (Train)
+
+def series(entries, key):
+    points = []
+    for entry in entries:
+        value = entry.get(key)
+        if value is not None:
+            points.append((entry['epoch'], value))
+    return points
+
+
+def plot_lines(ax, entries, specs, title, ylabel, ylim=None):
+    plotted = False
+    for key, label, style in specs:
+        points = series(entries, key)
+        if not points:
+            continue
+        xs, ys = zip(*points)
+        ax.plot(xs, ys, style, markersize=2, linewidth=1.5, label=label)
+        plotted = True
+
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    if plotted:
+        ax.legend(fontsize=8)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            'No data',
+            ha='center',
+            va='center',
+            transform=ax.transAxes,
+            color='gray',
+        )
+
+
+def gate_label(key):
+    label = key
+    if label.startswith('train_'):
+        label = label[len('train_'):]
+    return label.replace('_gate', '').replace('_', ' ')
+
+
+def gate_specs(entries, styles):
+    preferred = [
+        'train_head_gate',
+        'train_relation_gate',
+        'train_context_entity_gate',
+        'train_context_relation_gate',
+        'train_target_gate',
+    ]
+    available = {
+        key
+        for entry in entries
+        for key in entry
+        if key.startswith('train_') and key.endswith('_gate')
+    }
+    keys = [key for key in preferred if key in available]
+    return [
+        (key, gate_label(key), styles[idx % len(styles)])
+        for idx, key in enumerate(keys)
+    ]
+
+
+def plot_training_curves(log_data, output_path=None, show=True):
+    entries = epoch_entries(log_data)
+    if not entries:
+        raise ValueError("Training log does not contain epoch entries.")
+
+    fig = plt.figure(figsize=(18, 14))
+    styles = ['g-o', 'b-s', 'r-^', 'm-d', 'c-x', 'y-*', 'k-p']
+
+    ax1 = plt.subplot(3, 3, 1)
+    plot_lines(
+        ax1,
+        entries,
+        [('train_loss', 'train loss', 'b-')],
+        'Training Loss',
+        'Loss',
+    )
+
+    ax2 = plt.subplot(3, 3, 2)
+    plot_lines(
+        ax2,
+        entries,
+        [
+            ('val_mrr', 'direction avg', 'g-o'),
+            ('val_forward_mrr', 'forward', 'b-s'),
+            ('val_backward_mrr', 'backward', 'r-^'),
+            ('val_micro_mrr', 'micro', 'k--'),
+        ],
+        'Validation MRR',
+        'MRR',
+        ylim=(0, 1),
+    )
+
+    ax3 = plt.subplot(3, 3, 3)
+    plot_lines(
+        ax3,
+        entries,
+        [
+            ('val_hits1', 'Hits@1', 'm-o'),
+            ('val_hits3', 'Hits@3', 'c-s'),
+            ('val_hits10', 'Hits@10', 'y-^'),
+        ],
+        'Validation Hits',
+        'Score',
+        ylim=(0, 1),
+    )
+
+    ax4 = plt.subplot(3, 3, 4)
+    plot_lines(
+        ax4,
+        entries,
+        [
+            ('val_forward_hits10', 'forward Hits@10', 'b-s'),
+            ('val_backward_hits10', 'backward Hits@10', 'r-^'),
+            ('val_micro_hits10', 'micro Hits@10', 'k--'),
+        ],
+        'Directional Hits@10',
+        'Hits@10',
+        ylim=(0, 1),
+    )
+
+    ax5 = plt.subplot(3, 3, 5)
+    plot_lines(
+        ax5,
+        entries,
+        [('val_mr', 'mean rank', 'r-o')],
+        'Validation Mean Rank',
+        'MR',
+    )
+
+    ax6 = plt.subplot(3, 3, 6)
+    plot_lines(
+        ax6,
+        entries,
+        gate_specs(entries, styles),
+        'GatedFusion Gate Values',
+        'Mean gate',
+        ylim=(0, 1),
+    )
+
+    ax7 = plt.subplot(3, 3, 7)
+    plot_lines(
+        ax7,
+        entries,
+        [
+            ('avg_filtered_truths_per_query', 'filtered truths/query', 'b-o'),
+            ('filtered_query_rate', 'rows with filtered truths', 'g-s'),
+        ],
+        'Filtered-Negative Diagnostics',
+        'Value',
+    )
+
+    ax8 = plt.subplot(3, 3, 8)
+    plot_lines(
+        ax8,
+        entries,
+        [
+            ('val_forward_mrr', 'forward MRR', 'b-s'),
+            ('val_backward_mrr', 'backward MRR', 'r-^'),
+        ],
+        'Forward vs Backward MRR',
+        'MRR',
+        ylim=(0, 1),
+    )
+
     ax9 = plt.subplot(3, 3, 9)
-    valid_sigreg = [(e, s) for e, s in zip(epochs, train_sigreg) if s is not None]
-    if valid_sigreg:
-        e_vals, s_vals = zip(*valid_sigreg)
-        ax9.plot(e_vals, s_vals, 'teal', marker='o', markersize=1, label='Train SIGReg')
-        ax9.set_xlabel('Epoch', fontsize=11)
-        ax9.set_ylabel('SIGReg', fontsize=11)
-        ax9.set_title('Training SIGReg', fontsize=12, fontweight='bold')
-        ax9.grid(True, alpha=0.3)
-        ax9.legend()
-    
+    plot_lines(
+        ax9,
+        entries,
+        [
+            ('avg_filtered_truths_per_query', 'filtered truths/query', 'b-o'),
+            ('filtered_query_rate', 'rows with filtered truths', 'g-s'),
+        ],
+        'Filtered-Negative Diagnostics',
+        'Value',
+    )
+
     plt.tight_layout()
-    
-    # Save if output path provided
     if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Visualization saved to: {output_path}")
-    
-    plt.show()
+        print(f"Visualization saved to: {output_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def best_epoch(entries, key, maximize=True):
+    points = series(entries, key)
+    if not points:
+        return None
+    return max(points, key=lambda item: item[1]) if maximize else min(points, key=lambda item: item[1])
 
 
 def print_metrics_summary(log_data):
-    """Print summary statistics."""
-    print("\n" + "="*70)
+    entries = epoch_entries(log_data)
+    print("\n" + "=" * 70)
     print("TRAINING SUMMARY")
-    print("="*70)
-    
-    print(f"\nTotal Epochs: {len(log_data)}")
-    
-    # Training Loss
-    train_losses = [entry['train_loss'] for entry in log_data if 'train_loss' in entry]
-    print(f"\nTraining Loss:")
-    print(f"  Initial: {train_losses[0]:.4f}")
-    print(f"  Final:   {train_losses[-1]:.4f}")
-    print(f"  Best:    {min(train_losses):.4f} (Epoch {train_losses.index(min(train_losses)) + 1})")
-    
-    # Validation Metrics
-    val_mrr = [entry.get('val_mrr', None) for entry in log_data]
-    valid_mrr = [m for m in val_mrr if m is not None]
-    
-    if valid_mrr:
-        print(f"\nValidation MRR:")
-        print(f"  Initial: {valid_mrr[0]:.4f}")
-        print(f"  Final:   {valid_mrr[-1]:.4f}")
-        print(f"  Best:    {max(valid_mrr):.4f} (Epoch {valid_mrr.index(max(valid_mrr)) + 1})")
-        print(f"  Improvement: {(valid_mrr[-1] - valid_mrr[0]) / valid_mrr[0] * 100:.1f}%")
-    
-    # Hits@10
-    val_h10 = [entry.get('val_hits10', None) for entry in log_data]
-    valid_h10 = [h for h in val_h10 if h is not None]
-    
-    if valid_h10:
-        print(f"\nValidation Hits@10:")
-        print(f"  Initial: {valid_h10[0]:.4f} ({valid_h10[0]*100:.2f}%)")
-        print(f"  Final:   {valid_h10[-1]:.4f} ({valid_h10[-1]*100:.2f}%)")
-        print(f"  Best:    {max(valid_h10):.4f} ({max(valid_h10)*100:.2f}%) (Epoch {valid_h10.index(max(valid_h10)) + 1})")
-    
-    # Alpha values
-    train_alpha = [entry.get('train_alpha', None) for entry in log_data]
-    val_alpha = [entry.get('val_alpha', None) for entry in log_data]
-    valid_train_alpha = [a for a in train_alpha if a is not None]
-    valid_val_alpha = [a for a in val_alpha if a is not None]
-    
-    if valid_train_alpha:
-        print(f"\nGate Weight (α) - Text Contribution:")
-        print(f"  Train - Initial: {valid_train_alpha[0]:.4f}, Final: {valid_train_alpha[-1]:.4f}")
-        # print(f"  Val   - Initial: {valid_val_alpha[0]:.4f}, Final: {valid_val_alpha[-1]:.4f}")
-        print(f"  (Higher α = model relies more on text embeddings)")
-    
-    print("\n" + "="*70)
+    print("=" * 70)
+    print(f"Epoch entries: {len(entries)}")
+
+    if entries and 'train_loss' in entries[0]:
+        losses = [entry['train_loss'] for entry in entries if 'train_loss' in entry]
+        best_loss_epoch, best_loss = min(
+            ((entry['epoch'], entry['train_loss']) for entry in entries if 'train_loss' in entry),
+            key=lambda item: item[1],
+        )
+        print("\nTraining Loss:")
+        print(f"  Initial: {losses[0]:.4f}")
+        print(f"  Final:   {losses[-1]:.4f}")
+        print(f"  Best:    {best_loss:.4f} (epoch {best_loss_epoch})")
+
+    best_mrr = best_epoch(entries, 'val_mrr', maximize=True)
+    if best_mrr:
+        print("\nValidation MRR:")
+        print(f"  Best direction-avg: {best_mrr[1]:.4f} (epoch {best_mrr[0]})")
+        forward = series(entries, 'val_forward_mrr')
+        backward = series(entries, 'val_backward_mrr')
+        if forward and backward:
+            print(f"  Final forward:     {forward[-1][1]:.4f}")
+            print(f"  Final backward:    {backward[-1][1]:.4f}")
+
+    gate_mean_keys = sorted({
+        key
+        for entry in entries
+        for key in entry
+        if key.startswith('train_') and key.endswith('_gate')
+    })
+    if gate_mean_keys:
+        print("\nFinal Gate Values:")
+        final_entry = entries[-1]
+        for key in gate_mean_keys:
+            if key in final_entry:
+                print(f"  {gate_label(key):24s}: {final_entry[key]:.4f}")
+
+    final_events = [entry for entry in log_data if entry.get('event') == 'training_complete']
+    if final_events:
+        event = final_events[-1]
+        print("\nRuntime:")
+        print(f"  Total seconds: {event.get('total_train_seconds', 'n/a')}")
+        print(f"  Epochs completed: {event.get('epochs_completed', 'n/a')}")
+
+    print("=" * 70)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize training metrics")
-    parser.add_argument('--log_path', type=str, help='Path to training_log.json file')
-    parser.add_argument('--output', type=str, default=None, help='Output path for visualization (e.g., training_curves.png)')
-    parser.add_argument('--no_show', action='store_true', help='Do not display plot')
-    
+    parser = argparse.ArgumentParser(description="Visualize GWM training metrics")
+    parser.add_argument('--log_path', type=str, required=True, help='Path to training_log.json')
+    parser.add_argument('--output', type=str, default=None, help='Output image path')
+    parser.add_argument('--no_show', action='store_true', help='Do not display the plot window')
     args = parser.parse_args()
-    
-    # Load log
+
     log_path = Path(args.log_path)
     if not log_path.exists():
-        print(f"❌ Error: Log file not found at {log_path}")
-        return
-    
+        raise FileNotFoundError(f"Log file not found: {log_path}")
+
     print(f"Loading training log from: {log_path}")
     log_data = load_training_log(log_path)
-    
-    # Print summary
     print_metrics_summary(log_data)
-    
-    # Generate visualization
+
     output_path = args.output
-    if not output_path:
-        # Default: save next to log file with same name
+    if output_path is None:
         output_path = log_path.parent / 'training_curves.png'
-    
-    plot_training_curves(log_data, output_path=output_path)
+
+    plot_training_curves(
+        log_data,
+        output_path=output_path,
+        show=not args.no_show,
+    )
 
 
 if __name__ == '__main__':

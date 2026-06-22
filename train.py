@@ -22,6 +22,7 @@ from utils.eval import (
     compute_filtered_ranking_metrics,
     encode_all_entities_as_targets,
     load_hr_map_for_filtering,
+    load_relation_direction_map,
 )
 from utils.early_stopping import EarlyStopping
 
@@ -226,16 +227,18 @@ def train(args):
     else:
         valid_loader = None
 
-    # Build filtered-ranking structures for standard validation
+    # Build filtered-ranking structures for bidirectional validation.
     hr_map = None
     all_entity_embeddings = None
     entity_loader = None
+    relation_direction_map = None
     if valid_loader is not None:
         hr_map = load_hr_map_for_filtering(
             config.data_dir,
             preferred_ground_truth_file='ground_truth.json',
             fallback_splits=['train']
         )
+        relation_direction_map = load_relation_direction_map(config.data_dir)
 
         candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(int(config.batch_size), 256)))
         entity_loader = build_entity_loader(
@@ -361,6 +364,7 @@ def train(args):
                 hr_map=hr_map,
                 device=device,
                 desc="Validation",
+                relation_direction_map=relation_direction_map,
                 # save_predictions_path=predictions_path,
                 # topk=eval_topk,
             )
@@ -376,6 +380,10 @@ def train(args):
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
                 f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
             )
+            print(
+                f"Forward MRR: {val_metrics['forward']['MRR']:.4f} | "
+                f"Backward MRR: {val_metrics['backward']['MRR']:.4f}"
+            )
             
             # Log metrics
             epoch_log = {
@@ -387,7 +395,13 @@ def train(args):
                 'val_mr': val_mr,
                 'val_hits1': val_h1,
                 'val_hits3': val_h3,
-                'val_hits10': val_h10
+                'val_hits10': val_h10,
+                'val_forward_mrr': val_metrics['forward']['MRR'],
+                'val_forward_hits10': val_metrics['forward']['Hits@10'],
+                'val_backward_mrr': val_metrics['backward']['MRR'],
+                'val_backward_hits10': val_metrics['backward']['Hits@10'],
+                'val_micro_mrr': val_metrics['micro']['MRR'],
+                'val_micro_hits10': val_metrics['micro']['Hits@10'],
             }
             history.append(epoch_log)
             with open(log_path, 'w') as f:

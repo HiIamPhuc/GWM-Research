@@ -85,6 +85,19 @@ def load_inverse_relation_id_map(data_dir):
     return inverse_relation_ids
 
 
+def load_relation_direction_map(data_dir):
+    """Map relation IDs to evaluation direction labels."""
+    with open(os.path.join(data_dir, 'relation2id.json'), 'r', encoding='utf-8') as f:
+        relation2id = json.load(f)
+
+    return {
+        int(relation_id): (
+            'backward' if relation.endswith('_inv') else 'forward'
+        )
+        for relation, relation_id in relation2id.items()
+    }
+
+
 def assert_bidirectional_split(data_dir, split):
     """Require an evaluation split to contain each triple and its inverse."""
     inverse_relation_ids = load_inverse_relation_id_map(data_dir)
@@ -136,6 +149,55 @@ def encode_all_entities_as_targets(model, entity_loader, device):
     return torch.cat(all_chunks, dim=0).to(device)
 
 
+def _new_metric_state():
+    return {
+        'hits1': 0,
+        'hits3': 0,
+        'hits10': 0,
+        'mrr': 0.0,
+        'mr': 0.0,
+        'count': 0,
+    }
+
+
+def _add_ranks_to_state(state, ranks):
+    if ranks.numel() == 0:
+        return
+    ranks = ranks.float()
+    state['hits1'] += (ranks <= 1).sum().item()
+    state['hits3'] += (ranks <= 3).sum().item()
+    state['hits10'] += (ranks <= 10).sum().item()
+    state['mrr'] += (1.0 / ranks).sum().item()
+    state['mr'] += ranks.sum().item()
+    state['count'] += ranks.numel()
+
+
+def _finalize_metric_state(state):
+    total = state['count']
+    if total == 0:
+        raise ValueError("Cannot compute ranking metrics from zero queries.")
+
+    return {
+        'MRR': state['mrr'] / total,
+        'MR': state['mr'] / total,
+        'Hits@1': state['hits1'] / total,
+        'Hits@3': state['hits3'] / total,
+        'Hits@10': state['hits10'] / total,
+        'count': total,
+    }
+
+
+def _average_direction_metrics(forward_metrics, backward_metrics):
+    averaged = {}
+    for key in ('MRR', 'MR', 'Hits@1', 'Hits@3', 'Hits@10'):
+        averaged[key] = 0.5 * (forward_metrics[key] + backward_metrics[key])
+    averaged['count'] = forward_metrics['count'] + backward_metrics['count']
+    averaged['forward'] = forward_metrics
+    averaged['backward'] = backward_metrics
+    averaged['micro'] = None
+    return averaged
+
+
 def compute_filtered_ranking_metrics(
     model,
     data_loader,
@@ -145,9 +207,13 @@ def compute_filtered_ranking_metrics(
     desc="Filtered Ranking",
     save_predictions_path=None,
     topk=50,
+    relation_direction_map=None,
 ):
-    hits1, hits3, hits10, mrr, mr = 0, 0, 0, 0.0, 0.0
-    total = 0
+    micro_state = _new_metric_state()
+    direction_states = {
+        'forward': _new_metric_state(),
+        'backward': _new_metric_state(),
+    }
 
     writer = None
     if save_predictions_path is not None:
@@ -161,8 +227,10 @@ def compute_filtered_ranking_metrics(
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             t_ids = batch['t_batch']['id'].to(device)
-            h_ids = batch['h_batch']['id'].cpu().numpy()
-            r_ids = batch['r_batch']['id'].cpu().numpy()
+            h_ids_tensor = batch['h_batch']['id']
+            r_ids_tensor = batch['r_batch']['id']
+            h_ids = h_ids_tensor.cpu().numpy()
+            r_ids = r_ids_tensor.cpu().numpy()
 
             query_vectors = model(h_batch, r_batch, context_batch)
             scores = torch.mm(query_vectors, all_entity_embeddings.t())
@@ -201,20 +269,49 @@ def compute_filtered_ranking_metrics(
                     }
                     writer.write(json.dumps(record) + '\n')
 
-            hits1 += (ranks <= 1).sum().item()
-            hits3 += (ranks <= 3).sum().item()
-            hits10 += (ranks <= 10).sum().item()
-            mrr += (1.0 / ranks.float()).sum().item()
-            mr += ranks.float().sum().item()
-            total += ranks.size(0)
+            _add_ranks_to_state(micro_state, ranks)
+
+            if relation_direction_map is not None:
+                directions = [
+                    relation_direction_map.get(int(r_id))
+                    for r_id in r_ids_tensor.cpu().tolist()
+                ]
+                if any(direction is None for direction in directions):
+                    raise ValueError(
+                        "relation_direction_map is missing one or more relation IDs."
+                    )
+
+                forward_mask = torch.tensor(
+                    [direction == 'forward' for direction in directions],
+                    dtype=torch.bool,
+                    device=ranks.device,
+                )
+                backward_mask = torch.tensor(
+                    [direction == 'backward' for direction in directions],
+                    dtype=torch.bool,
+                    device=ranks.device,
+                )
+                _add_ranks_to_state(
+                    direction_states['forward'],
+                    ranks[forward_mask],
+                )
+                _add_ranks_to_state(
+                    direction_states['backward'],
+                    ranks[backward_mask],
+                )
 
     if writer is not None:
         writer.close()
 
-    return {
-        'MRR': mrr / total,
-        'MR': mr / total,
-        'Hits@1': hits1 / total,
-        'Hits@3': hits3 / total,
-        'Hits@10': hits10 / total
-    }
+    micro_metrics = _finalize_metric_state(micro_state)
+    if relation_direction_map is None:
+        return micro_metrics
+
+    forward_metrics = _finalize_metric_state(direction_states['forward'])
+    backward_metrics = _finalize_metric_state(direction_states['backward'])
+    averaged_metrics = _average_direction_metrics(
+        forward_metrics,
+        backward_metrics,
+    )
+    averaged_metrics['micro'] = micro_metrics
+    return averaged_metrics

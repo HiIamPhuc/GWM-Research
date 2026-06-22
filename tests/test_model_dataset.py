@@ -8,7 +8,7 @@ import torch
 
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import ContextAggregator, GWM
-from utils.eval import assert_bidirectional_split
+from utils.eval import assert_bidirectional_split, load_relation_direction_map
 
 
 def make_config(context_agg='mean'):
@@ -271,6 +271,24 @@ class DatasetTests(unittest.TestCase):
                 root_path / 'valid_triples.pt',
             )
             assert_bidirectional_split(root, 'valid')
+
+    def test_relation_direction_map_separates_forward_and_backward_ids(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            (root_path / 'relation2id.json').write_text(
+                json.dumps({'r': 0, 's': 1, 'r_inv': 2, 's_inv': 3}),
+                encoding='utf-8',
+            )
+
+            self.assertEqual(
+                load_relation_direction_map(root),
+                {
+                    0: 'forward',
+                    1: 'forward',
+                    2: 'backward',
+                    3: 'backward',
+                },
+            )
 
 
 if __name__ == '__main__':

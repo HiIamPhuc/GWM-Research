@@ -17,6 +17,7 @@ from utils.eval import (
     compute_filtered_ranking_metrics,
     encode_all_entities_as_targets,
     load_hr_map_for_filtering,
+    load_relation_direction_map,
 )
 
 def get_config(args):
@@ -94,6 +95,7 @@ def evaluate(args):
         print(f"Test triples not found, using 'valid' set.")
         split = 'valid'
     assert_bidirectional_split(config.data_dir, split)
+    relation_direction_map = load_relation_direction_map(config.data_dir)
 
     test_dataset = GWMDataset(config.data_dir, split=split)
     collate_fn = CollateFN()
@@ -132,6 +134,7 @@ def evaluate(args):
         device=device,
         desc="Evaluating",
         save_predictions_path=predictions_path,
+        relation_direction_map=relation_direction_map,
     )
 
     final_mrr = metrics['MRR']
@@ -139,11 +142,21 @@ def evaluate(args):
     final_h3 = metrics['Hits@3']
     final_h10 = metrics['Hits@10']
 
-    print(f"\n--- Evaluation Results ({split}) ---")
+    print(f"\n--- Bidirectional Evaluation Results ({split}) ---")
     print(f"MRR       : {final_mrr:.4f}")
     print(f"Hits@1    : {final_h1:.4f}")
     print(f"Hits@3    : {final_h3:.4f}")
     print(f"Hits@10   : {final_h10:.4f}")
+    print(
+        f"Forward  : MRR {metrics['forward']['MRR']:.4f} | "
+        f"Hits@10 {metrics['forward']['Hits@10']:.4f} | "
+        f"count {metrics['forward']['count']}"
+    )
+    print(
+        f"Backward : MRR {metrics['backward']['MRR']:.4f} | "
+        f"Hits@10 {metrics['backward']['Hits@10']:.4f} | "
+        f"count {metrics['backward']['count']}"
+    )
     print("-------------------------------")
     
     # Save results
@@ -152,6 +165,30 @@ def evaluate(args):
         'hits1': final_h1,
         'hits3': final_h3,
         'hits10': final_h10,
+        'forward': {
+            'mrr': metrics['forward']['MRR'],
+            'mr': metrics['forward']['MR'],
+            'hits1': metrics['forward']['Hits@1'],
+            'hits3': metrics['forward']['Hits@3'],
+            'hits10': metrics['forward']['Hits@10'],
+            'count': metrics['forward']['count'],
+        },
+        'backward': {
+            'mrr': metrics['backward']['MRR'],
+            'mr': metrics['backward']['MR'],
+            'hits1': metrics['backward']['Hits@1'],
+            'hits3': metrics['backward']['Hits@3'],
+            'hits10': metrics['backward']['Hits@10'],
+            'count': metrics['backward']['count'],
+        },
+        'micro': {
+            'mrr': metrics['micro']['MRR'],
+            'mr': metrics['micro']['MR'],
+            'hits1': metrics['micro']['Hits@1'],
+            'hits3': metrics['micro']['Hits@3'],
+            'hits10': metrics['micro']['Hits@10'],
+            'count': metrics['micro']['count'],
+        },
     }
     with open(os.path.join(config.output_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)

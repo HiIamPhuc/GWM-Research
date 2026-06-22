@@ -31,7 +31,6 @@ output_dir: output/umls
 
 add_inverse: true
 context_k: 5
-context_agg: mean
 
 device: cuda
 seed: 42

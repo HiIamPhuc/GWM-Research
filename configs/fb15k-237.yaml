@@ -31,7 +31,6 @@ output_dir: output/fb15k-237
     
 add_inverse: true
 context_k: 10
-context_agg: mean
     
 device: cuda
 seed: 42

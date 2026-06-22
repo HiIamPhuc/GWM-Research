@@ -31,7 +31,6 @@ output_dir: output/nell-995
 
 add_inverse: true
 context_k: 5
-context_agg: mean
 
 device: cuda
 seed: 42

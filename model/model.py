@@ -122,11 +122,7 @@ class GWM(nn.Module):
             dropout=self.dropout,
         )
 
-        self.context_agg = str(getattr(config, 'context_agg', 'mean')).lower()
-        self.fused_context_aggregator = ContextAggregator(
-            hidden_dim=self.fusion_dim,
-            reduction=self.context_agg,
-        )
+        self.fused_context_aggregator = ContextAggregator(hidden_dim=self.fusion_dim)
         self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
 

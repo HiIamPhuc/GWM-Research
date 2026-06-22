@@ -8,7 +8,10 @@ import torch
 
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import ContextAggregator, GWM
-from utils.eval import assert_bidirectional_split, load_relation_direction_map
+from utils.eval import (
+    build_bidirectional_eval_dataset,
+    build_bidirectional_hr_map_for_filtering,
+)
 
 
 def make_config(context_agg='mean'):
@@ -270,41 +273,39 @@ class DatasetTests(unittest.TestCase):
                 {'id', 'rel_id', 'batch_index'},
             )
 
-    def test_bidirectional_split_guard_rejects_tail_only_eval_split(self):
+    def test_bidirectional_eval_dataset_builds_inverse_queries_on_the_fly(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            self._write_data(root_path)
+            torch.save(torch.tensor([[0, 0, 1]]), root_path / 'test_triples.pt')
+
+            base_dataset = GWMDataset(root, split='test')
+            forward_dataset, backward_dataset = build_bidirectional_eval_dataset(
+                base_dataset,
+                root,
+            )
+
+            self.assertEqual(forward_dataset.triples.tolist(), [[0, 0, 1]])
+            self.assertEqual(backward_dataset.triples.tolist(), [[1, 1, 0]])
+
+    def test_bidirectional_filter_map_adds_inverse_truths(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
             (root_path / 'relation2id.json').write_text(
                 json.dumps({'r': 0, 'r_inv': 1}), encoding='utf-8'
             )
-            torch.save(torch.tensor([[0, 0, 1]]), root_path / 'valid_triples.pt')
+            torch.save(torch.tensor([[0, 0, 1], [1, 1, 0]]), root_path / 'train_triples.pt')
+            torch.save(torch.tensor([[0, 0, 2]]), root_path / 'valid_triples.pt')
+            torch.save(torch.tensor([[0, 0, 1]]), root_path / 'test_triples.pt')
 
-            with self.assertRaisesRegex(ValueError, 'not bidirectional'):
-                assert_bidirectional_split(root, 'valid')
-
-            torch.save(
-                torch.tensor([[0, 0, 1], [1, 1, 0]]),
-                root_path / 'valid_triples.pt',
-            )
-            assert_bidirectional_split(root, 'valid')
-
-    def test_relation_direction_map_separates_forward_and_backward_ids(self):
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-            (root_path / 'relation2id.json').write_text(
-                json.dumps({'r': 0, 's': 1, 'r_inv': 2, 's_inv': 3}),
-                encoding='utf-8',
+            hr_map = build_bidirectional_hr_map_for_filtering(
+                root,
+                splits=['train', 'valid', 'test'],
             )
 
-            self.assertEqual(
-                load_relation_direction_map(root),
-                {
-                    0: 'forward',
-                    1: 'forward',
-                    2: 'backward',
-                    3: 'backward',
-                },
-            )
-
+            self.assertEqual(hr_map[(0, 0)], {1, 2})
+            self.assertEqual(hr_map[(1, 1)], {0})
+            self.assertEqual(hr_map[(2, 1)], {0})
 
 if __name__ == '__main__':
     unittest.main()

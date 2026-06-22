@@ -440,8 +440,8 @@ def process_dataset(
         json.dump(relation2id, f, indent=2)
 
     train_tensor = triples_to_ids(train_triples, entity2id, relation2id, add_inverse=add_inverse)
-    valid_tensor = triples_to_ids(valid_triples, entity2id, relation2id, add_inverse=add_inverse)
-    test_tensor = triples_to_ids(test_triples, entity2id, relation2id, add_inverse=add_inverse)
+    valid_tensor = triples_to_ids(valid_triples, entity2id, relation2id, add_inverse=False)
+    test_tensor = triples_to_ids(test_triples, entity2id, relation2id, add_inverse=False)
     
     torch.save(train_tensor, out_path / 'train_triples.pt')
     torch.save(valid_tensor, out_path / 'valid_triples.pt')

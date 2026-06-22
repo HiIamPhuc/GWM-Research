@@ -12,12 +12,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model.model import GWM
 from model.dataset import GWMDataset, CollateFN
 from utils.eval import (
-    assert_bidirectional_split,
+    build_bidirectional_hr_map_for_filtering,
     build_entity_loader,
+    compute_bidirectional_filtered_ranking_metrics,
     compute_filtered_ranking_metrics,
     encode_all_entities_as_targets,
     load_hr_map_for_filtering,
-    load_relation_direction_map,
 )
 
 def get_config(args):
@@ -94,8 +94,6 @@ def evaluate(args):
     if not os.path.exists(os.path.join(config.data_dir, f'{split}_triples.pt')):
         print(f"Test triples not found, using 'valid' set.")
         split = 'valid'
-    assert_bidirectional_split(config.data_dir, split)
-    relation_direction_map = load_relation_direction_map(config.data_dir)
 
     test_dataset = GWMDataset(config.data_dir, split=split)
     collate_fn = CollateFN()
@@ -110,53 +108,64 @@ def evaluate(args):
 
     # Filtering Setup
     if split == 'test':
-        # Standard test protocol: filter with train+valid
-        hr_map = load_hr_map_for_filtering(
+        hr_map = build_bidirectional_hr_map_for_filtering(
             config.data_dir,
-            preferred_ground_truth_file='ground_truth.json',
-            fallback_splits=['train', 'valid']
+            splits=['train', 'valid', 'test'],
         )
     else:
-        # Validation protocol: filter with train only
         hr_map = load_hr_map_for_filtering(
             config.data_dir,
-            preferred_ground_truth_file='ground_truth.json',
+            preferred_ground_truth_file=None,
             fallback_splits=['train']
         )
 
     predictions_path = os.path.join(config.output_dir, f'predictions_{split}.jsonl')
 
-    metrics = compute_filtered_ranking_metrics(
-        model=model,
-        data_loader=test_loader,
-        all_entity_embeddings=all_entity_embeddings,
-        hr_map=hr_map,
-        device=device,
-        desc="Evaluating",
-        save_predictions_path=predictions_path,
-        relation_direction_map=relation_direction_map,
-    )
+    if split == 'test':
+        metrics = compute_bidirectional_filtered_ranking_metrics(
+            model=model,
+            data_loader=test_loader,
+            all_entity_embeddings=all_entity_embeddings,
+            hr_map=hr_map,
+            device=device,
+            desc="Evaluating",
+            save_predictions_path=predictions_path,
+        )
+    else:
+        metrics = compute_filtered_ranking_metrics(
+            model=model,
+            data_loader=test_loader,
+            all_entity_embeddings=all_entity_embeddings,
+            hr_map=hr_map,
+            device=device,
+            desc="Evaluating",
+            save_predictions_path=predictions_path,
+        )
 
     final_mrr = metrics['MRR']
     final_h1 = metrics['Hits@1']
     final_h3 = metrics['Hits@3']
     final_h10 = metrics['Hits@10']
 
-    print(f"\n--- Bidirectional Evaluation Results ({split}) ---")
+    if split == 'test':
+        print(f"\n--- Bidirectional Evaluation Results ({split}) ---")
+    else:
+        print(f"\n--- Tail-Only Evaluation Results ({split}) ---")
     print(f"MRR       : {final_mrr:.4f}")
     print(f"Hits@1    : {final_h1:.4f}")
     print(f"Hits@3    : {final_h3:.4f}")
     print(f"Hits@10   : {final_h10:.4f}")
-    print(
-        f"Forward  : MRR {metrics['forward']['MRR']:.4f} | "
-        f"Hits@10 {metrics['forward']['Hits@10']:.4f} | "
-        f"count {metrics['forward']['count']}"
-    )
-    print(
-        f"Backward : MRR {metrics['backward']['MRR']:.4f} | "
-        f"Hits@10 {metrics['backward']['Hits@10']:.4f} | "
-        f"count {metrics['backward']['count']}"
-    )
+    if split == 'test':
+        print(
+            f"Forward  : MRR {metrics['forward']['MRR']:.4f} | "
+            f"Hits@10 {metrics['forward']['Hits@10']:.4f} | "
+            f"count {metrics['forward']['count']}"
+        )
+        print(
+            f"Backward : MRR {metrics['backward']['MRR']:.4f} | "
+            f"Hits@10 {metrics['backward']['Hits@10']:.4f} | "
+            f"count {metrics['backward']['count']}"
+        )
     print("-------------------------------")
     
     # Save results
@@ -165,31 +174,35 @@ def evaluate(args):
         'hits1': final_h1,
         'hits3': final_h3,
         'hits10': final_h10,
-        'forward': {
+        'evaluation_mode': 'bidirectional_test' if split == 'test' else 'tail_only',
+    }
+    if split == 'test':
+        results.update({
+            'forward': {
             'mrr': metrics['forward']['MRR'],
             'mr': metrics['forward']['MR'],
             'hits1': metrics['forward']['Hits@1'],
             'hits3': metrics['forward']['Hits@3'],
             'hits10': metrics['forward']['Hits@10'],
             'count': metrics['forward']['count'],
-        },
-        'backward': {
+            },
+            'backward': {
             'mrr': metrics['backward']['MRR'],
             'mr': metrics['backward']['MR'],
             'hits1': metrics['backward']['Hits@1'],
             'hits3': metrics['backward']['Hits@3'],
             'hits10': metrics['backward']['Hits@10'],
             'count': metrics['backward']['count'],
-        },
-        'micro': {
+            },
+            'micro': {
             'mrr': metrics['micro']['MRR'],
             'mr': metrics['micro']['MR'],
             'hits1': metrics['micro']['Hits@1'],
             'hits3': metrics['micro']['Hits@3'],
             'hits10': metrics['micro']['Hits@10'],
             'count': metrics['micro']['count'],
-        },
-    }
+            },
+        })
     with open(os.path.join(config.output_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)
 

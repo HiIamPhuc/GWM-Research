@@ -13,8 +13,8 @@ from torch.optim.lr_scheduler import LambdaLR
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from model.model import GWM
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
+from studies.ablation_models import build_model
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
     build_entity_loader,
@@ -158,7 +158,7 @@ def train(args):
     
     # Init Model
     print("Initializing model...")
-    model = GWM(config).to(device)
+    model = build_model(config).to(device)
     
     # Collater
     collate_fn = CollateFN()
@@ -175,19 +175,23 @@ def train(args):
         worker_init_fn=make_worker_init_fn(seed),
     )
 
-    entity_emb_path = os.path.join(config.data_dir, 'entity_text_embeddings.pt')
-    relation_emb_path = os.path.join(config.data_dir, 'relation_text_embeddings.pt')
-    if not os.path.exists(entity_emb_path) or not os.path.exists(relation_emb_path):
-        raise FileNotFoundError(
-            "Missing precomputed text embedding cache files. "
-            "Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
-        )
+    if getattr(model, 'requires_text_embeddings', True):
+        entity_emb_path = os.path.join(config.data_dir, 'entity_text_embeddings.pt')
+        relation_emb_path = os.path.join(config.data_dir, 'relation_text_embeddings.pt')
+        if not os.path.exists(entity_emb_path) or not os.path.exists(relation_emb_path):
+            raise FileNotFoundError(
+                "Missing precomputed text embedding cache files. "
+                "Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
+            )
 
-    model.load_text_embeddings(
-        entity_source=entity_emb_path,
-        relation_source=relation_emb_path,
-        freeze=True,
-    )
+        model.load_text_embeddings(
+            entity_source=entity_emb_path,
+            relation_source=relation_emb_path,
+            freeze=True,
+        )
+        print("Loaded text embeddings into text embedding tables...")
+    else:
+        print("Skipping precomputed text embeddings for structure-only ablation.")
     
     # Save effective config (including inferred dimensions, CLI overrides, and model params).
     save_training_config(config, config.output_dir, args=args, model=model)

@@ -1,9 +1,8 @@
-"""
-Visualize current GWM training logs.
+"""Visualize GWM training logs.
 
-The script is intentionally tolerant of missing fields so it can read older
-training_log.json files as well as the current logs with bidirectional metrics
-and GatedFusion gate statistics.
+Current training logs contain forward validation metrics and compact
+GatedFusion gate means. The plotting code stays tolerant of older logs that
+may not contain gate or filtered-negative diagnostics.
 """
 
 import argparse
@@ -73,11 +72,8 @@ def gate_label(key):
 
 def gate_specs(entries, styles):
     preferred = [
-        'train_head_gate',
-        'train_relation_gate',
-        'train_context_entity_gate',
-        'train_context_relation_gate',
-        'train_target_gate',
+        'train_entity_gate',
+        'train_relation_gate'
     ]
     available = {
         key
@@ -97,10 +93,10 @@ def plot_training_curves(log_data, output_path=None, show=True):
     if not entries:
         raise ValueError("Training log does not contain epoch entries.")
 
-    fig = plt.figure(figsize=(18, 14))
+    fig = plt.figure(figsize=(16, 10))
     styles = ['g-o', 'b-s', 'r-^', 'm-d', 'c-x', 'y-*', 'k-p']
 
-    ax1 = plt.subplot(3, 3, 1)
+    ax1 = plt.subplot(2, 3, 1)
     plot_lines(
         ax1,
         entries,
@@ -109,22 +105,17 @@ def plot_training_curves(log_data, output_path=None, show=True):
         'Loss',
     )
 
-    ax2 = plt.subplot(3, 3, 2)
+    ax2 = plt.subplot(2, 3, 2)
     plot_lines(
         ax2,
         entries,
-        [
-            ('val_mrr', 'direction avg', 'g-o'),
-            ('val_forward_mrr', 'forward', 'b-s'),
-            ('val_backward_mrr', 'backward', 'r-^'),
-            ('val_micro_mrr', 'micro', 'k--'),
-        ],
+        [('val_mrr', 'validation MRR', 'g-o')],
         'Validation MRR',
         'MRR',
         ylim=(0, 1),
     )
 
-    ax3 = plt.subplot(3, 3, 3)
+    ax3 = plt.subplot(2, 3, 3)
     plot_lines(
         ax3,
         entries,
@@ -138,67 +129,28 @@ def plot_training_curves(log_data, output_path=None, show=True):
         ylim=(0, 1),
     )
 
-    ax4 = plt.subplot(3, 3, 4)
+    ax4 = plt.subplot(2, 3, 4)
     plot_lines(
         ax4,
-        entries,
-        [
-            ('val_forward_hits10', 'forward Hits@10', 'b-s'),
-            ('val_backward_hits10', 'backward Hits@10', 'r-^'),
-            ('val_micro_hits10', 'micro Hits@10', 'k--'),
-        ],
-        'Directional Hits@10',
-        'Hits@10',
-        ylim=(0, 1),
-    )
-
-    ax5 = plt.subplot(3, 3, 5)
-    plot_lines(
-        ax5,
         entries,
         [('val_mr', 'mean rank', 'r-o')],
         'Validation Mean Rank',
         'MR',
     )
 
-    ax6 = plt.subplot(3, 3, 6)
+    ax5 = plt.subplot(2, 3, 5)
     plot_lines(
-        ax6,
+        ax5,
         entries,
         gate_specs(entries, styles),
-        'GatedFusion Gate Values',
+        'GatedFusion Gate Means',
         'Mean gate',
         ylim=(0, 1),
     )
 
-    ax7 = plt.subplot(3, 3, 7)
+    ax6 = plt.subplot(2, 3, 6)
     plot_lines(
-        ax7,
-        entries,
-        [
-            ('avg_filtered_truths_per_query', 'filtered truths/query', 'b-o'),
-            ('filtered_query_rate', 'rows with filtered truths', 'g-s'),
-        ],
-        'Filtered-Negative Diagnostics',
-        'Value',
-    )
-
-    ax8 = plt.subplot(3, 3, 8)
-    plot_lines(
-        ax8,
-        entries,
-        [
-            ('val_forward_mrr', 'forward MRR', 'b-s'),
-            ('val_backward_mrr', 'backward MRR', 'r-^'),
-        ],
-        'Forward vs Backward MRR',
-        'MRR',
-        ylim=(0, 1),
-    )
-
-    ax9 = plt.subplot(3, 3, 9)
-    plot_lines(
-        ax9,
+        ax6,
         entries,
         [
             ('avg_filtered_truths_per_query', 'filtered truths/query', 'b-o'),
@@ -248,12 +200,18 @@ def print_metrics_summary(log_data):
     best_mrr = best_epoch(entries, 'val_mrr', maximize=True)
     if best_mrr:
         print("\nValidation MRR:")
-        print(f"  Best direction-avg: {best_mrr[1]:.4f} (epoch {best_mrr[0]})")
-        forward = series(entries, 'val_forward_mrr')
-        backward = series(entries, 'val_backward_mrr')
-        if forward and backward:
-            print(f"  Final forward:     {forward[-1][1]:.4f}")
-            print(f"  Final backward:    {backward[-1][1]:.4f}")
+        print(f"  Best:  {best_mrr[1]:.4f} (epoch {best_mrr[0]})")
+        val_mrr = series(entries, 'val_mrr')
+        if val_mrr:
+            print(f"  Final: {val_mrr[-1][1]:.4f}")
+
+    best_hits10 = best_epoch(entries, 'val_hits10', maximize=True)
+    if best_hits10:
+        print("\nValidation Hits@10:")
+        print(f"  Best:  {best_hits10[1]:.4f} (epoch {best_hits10[0]})")
+        val_hits10 = series(entries, 'val_hits10')
+        if val_hits10:
+            print(f"  Final: {val_hits10[-1][1]:.4f}")
 
     gate_mean_keys = sorted({
         key

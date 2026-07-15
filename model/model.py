@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 class ContextAggregator(nn.Module):
@@ -83,6 +84,45 @@ class GatedFusion(nn.Module):
         return self.output_norm(fused), gate
 
 
+class ConvTransEDecoder(nn.Module):
+    """ConvTransE decoder shared with the temporal GWM architecture."""
+
+    def __init__(self, embedding_dim, dropout=0.0, channels=50, kernel_size=3):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.bn0 = nn.BatchNorm1d(2)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.bn2 = nn.BatchNorm1d(self.embedding_dim)
+        self.conv = nn.Conv1d(
+            2,
+            channels,
+            kernel_size,
+            stride=1,
+            padding=int(math.floor(kernel_size / 2)),
+        )
+        self.fc = nn.Linear(self.embedding_dim * channels, self.embedding_dim)
+
+    def forward(self, query_vectors, relation_vectors, candidate_vectors):
+        batch_size = query_vectors.size(0)
+        stacked_inputs = torch.stack([query_vectors, relation_vectors], dim=1)
+        x = self.bn0(stacked_inputs)
+        x = self.dropout1(x)
+        x = self.conv(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = x.reshape(batch_size, -1)
+        x = self.fc(x)
+        x = self.dropout3(x)
+        if batch_size > 1:
+            x = self.bn2(x)
+        x = F.relu(x)
+        return torch.mm(x, torch.tanh(candidate_vectors).t())
+
+
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -144,6 +184,18 @@ class GWM(nn.Module):
         )
 
         self.temperature = float(getattr(config, 'temperature'))
+        self.decoder_name = str(getattr(config, 'decoder', 'dot')).lower()
+        if self.decoder_name == 'convtranse':
+            self.decoder = ConvTransEDecoder(
+                embedding_dim=self.fusion_dim,
+                dropout=self.dropout,
+                channels=int(getattr(config, 'convtranse_channels', 50)),
+                kernel_size=int(getattr(config, 'convtranse_kernel_size', 3)),
+            )
+        elif self.decoder_name in {'dot', 'contrastive'}:
+            self.decoder = None
+        else:
+            raise ValueError(f"Unsupported decoder: {self.decoder_name}")
         self._last_gate_stats = {}
 
     def reset_gate_stats(self):
@@ -303,7 +355,7 @@ class GWM(nn.Module):
             reduction='none',
         )
 
-    def forward(self, h_batch, r_batch, context_batch):
+    def encode_query(self, h_batch, r_batch, context_batch):
         self.reset_gate_stats()
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
         r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
@@ -338,7 +390,12 @@ class GWM(nn.Module):
             self.fused_h0_projection,
             self.fused_c0_projection,
         )
-        return F.normalize(self.fused_output_projection(query), p=2, dim=1)
+        query = F.normalize(self.fused_output_projection(query), p=2, dim=1)
+        return query, r_fused
+
+    def forward(self, h_batch, r_batch, context_batch):
+        query, _ = self.encode_query(h_batch, r_batch, context_batch)
+        return query
 
     def encode_target(self, t_batch):
         t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
@@ -363,3 +420,35 @@ class GWM(nn.Module):
             truth_mask=truth_mask,
         ).mean()
         return loss, scores
+
+    def score_all_entities(
+        self,
+        h_batch,
+        r_batch,
+        context_batch,
+        candidate_vectors=None,
+    ):
+        query_vectors, relation_vectors = self.encode_query(
+            h_batch,
+            r_batch,
+            context_batch,
+        )
+        if candidate_vectors is None:
+            entity_ids = torch.arange(
+                int(self.config.num_entities),
+                device=query_vectors.device,
+                dtype=torch.long,
+            )
+            candidate_vectors = self.encode_target({'id': entity_ids})
+
+        if self.decoder_name == 'convtranse':
+            return self.decoder(
+                query_vectors,
+                relation_vectors,
+                candidate_vectors,
+            )
+        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
+
+    @staticmethod
+    def compute_full_softmax_loss(scores, target_ids):
+        return F.cross_entropy(scores, target_ids)

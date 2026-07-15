@@ -159,6 +159,12 @@ def train(args):
     # Init Model
     print("Initializing model...")
     model = build_model(config).to(device)
+    use_full_entity_decoder = getattr(model, 'decoder_name', 'dot') == 'convtranse'
+    config.training_objective = (
+        'full_entity_convtranse_cross_entropy'
+        if use_full_entity_decoder
+        else 'single_positive_filtered_in_batch'
+    )
     
     # Collater
     collate_fn = CollateFN()
@@ -170,7 +176,7 @@ def train(args):
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=(device.type == 'cuda'),
-        drop_last=True, # Important for In-Batch Negatives stability
+        drop_last=not use_full_entity_decoder,
         generator=make_torch_generator(seed),
         worker_init_fn=make_worker_init_fn(seed),
     )
@@ -285,20 +291,24 @@ def train(args):
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
-            truth_mask = train_truth_index.build_in_batch_truth_mask(
-                head_ids=batch['h_batch']['id'],
-                relation_ids=batch['r_batch']['id'],
-                candidate_tail_ids=batch['t_batch']['id'],
-                device=device,
-            )
-            filtered_truths_per_query = truth_mask.sum(dim=1) - 1
-            total_filtered_truth_count += int(
-                filtered_truths_per_query.sum().item()
-            )
-            total_query_rows += int(filtered_truths_per_query.numel())
-            filtered_query_rows += int(
-                (filtered_truths_per_query > 0).sum().item()
-            )
+            if use_full_entity_decoder:
+                truth_mask = None
+                total_query_rows += int(batch['t_batch']['id'].numel())
+            else:
+                truth_mask = train_truth_index.build_in_batch_truth_mask(
+                    head_ids=batch['h_batch']['id'],
+                    relation_ids=batch['r_batch']['id'],
+                    candidate_tail_ids=batch['t_batch']['id'],
+                    device=device,
+                )
+                filtered_truths_per_query = truth_mask.sum(dim=1) - 1
+                total_filtered_truth_count += int(
+                    filtered_truths_per_query.sum().item()
+                )
+                total_query_rows += int(filtered_truths_per_query.numel())
+                filtered_query_rows += int(
+                    (filtered_truths_per_query > 0).sum().item()
+                )
 
             # Move batch to device (handle nested dicts)
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
@@ -306,20 +316,24 @@ def train(args):
             t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
-            # Forward: Query Vector (from head, relation, context)
-            query_vector = model(h_batch, r_batch, context_batch)
-            
-            # Forward: Target Vector
-            t_fused = model.encode_target(t_batch)
-            gate_stats = model.pop_gate_stats()
-
             optimizer.zero_grad()
 
-            loss, _ = model.compute_loss(
-                query_vector,
-                t_fused,
-                truth_mask=truth_mask,
-            )
+            if use_full_entity_decoder:
+                scores = model.score_all_entities(
+                    h_batch,
+                    r_batch,
+                    context_batch,
+                )
+                loss = model.compute_full_softmax_loss(scores, t_batch['id'])
+            else:
+                query_vector = model(h_batch, r_batch, context_batch)
+                t_fused = model.encode_target(t_batch)
+                loss, _ = model.compute_loss(
+                    query_vector,
+                    t_fused,
+                    truth_mask=truth_mask,
+                )
+            gate_stats = model.pop_gate_stats()
 
             if not torch.isfinite(loss):
                 print("Warning: non-finite loss detected; skipping batch to avoid corrupting model weights.")
@@ -339,16 +353,32 @@ def train(args):
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
+        avg_filtered_truths_per_query = (
+            total_filtered_truth_count / max(total_query_rows, 1)
+        )
+        filtered_query_rate = (
+            filtered_query_rows / max(total_query_rows, 1)
+        )
         avg_gate_stats = _average_metric_sums(
             gate_stat_sums,
             gate_stat_counts,
             prefix='train_',
         )
 
-        print(
-            f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-            f"Train Time: {epoch_train_seconds:.2f}s"
-        )
+        if use_full_entity_decoder:
+            print(
+                f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
+                f"Objective: Full-Entity ConvTransE CE | "
+                f"Candidates: {config.num_entities} | "
+                f"Train Time: {epoch_train_seconds:.2f}s"
+            )
+        else:
+            print(
+                f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
+                f"Filtered Truths/Query: {avg_filtered_truths_per_query:.4f} | "
+                f"Rows with Filtered Truths: {filtered_query_rate:.4f} | "
+                f"Train Time: {epoch_train_seconds:.2f}s"
+            )
         
         # Validation
         eval_every = getattr(config, 'eval_every', 1)

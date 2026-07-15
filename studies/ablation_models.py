@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.model import ContextAggregator, GWM, MLPAdapter
+from model.model import ContextAggregator, ConvTransEDecoder, GWM, MLPAdapter
 
 
 def build_model(config):
@@ -64,6 +64,18 @@ class SingleModalityGWM(nn.Module):
         )
         self.output_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.temperature = float(getattr(config, 'temperature'))
+        self.decoder_name = str(getattr(config, 'decoder', 'dot')).lower()
+        if self.decoder_name == 'convtranse':
+            self.decoder = ConvTransEDecoder(
+                embedding_dim=self.fusion_dim,
+                dropout=self.dropout,
+                channels=int(getattr(config, 'convtranse_channels', 50)),
+                kernel_size=int(getattr(config, 'convtranse_kernel_size', 3)),
+            )
+        elif self.decoder_name in {'dot', 'contrastive'}:
+            self.decoder = None
+        else:
+            raise ValueError(f"Unsupported decoder: {self.decoder_name}")
 
     def reset_gate_stats(self):
         pass
@@ -115,7 +127,7 @@ class SingleModalityGWM(nn.Module):
         )
         return h_n[-1]
 
-    def forward(self, h_batch, r_batch, context_batch):
+    def encode_query(self, h_batch, r_batch, context_batch):
         h_emb = self._encode_entities(h_batch['id'])
         r_emb = self._encode_relations(r_batch['id'])
 
@@ -132,7 +144,12 @@ class SingleModalityGWM(nn.Module):
             nbr_batch_index=context_batch_index,
         )
         query = self._run_dynamics(world_state, h_emb, r_emb)
-        return F.normalize(self.output_projection(query), p=2, dim=1)
+        query = F.normalize(self.output_projection(query), p=2, dim=1)
+        return query, r_emb
+
+    def forward(self, h_batch, r_batch, context_batch):
+        query, _ = self.encode_query(h_batch, r_batch, context_batch)
+        return query
 
     def encode_target(self, t_batch):
         target = self._encode_entities(t_batch['id'])
@@ -145,6 +162,38 @@ class SingleModalityGWM(nn.Module):
             truth_mask=truth_mask,
         ).mean()
         return loss, scores
+
+    def score_all_entities(
+        self,
+        h_batch,
+        r_batch,
+        context_batch,
+        candidate_vectors=None,
+    ):
+        query_vectors, relation_vectors = self.encode_query(
+            h_batch,
+            r_batch,
+            context_batch,
+        )
+        if candidate_vectors is None:
+            entity_ids = torch.arange(
+                int(self.config.num_entities),
+                device=query_vectors.device,
+                dtype=torch.long,
+            )
+            candidate_vectors = self.encode_target({'id': entity_ids})
+
+        if self.decoder_name == 'convtranse':
+            return self.decoder(
+                query_vectors,
+                relation_vectors,
+                candidate_vectors,
+            )
+        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
+
+    @staticmethod
+    def compute_full_softmax_loss(scores, target_ids):
+        return F.cross_entropy(scores, target_ids)
 
 
 class TextOnlyGWM(SingleModalityGWM):

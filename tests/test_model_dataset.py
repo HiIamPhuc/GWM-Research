@@ -14,8 +14,8 @@ from utils.eval import (
 )
 
 
-def make_config(context_agg='mean'):
-    return SimpleNamespace(
+def make_config(context_agg='mean', decoder=None):
+    config = SimpleNamespace(
         num_entities=4,
         num_relations=4,
         text_emb_dim=6,
@@ -29,6 +29,11 @@ def make_config(context_agg='mean'):
         temperature=0.1,
         context_agg=context_agg,
     )
+    if decoder is not None:
+        config.decoder = decoder
+        config.convtranse_channels = 2
+        config.convtranse_kernel_size = 3
+    return config
 
 
 class ModelTests(unittest.TestCase):
@@ -209,6 +214,35 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
         self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
 
+    def test_convtranse_scores_all_entities_and_backpropagates(self):
+        model = GWM(make_config(decoder='convtranse'))
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        context_batch = {
+            'id': torch.tensor([1, 2]),
+            'rel_id': torch.tensor([0, 1]),
+            'batch_index': torch.tensor([0, 1]),
+        }
+
+        scores = model.score_all_entities(h_batch, r_batch, context_batch)
+        loss = model.compute_full_softmax_loss(
+            scores,
+            torch.tensor([2, 3]),
+        )
+
+        self.assertEqual(scores.shape, (2, 4))
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(model.decoder.conv.weight.grad)
+        self.assertIsNotNone(model.decoder.fc.weight.grad)
+        self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
+        self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
+
+    def test_decoder_defaults_to_legacy_dot_scoring(self):
+        model = GWM(make_config())
+        self.assertEqual(model.decoder_name, 'dot')
+        self.assertIsNone(model.decoder)
+
     def test_gate_statistics_are_recorded_and_consumed(self):
         model = GWM(make_config())
         h_batch = {'id': torch.tensor([0, 1])}
@@ -227,15 +261,12 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(
             set(stats),
             {
-                'head_gate',
+                'entity_gate',
                 'relation_gate',
-                'context_entity_gate',
-                'context_relation_gate',
-                'target_gate',
             },
         )
-        self.assertGreaterEqual(stats['head_gate'], 0.0)
-        self.assertLessEqual(stats['head_gate'], 1.0)
+        self.assertGreaterEqual(stats['entity_gate'], 0.0)
+        self.assertLessEqual(stats['entity_gate'], 1.0)
         self.assertEqual(model.pop_gate_stats(), {})
 
 

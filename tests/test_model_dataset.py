@@ -152,6 +152,30 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(mask[0, 1].item())
         self.assertFalse(mask[1, 0].item())
 
+    def test_full_entity_truth_mask_marks_all_training_tails(self):
+        truth_index = TrainTruthIndex(
+            torch.tensor(
+                [
+                    [0, 0, 2],
+                    [0, 0, 3],
+                    [1, 0, 4],
+                ]
+            )
+        )
+        mask = truth_index.build_full_entity_truth_mask(
+            head_ids=torch.tensor([0, 1]),
+            relation_ids=torch.tensor([0, 0]),
+            target_tail_ids=torch.tensor([2, 4]),
+            num_entities=6,
+        )
+        expected = torch.tensor(
+            [
+                [False, False, True, True, False, False],
+                [False, False, False, False, True, False],
+            ]
+        )
+        self.assertTrue(torch.equal(mask, expected))
+
     def test_filtered_loss_ignores_other_training_truths(self):
         scores = torch.tensor(
             [
@@ -188,6 +212,25 @@ class ModelTests(unittest.TestCase):
             truth_mask=truth_mask,
         )
         self.assertGreater(losses[0].item(), 17.0)
+
+    def test_filtered_full_softmax_ignores_other_training_truths(self):
+        scores = torch.tensor(
+            [[2.0, 20.0, 0.0]],
+            requires_grad=True,
+        )
+        truth_mask = torch.tensor([[True, True, False]])
+
+        loss = GWM.compute_full_softmax_loss(
+            scores,
+            target_ids=torch.tensor([0]),
+            truth_mask=truth_mask,
+        )
+        expected = torch.log1p(torch.exp(torch.tensor(-2.0)))
+
+        self.assertTrue(torch.allclose(loss, expected))
+        loss.backward()
+        self.assertEqual(scores.grad[0, 1].item(), 0.0)
+        self.assertGreater(scores.grad[0, 2].item(), 0.0)
 
     def test_early_fusion_loss_backpropagates_to_gate(self):
         model = GWM(make_config())
@@ -237,6 +280,34 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.decoder.fc.weight.grad)
         self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
         self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
+
+    def test_dot_decoder_supports_filtered_full_softmax(self):
+        model = GWM(make_config())
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        context_batch = {
+            'id': torch.tensor([1, 2]),
+            'rel_id': torch.tensor([0, 1]),
+            'batch_index': torch.tensor([0, 1]),
+        }
+        truth_mask = torch.tensor(
+            [
+                [False, False, True, True],
+                [True, False, False, True],
+            ]
+        )
+
+        scores = model.score_all_entities(h_batch, r_batch, context_batch)
+        loss = model.compute_full_softmax_loss(
+            scores,
+            torch.tensor([2, 3]),
+            truth_mask=truth_mask,
+        )
+
+        self.assertEqual(scores.shape, (2, 4))
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
 
     def test_decoder_defaults_to_legacy_dot_scoring(self):
         model = GWM(make_config())

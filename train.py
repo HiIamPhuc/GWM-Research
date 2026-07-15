@@ -17,10 +17,10 @@ from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from studies.ablation_models import build_model
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
+    build_bidirectional_hr_map_for_filtering,
     build_entity_loader,
-    compute_filtered_ranking_metrics,
+    compute_bidirectional_filtered_ranking_metrics,
     encode_all_entities_as_targets,
-    load_hr_map_for_filtering,
 )
 from utils.early_stopping import EarlyStopping
 
@@ -159,13 +159,19 @@ def train(args):
     # Init Model
     print("Initializing model...")
     model = build_model(config).to(device)
-    use_full_entity_decoder = getattr(model, 'decoder_name', 'dot') == 'convtranse'
-    config.training_objective = (
-        'full_entity_convtranse_cross_entropy'
-        if use_full_entity_decoder
-        else 'single_positive_filtered_in_batch'
-    )
-    
+    decoder_name = getattr(model, 'decoder_name', 'dot')
+    training_objective = str(
+        getattr(config, 'training_objective')
+    ).lower()
+    if training_objective not in {'filtered_in_batch', 'filtered_full_softmax'}:
+        raise ValueError(
+            "Unsupported training_objective. Expected 'auto', "
+            "'filtered_in_batch', or 'filtered_full_softmax'. "
+            f"Got: {training_objective}"
+        )
+    use_full_entity_objective = training_objective == 'filtered_full_softmax'
+    config.training_objective = training_objective
+
     # Collater
     collate_fn = CollateFN()
     
@@ -176,7 +182,7 @@ def train(args):
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=(device.type == 'cuda'),
-        drop_last=not use_full_entity_decoder,
+        drop_last=not use_full_entity_objective,
         generator=make_torch_generator(seed),
         worker_init_fn=make_worker_init_fn(seed),
     )
@@ -247,15 +253,16 @@ def train(args):
     else:
         valid_loader = None
 
-    # Build filtered-ranking structures for tail-only validation.
+    # Build filtered-ranking structures for validation. Bidirectional
+    # validation constructs inverse queries in memory; preprocessing remains
+    # unchanged.
     hr_map = None
     all_entity_embeddings = None
     entity_loader = None
     if valid_loader is not None:
-        hr_map = load_hr_map_for_filtering(
+        hr_map = build_bidirectional_hr_map_for_filtering(
             config.data_dir,
-            preferred_ground_truth_file=None,
-            fallback_splits=['train']
+            splits=['train', 'valid'],
         )
 
         candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(int(config.batch_size), 256)))
@@ -291,9 +298,14 @@ def train(args):
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
-            if use_full_entity_decoder:
-                truth_mask = None
-                total_query_rows += int(batch['t_batch']['id'].numel())
+            if use_full_entity_objective:
+                truth_mask = train_truth_index.build_full_entity_truth_mask(
+                    head_ids=batch['h_batch']['id'],
+                    relation_ids=batch['r_batch']['id'],
+                    target_tail_ids=batch['t_batch']['id'],
+                    num_entities=config.num_entities,
+                    device=device,
+                )
             else:
                 truth_mask = train_truth_index.build_in_batch_truth_mask(
                     head_ids=batch['h_batch']['id'],
@@ -301,14 +313,14 @@ def train(args):
                     candidate_tail_ids=batch['t_batch']['id'],
                     device=device,
                 )
-                filtered_truths_per_query = truth_mask.sum(dim=1) - 1
-                total_filtered_truth_count += int(
-                    filtered_truths_per_query.sum().item()
-                )
-                total_query_rows += int(filtered_truths_per_query.numel())
-                filtered_query_rows += int(
-                    (filtered_truths_per_query > 0).sum().item()
-                )
+            filtered_truths_per_query = truth_mask.sum(dim=1) - 1
+            total_filtered_truth_count += int(
+                filtered_truths_per_query.sum().item()
+            )
+            total_query_rows += int(filtered_truths_per_query.numel())
+            filtered_query_rows += int(
+                (filtered_truths_per_query > 0).sum().item()
+            )
 
             # Move batch to device (handle nested dicts)
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
@@ -318,13 +330,17 @@ def train(args):
 
             optimizer.zero_grad()
 
-            if use_full_entity_decoder:
+            if use_full_entity_objective:
                 scores = model.score_all_entities(
                     h_batch,
                     r_batch,
                     context_batch,
                 )
-                loss = model.compute_full_softmax_loss(scores, t_batch['id'])
+                loss = model.compute_full_softmax_loss(
+                    scores,
+                    t_batch['id'],
+                    truth_mask=truth_mask,
+                )
             else:
                 query_vector = model(h_batch, r_batch, context_batch)
                 t_fused = model.encode_target(t_batch)
@@ -365,11 +381,13 @@ def train(args):
             prefix='train_',
         )
 
-        if use_full_entity_decoder:
+        if use_full_entity_objective:
             print(
                 f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-                f"Objective: Full-Entity ConvTransE CE | "
+                f"Objective: Filtered Full-Entity CE | "
+                f"Decoder: {decoder_name} | "
                 f"Candidates: {config.num_entities} | "
+                f"Filtered Truths/Query: {avg_filtered_truths_per_query:.4f} | "
                 f"Train Time: {epoch_train_seconds:.2f}s"
             )
         else:
@@ -391,25 +409,15 @@ def train(args):
                 device=device,
             )
 
-            # save_eval_predictions = bool(getattr(config, 'save_eval_predictions', False))
-            # eval_topk = int(getattr(config, 'eval_topk', 50))
-            # predictions_dir = getattr(config, 'eval_predictions_dir', None)
-            # predictions_path = None
-            # if save_eval_predictions:
-            #     if predictions_dir is None:
-            #         predictions_dir = os.path.join(config.output_dir, 'predictions')
-            #     predictions_path = os.path.join(predictions_dir, f'val_epoch_{epoch + 1}.jsonl')
-
-            val_metrics = compute_filtered_ranking_metrics(
+            directional_val_metrics = compute_bidirectional_filtered_ranking_metrics(
                 model=model,
                 data_loader=valid_loader,
                 all_entity_embeddings=all_entity_embeddings,
                 hr_map=hr_map,
                 device=device,
                 desc="Validation",
-                # save_predictions_path=predictions_path,
-                # topk=eval_topk,
             )
+            val_metrics = directional_val_metrics['micro']
 
             val_mrr = val_metrics['MRR']
             val_h1 = val_metrics['Hits@1']
@@ -422,6 +430,11 @@ def train(args):
                 f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
                 f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
             )
+            print(
+                f"Val Directions | "
+                f"Forward MRR: {directional_val_metrics['forward']['MRR']:.4f} | "
+                f"Backward MRR: {directional_val_metrics['backward']['MRR']:.4f}"
+            )
             
             # Log metrics
             epoch_log = {
@@ -432,6 +445,8 @@ def train(args):
                 'val_hits1': val_h1,
                 'val_hits3': val_h3,
                 'val_hits10': val_h10,
+                'val_forward_mrr': directional_val_metrics['forward']['MRR'],
+                'val_backward_mrr': directional_val_metrics['backward']['MRR'],
             }
             epoch_log.update(avg_gate_stats)
             history.append(epoch_log)

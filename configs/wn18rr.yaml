@@ -25,6 +25,8 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 temperature: 0.07
+decoder: dot
+training_objective: filtered_in_batch
 
 data_dir: data-processed/wn18rr
 output_dir: output/wn18rr

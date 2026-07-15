@@ -192,8 +192,12 @@ class SingleModalityGWM(nn.Module):
         return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
 
     @staticmethod
-    def compute_full_softmax_loss(scores, target_ids):
-        return F.cross_entropy(scores, target_ids)
+    def compute_full_softmax_loss(scores, target_ids, truth_mask=None):
+        return GWM.compute_full_softmax_loss(
+            scores,
+            target_ids,
+            truth_mask=truth_mask,
+        )
 
 
 class TextOnlyGWM(SingleModalityGWM):

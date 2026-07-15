@@ -5,7 +5,7 @@ import os
 
 
 class TrainTruthIndex:
-    """Build query-aware in-batch truth masks from training triples only."""
+    """Build query-aware truth masks from training triples only."""
 
     def __init__(self, train_triples):
         train_triples = torch.as_tensor(train_triples, dtype=torch.long)
@@ -61,6 +61,56 @@ class TrainTruthIndex:
         # The diagonal is the sampled target for each query and must always be
         # recognized as true, even with an externally malformed triple tensor.
         truth_mask.fill_diagonal_(True)
+        if device is not None:
+            truth_mask = truth_mask.to(device)
+        return truth_mask
+
+    def build_full_entity_truth_mask(
+        self,
+        head_ids,
+        relation_ids,
+        target_tail_ids,
+        num_entities,
+        device=None,
+    ):
+        head_ids = torch.as_tensor(head_ids, dtype=torch.long).reshape(-1).cpu()
+        relation_ids = torch.as_tensor(
+            relation_ids, dtype=torch.long
+        ).reshape(-1).cpu()
+        target_tail_ids = torch.as_tensor(
+            target_tail_ids, dtype=torch.long
+        ).reshape(-1).cpu()
+
+        batch_size = head_ids.numel()
+        if relation_ids.numel() != batch_size or target_tail_ids.numel() != batch_size:
+            raise ValueError(
+                "head_ids, relation_ids, and target_tail_ids must contain "
+                "the same number of rows."
+            )
+        num_entities = int(num_entities)
+        if num_entities <= 0:
+            raise ValueError("num_entities must be positive.")
+        if target_tail_ids.numel() and (
+            target_tail_ids.min() < 0 or target_tail_ids.max() >= num_entities
+        ):
+            raise ValueError("target_tail_ids contains an invalid entity ID.")
+
+        truth_mask = torch.zeros(
+            batch_size, num_entities, dtype=torch.bool
+        )
+        for row, (head_id, relation_id) in enumerate(
+            zip(head_ids.tolist(), relation_ids.tolist())
+        ):
+            tails = self.query_tails.get((head_id, relation_id), ())
+            if tails:
+                truth_mask[row, list(tails)] = True
+
+        # Preserve the sampled target even if an externally supplied truth
+        # index is incomplete.
+        if batch_size:
+            truth_mask[
+                torch.arange(batch_size), target_tail_ids
+            ] = True
         if device is not None:
             truth_mask = truth_mask.to(device)
         return truth_mask

@@ -450,5 +450,25 @@ class GWM(nn.Module):
         return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
 
     @staticmethod
-    def compute_full_softmax_loss(scores, target_ids):
+    def compute_full_softmax_loss(scores, target_ids, truth_mask=None):
+        if scores.dim() != 2:
+            raise ValueError("Full-softmax scores must have shape (B, |E|).")
+
+        target_ids = torch.as_tensor(
+            target_ids, dtype=torch.long, device=scores.device
+        ).reshape(-1)
+        if target_ids.numel() != scores.size(0):
+            raise ValueError("target_ids must contain one entity ID per score row.")
+
+        if truth_mask is not None:
+            if truth_mask.shape != scores.shape:
+                raise ValueError("truth_mask must have the same shape as scores.")
+            truth_mask = truth_mask.to(device=scores.device, dtype=torch.bool)
+
+            # Other known truths are ignored, while the sampled target remains
+            # in the softmax denominator and receives the positive gradient.
+            ignored_truths = truth_mask.clone()
+            ignored_truths.scatter_(1, target_ids.unsqueeze(1), False)
+            scores = scores.masked_fill(ignored_truths, float('-inf'))
+
         return F.cross_entropy(scores, target_ids)

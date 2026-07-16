@@ -9,13 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.model import (
-    ContextAggregator,
-    ConvTransEDecoder,
-    GWM,
-    MLPAdapter,
-    n3_factor_regularizer,
-)
+from model.model import ContextAggregator, ConvTransEDecoder, GWM, MLPAdapter
 
 
 def build_model(config):
@@ -164,25 +158,6 @@ class SingleModalityGWM(nn.Module):
     @staticmethod
     def compute_loss(scores, target_ids):
         return GWM.compute_loss(scores, target_ids)
-
-    def compute_n3_regularizer(self, head_ids, relation_ids, tail_ids):
-        if self.modality_name != 'structure':
-            raise ValueError(
-                "N3 factor regularization is only defined for models with "
-                "trainable structural ID embeddings."
-            )
-        return n3_factor_regularizer(
-            [
-                self.ent_embs(head_ids),
-                self.rel_embs(relation_ids),
-                self.ent_embs(tail_ids),
-            ]
-        )
-
-    def structural_factor_parameters(self):
-        if self.modality_name != 'structure':
-            return ()
-        return (self.ent_embs.weight, self.rel_embs.weight)
 
     def score_candidates(
         self,

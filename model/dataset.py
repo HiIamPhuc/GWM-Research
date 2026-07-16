@@ -161,20 +161,29 @@ class CollateFN:
         r_ids = torch.stack([b['r_id'] for b in batch])
         t_ids = torch.stack([b['t_id'] for b in batch])
 
-        positive_tail_chunks = []
-        positive_batch_chunks = []
-        for sample_idx, item in enumerate(batch):
-            positive_tail_ids = item['positive_tail_ids'].long()
-            positive_tail_chunks.append(positive_tail_ids)
-            positive_batch_chunks.append(
-                torch.full(
-                    (positive_tail_ids.numel(),),
-                    sample_idx,
-                    dtype=torch.long,
-                )
+        positive_batch = None
+        has_positive_sets = ['positive_tail_ids' in item for item in batch]
+        if any(has_positive_sets) and not all(has_positive_sets):
+            raise ValueError(
+                "A batch cannot mix samples with and without positive-tail sets."
             )
-        positive_tail_ids = torch.cat(positive_tail_chunks, dim=0)
-        positive_batch_index = torch.cat(positive_batch_chunks, dim=0)
+        if all(has_positive_sets):
+            positive_tail_chunks = []
+            positive_batch_chunks = []
+            for sample_idx, item in enumerate(batch):
+                positive_tail_ids = item['positive_tail_ids'].long()
+                positive_tail_chunks.append(positive_tail_ids)
+                positive_batch_chunks.append(
+                    torch.full(
+                        (positive_tail_ids.numel(),),
+                        sample_idx,
+                        dtype=torch.long,
+                    )
+                )
+            positive_batch = {
+                'id': torch.cat(positive_tail_chunks, dim=0),
+                'batch_index': torch.cat(positive_batch_chunks, dim=0),
+            }
 
         # Build ragged context representation: flattened edges + edge->sample index.
         context_entity_chunks = []
@@ -212,17 +221,16 @@ class CollateFN:
             context_relation_ids = torch.zeros(0, dtype=torch.long)
             context_batch_index = torch.zeros(0, dtype=torch.long)
         
-        return {
+        collated = {
             'h_batch': {'id': h_ids},
             'r_batch': {'id': r_ids},
             't_batch': {'id': t_ids},
-            'positive_batch': {
-                'id': positive_tail_ids,
-                'batch_index': positive_batch_index,
-            },
             'context_batch': {
                 'id': context_entity_ids,
                 'rel_id': context_relation_ids,
                 'batch_index': context_batch_index,
             },
         }
+        if positive_batch is not None:
+            collated['positive_batch'] = positive_batch
+        return collated

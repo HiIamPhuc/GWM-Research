@@ -287,6 +287,13 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(forward_dataset.triples.tolist(), [[0, 0, 1]])
             self.assertEqual(backward_dataset.triples.tolist(), [[1, 1, 0]])
 
+            forward_batch = CollateFN()([forward_dataset[0]])
+            backward_batch = CollateFN()([backward_dataset[0]])
+            self.assertNotIn('positive_batch', forward_batch)
+            self.assertNotIn('positive_batch', backward_batch)
+            self.assertEqual(forward_batch['t_batch']['id'].tolist(), [1])
+            self.assertEqual(backward_batch['t_batch']['id'].tolist(), [0])
+
     def test_bidirectional_filter_map_adds_inverse_truths(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)

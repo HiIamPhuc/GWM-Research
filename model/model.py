@@ -315,46 +315,6 @@ class GWM(nn.Module):
             self.text_ent_embs.weight.requires_grad = False
             self.text_rel_embs.weight.requires_grad = False
 
-    @staticmethod
-    def _filtered_in_batch_contrastive_loss(
-        scores,
-        truth_mask=None,
-    ):
-        batch_size = scores.size(0)
-        if scores.dim() != 2 or scores.size(1) != batch_size:
-            raise ValueError(
-                "In-batch contrastive scores must have shape (B, B)."
-            )
-
-        if truth_mask is None:
-            truth_mask = torch.eye(
-                batch_size, dtype=torch.bool, device=scores.device
-            )
-        else:
-            if truth_mask.shape != scores.shape:
-                raise ValueError(
-                    "truth_mask must have the same shape as scores."
-                )
-            truth_mask = truth_mask.to(
-                device=scores.device, dtype=torch.bool
-            )
-
-        diagonal = torch.eye(
-            batch_size, dtype=torch.bool, device=scores.device
-        )
-        # Keep the sampled diagonal target and all false candidates. Other
-        # known training truths are ignored instead of treated as negatives.
-        denominator_mask = (~truth_mask) | diagonal
-        filtered_scores = scores.masked_fill(
-            ~denominator_mask, float('-inf')
-        )
-        labels = torch.arange(batch_size, device=scores.device)
-        return F.cross_entropy(
-            filtered_scores,
-            labels,
-            reduction='none',
-        )
-
     def encode_query(self, h_batch, r_batch, context_batch):
         self.reset_gate_stats()
         h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
@@ -412,14 +372,40 @@ class GWM(nn.Module):
         self,
         query_vectors,
         target_vectors,
-        truth_mask=None,
+        relation_vectors=None,
     ):
-        scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
-        loss = self._filtered_in_batch_contrastive_loss(
-            scores,
-            truth_mask=truth_mask,
-        ).mean()
+        scores = self.score_candidates(
+            query_vectors,
+            target_vectors,
+            relation_vectors=relation_vectors,
+        )
+        expected_shape = (query_vectors.size(0), query_vectors.size(0))
+        if tuple(scores.shape) != expected_shape:
+            raise ValueError(
+                "Unfiltered in-batch loss requires one candidate tail per query "
+                f"and a score matrix of shape {expected_shape}, got {tuple(scores.shape)}."
+            )
+        labels = torch.arange(scores.size(0), device=scores.device)
+        loss = F.cross_entropy(scores, labels)
         return loss, scores
+
+    def score_candidates(
+        self,
+        query_vectors,
+        candidate_vectors,
+        relation_vectors=None,
+    ):
+        if self.decoder_name == 'convtranse':
+            if relation_vectors is None:
+                raise ValueError(
+                    "ConvTransE scoring requires relation vectors."
+                )
+            return self.decoder(
+                query_vectors,
+                relation_vectors,
+                candidate_vectors,
+            )
+        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
 
     def score_all_entities(
         self,
@@ -441,34 +427,8 @@ class GWM(nn.Module):
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        if self.decoder_name == 'convtranse':
-            return self.decoder(
-                query_vectors,
-                relation_vectors,
-                candidate_vectors,
-            )
-        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
-
-    @staticmethod
-    def compute_full_softmax_loss(scores, target_ids, truth_mask=None):
-        if scores.dim() != 2:
-            raise ValueError("Full-softmax scores must have shape (B, |E|).")
-
-        target_ids = torch.as_tensor(
-            target_ids, dtype=torch.long, device=scores.device
-        ).reshape(-1)
-        if target_ids.numel() != scores.size(0):
-            raise ValueError("target_ids must contain one entity ID per score row.")
-
-        if truth_mask is not None:
-            if truth_mask.shape != scores.shape:
-                raise ValueError("truth_mask must have the same shape as scores.")
-            truth_mask = truth_mask.to(device=scores.device, dtype=torch.bool)
-
-            # Other known truths are ignored, while the sampled target remains
-            # in the softmax denominator and receives the positive gradient.
-            ignored_truths = truth_mask.clone()
-            ignored_truths.scatter_(1, target_ids.unsqueeze(1), False)
-            scores = scores.masked_fill(ignored_truths, float('-inf'))
-
-        return F.cross_entropy(scores, target_ids)
+        return self.score_candidates(
+            query_vectors,
+            candidate_vectors,
+            relation_vectors=relation_vectors,
+        )

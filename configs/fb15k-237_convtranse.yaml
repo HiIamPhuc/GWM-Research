@@ -1,4 +1,4 @@
-# Static GWM with the same ConvTransE decoder and full-softmax objective as temporal GWM.
+# Static GWM with a ConvTransE decoder and unfiltered in-batch negatives.
 text_emb_dim: 768
 struct_emb_dim: 896
 fusion_dim: 1024
@@ -28,7 +28,6 @@ temperature: 0.07
 decoder: convtranse
 convtranse_channels: 50
 convtranse_kernel_size: 3
-training_objective: filtered_in_batch
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

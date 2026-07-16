@@ -155,13 +155,44 @@ class SingleModalityGWM(nn.Module):
         target = self._encode_entities(t_batch['id'])
         return F.normalize(self.output_projection(target), p=2, dim=1)
 
-    def compute_loss(self, query_vectors, target_vectors, truth_mask=None):
-        scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
-        loss = GWM._filtered_in_batch_contrastive_loss(
-            scores,
-            truth_mask=truth_mask,
-        ).mean()
+    def compute_loss(
+        self,
+        query_vectors,
+        target_vectors,
+        relation_vectors=None,
+    ):
+        scores = self.score_candidates(
+            query_vectors,
+            target_vectors,
+            relation_vectors=relation_vectors,
+        )
+        expected_shape = (query_vectors.size(0), query_vectors.size(0))
+        if tuple(scores.shape) != expected_shape:
+            raise ValueError(
+                "Unfiltered in-batch loss requires one candidate tail per query "
+                f"and a score matrix of shape {expected_shape}, got {tuple(scores.shape)}."
+            )
+        labels = torch.arange(scores.size(0), device=scores.device)
+        loss = F.cross_entropy(scores, labels)
         return loss, scores
+
+    def score_candidates(
+        self,
+        query_vectors,
+        candidate_vectors,
+        relation_vectors=None,
+    ):
+        if self.decoder_name == 'convtranse':
+            if relation_vectors is None:
+                raise ValueError(
+                    "ConvTransE scoring requires relation vectors."
+                )
+            return self.decoder(
+                query_vectors,
+                relation_vectors,
+                candidate_vectors,
+            )
+        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
 
     def score_all_entities(
         self,
@@ -183,20 +214,10 @@ class SingleModalityGWM(nn.Module):
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        if self.decoder_name == 'convtranse':
-            return self.decoder(
-                query_vectors,
-                relation_vectors,
-                candidate_vectors,
-            )
-        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
-
-    @staticmethod
-    def compute_full_softmax_loss(scores, target_ids, truth_mask=None):
-        return GWM.compute_full_softmax_loss(
-            scores,
-            target_ids,
-            truth_mask=truth_mask,
+        return self.score_candidates(
+            query_vectors,
+            candidate_vectors,
+            relation_vectors=relation_vectors,
         )
 
 

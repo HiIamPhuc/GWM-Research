@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
+from model.dataset import CollateFN, GWMDataset
 from studies.ablation_models import build_model
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
@@ -143,7 +143,6 @@ def train(args):
     # Load Dataset
     print(f"Loading data from {config.data_dir}...")
     train_dataset = GWMDataset(config.data_dir, split='train')
-    train_truth_index = TrainTruthIndex(train_dataset.triples)
     
     # Infer input dimensions from dataset
     # e.g., number of entities/relations for embedding layers
@@ -160,17 +159,6 @@ def train(args):
     print("Initializing model...")
     model = build_model(config).to(device)
     decoder_name = getattr(model, 'decoder_name', 'dot')
-    training_objective = str(
-        getattr(config, 'training_objective')
-    ).lower()
-    if training_objective not in {'filtered_in_batch', 'filtered_full_softmax'}:
-        raise ValueError(
-            "Unsupported training_objective. Expected 'auto', "
-            "'filtered_in_batch', or 'filtered_full_softmax'. "
-            f"Got: {training_objective}"
-        )
-    use_full_entity_objective = training_objective == 'filtered_full_softmax'
-    config.training_objective = training_objective
 
     # Collater
     collate_fn = CollateFN()
@@ -182,7 +170,7 @@ def train(args):
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=(device.type == 'cuda'),
-        drop_last=not use_full_entity_objective,
+        drop_last=True,
         generator=make_torch_generator(seed),
         worker_init_fn=make_worker_init_fn(seed),
     )
@@ -290,38 +278,11 @@ def train(args):
         _sync_device(device)
         model.train()
         total_loss = 0
-        total_filtered_truth_count = 0
-        total_query_rows = 0
-        filtered_query_rows = 0
         gate_stat_sums = {}
         gate_stat_counts = {}
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
-            if use_full_entity_objective:
-                truth_mask = train_truth_index.build_full_entity_truth_mask(
-                    head_ids=batch['h_batch']['id'],
-                    relation_ids=batch['r_batch']['id'],
-                    target_tail_ids=batch['t_batch']['id'],
-                    num_entities=config.num_entities,
-                    device=device,
-                )
-            else:
-                truth_mask = train_truth_index.build_in_batch_truth_mask(
-                    head_ids=batch['h_batch']['id'],
-                    relation_ids=batch['r_batch']['id'],
-                    candidate_tail_ids=batch['t_batch']['id'],
-                    device=device,
-                )
-            filtered_truths_per_query = truth_mask.sum(dim=1) - 1
-            total_filtered_truth_count += int(
-                filtered_truths_per_query.sum().item()
-            )
-            total_query_rows += int(filtered_truths_per_query.numel())
-            filtered_query_rows += int(
-                (filtered_truths_per_query > 0).sum().item()
-            )
-
             # Move batch to device (handle nested dicts)
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
@@ -330,25 +291,17 @@ def train(args):
 
             optimizer.zero_grad()
 
-            if use_full_entity_objective:
-                scores = model.score_all_entities(
-                    h_batch,
-                    r_batch,
-                    context_batch,
-                )
-                loss = model.compute_full_softmax_loss(
-                    scores,
-                    t_batch['id'],
-                    truth_mask=truth_mask,
-                )
-            else:
-                query_vector = model(h_batch, r_batch, context_batch)
-                t_fused = model.encode_target(t_batch)
-                loss, _ = model.compute_loss(
-                    query_vector,
-                    t_fused,
-                    truth_mask=truth_mask,
-                )
+            query_vector, relation_vector = model.encode_query(
+                h_batch,
+                r_batch,
+                context_batch,
+            )
+            target_vector = model.encode_target(t_batch)
+            loss, _ = model.compute_loss(
+                query_vector,
+                target_vector,
+                relation_vectors=relation_vector,
+            )
             gate_stats = model.pop_gate_stats()
 
             if not torch.isfinite(loss):
@@ -369,34 +322,19 @@ def train(args):
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
-        avg_filtered_truths_per_query = (
-            total_filtered_truth_count / max(total_query_rows, 1)
-        )
-        filtered_query_rate = (
-            filtered_query_rows / max(total_query_rows, 1)
-        )
         avg_gate_stats = _average_metric_sums(
             gate_stat_sums,
             gate_stat_counts,
             prefix='train_',
         )
 
-        if use_full_entity_objective:
-            print(
-                f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-                f"Objective: Filtered Full-Entity CE | "
-                f"Decoder: {decoder_name} | "
-                f"Candidates: {config.num_entities} | "
-                f"Filtered Truths/Query: {avg_filtered_truths_per_query:.4f} | "
-                f"Train Time: {epoch_train_seconds:.2f}s"
-            )
-        else:
-            print(
-                f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-                f"Filtered Truths/Query: {avg_filtered_truths_per_query:.4f} | "
-                f"Rows with Filtered Truths: {filtered_query_rate:.4f} | "
-                f"Train Time: {epoch_train_seconds:.2f}s"
-            )
+        print(
+            f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
+            f"Objective: Unfiltered In-Batch CE | "
+            f"Decoder: {decoder_name} | "
+            f"Candidates/Query: {config.batch_size} | "
+            f"Train Time: {epoch_train_seconds:.2f}s"
+        )
         
         # Validation
         eval_every = getattr(config, 'eval_every', 1)

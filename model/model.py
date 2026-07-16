@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import math
 
 
+MULTI_LABEL_SMOOTHING = 0.05
+
+
 class ContextAggregator(nn.Module):
     """Pool relation-composed facts, add the head residual, and normalize."""
 
@@ -369,18 +372,50 @@ class GWM(nn.Module):
         )
 
     @staticmethod
-    def compute_loss(scores, target_ids):
+    def compute_loss(scores, positive_tail_ids, positive_batch_index):
+        """Smoothed full-entity BCE using sparse multi-positive labels."""
         if scores.dim() != 2:
             raise ValueError("Full-entity scores must have shape (B, |E|).")
 
-        target_ids = torch.as_tensor(
-            target_ids,
+        positive_tail_ids = torch.as_tensor(
+            positive_tail_ids,
             dtype=torch.long,
             device=scores.device,
         ).reshape(-1)
-        if target_ids.numel() != scores.size(0):
-            raise ValueError("target_ids must contain one entity ID per score row.")
-        return F.cross_entropy(scores, target_ids)
+        positive_batch_index = torch.as_tensor(
+            positive_batch_index,
+            dtype=torch.long,
+            device=scores.device,
+        ).reshape(-1)
+        if positive_tail_ids.numel() != positive_batch_index.numel():
+            raise ValueError(
+                "positive_tail_ids and positive_batch_index must have equal lengths."
+            )
+        if positive_tail_ids.numel() == 0:
+            raise ValueError("Every training batch must contain a positive target.")
+        if (
+            positive_tail_ids.min() < 0
+            or positive_tail_ids.max() >= scores.size(1)
+            or positive_batch_index.min() < 0
+            or positive_batch_index.max() >= scores.size(0)
+        ):
+            raise ValueError("Multi-positive indices are outside the score matrix.")
+
+        batch_size, num_entities = scores.shape
+        positive_scores = scores[
+            positive_batch_index,
+            positive_tail_ids,
+        ]
+        loss = F.softplus(scores).mean()
+        loss = loss - (
+            MULTI_LABEL_SMOOTHING / num_entities
+        ) * scores.mean()
+        loss = loss - (
+            (1.0 - MULTI_LABEL_SMOOTHING)
+            * positive_scores.sum()
+            / (batch_size * num_entities)
+        )
+        return loss
 
     def score_candidates(
         self,

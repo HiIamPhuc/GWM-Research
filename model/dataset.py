@@ -31,6 +31,35 @@ class GWMDataset(Dataset):
             raise ValueError(
                 f"Expected triples with shape (N, 3), got {tuple(self.triples.shape)}"
             )
+
+        self.num_input_triples = int(self.triples.size(0))
+        self.query_positive_tail_ids = None
+        self.query_positive_offsets = None
+        if split == 'train':
+            query_to_tails = {}
+            for h_id, r_id, t_id in self.triples.tolist():
+                query_to_tails.setdefault((h_id, r_id), {})[t_id] = None
+
+            query_rows = []
+            flat_positive_tail_ids = []
+            positive_offsets = [0]
+            for (h_id, r_id), tail_map in query_to_tails.items():
+                tail_ids = list(tail_map)
+                query_rows.append((h_id, r_id, tail_ids[0]))
+                flat_positive_tail_ids.extend(tail_ids)
+                positive_offsets.append(len(flat_positive_tail_ids))
+            self.triples = torch.tensor(
+                query_rows,
+                dtype=torch.long,
+            ).reshape(-1, 3)
+            self.query_positive_tail_ids = torch.tensor(
+                flat_positive_tail_ids,
+                dtype=torch.long,
+            )
+            self.query_positive_offsets = torch.tensor(
+                positive_offsets,
+                dtype=torch.long,
+            )
         
         # Load compact relation-aware context artifact.
         context_pack_path = os.path.join(data_dir, 'context_neighbors.pt')
@@ -84,6 +113,14 @@ class GWMDataset(Dataset):
     def __getitem__(self, idx):
         h, r, t = self.triples[idx]
         h_idx = int(h.item())
+        if self.query_positive_tail_ids is None:
+            positive_tail_ids = t.reshape(1).long()
+        else:
+            positive_start = int(self.query_positive_offsets[idx].item())
+            positive_end = int(self.query_positive_offsets[idx + 1].item())
+            positive_tail_ids = self.query_positive_tail_ids[
+                positive_start:positive_end
+            ]
 
         # Retrieve context row for this head.
         if self.context_entity_ids is not None:
@@ -91,10 +128,12 @@ class GWMDataset(Dataset):
             ctx_relation_ids = self.context_relation_ids[h_idx]
             ctx_mask = self.context_mask[h_idx].clone()
 
-            # Do not expose the answer edge while predicting this triple.
+            # Do not expose any positive answer edge for this query.
+            positive_entity = ctx_entity_ids.unsqueeze(1).eq(
+                positive_tail_ids.unsqueeze(0)
+            ).any(dim=1)
             target_edge = (
-                ctx_entity_ids.eq(int(t.item()))
-                & ctx_relation_ids.eq(int(r.item()))
+                positive_entity & ctx_relation_ids.eq(int(r.item()))
             )
             ctx_mask &= ~target_edge
         else:
@@ -107,6 +146,7 @@ class GWMDataset(Dataset):
             'h_id': h.long(),
             'r_id': r.long(),
             't_id': t.long(),
+            'positive_tail_ids': positive_tail_ids.long(),
             'context_entity_ids': ctx_entity_ids.long(),
             'context_relation_ids': ctx_relation_ids.long(),
             'context_mask': ctx_mask.bool(),
@@ -120,6 +160,21 @@ class CollateFN:
         h_ids = torch.stack([b['h_id'] for b in batch])
         r_ids = torch.stack([b['r_id'] for b in batch])
         t_ids = torch.stack([b['t_id'] for b in batch])
+
+        positive_tail_chunks = []
+        positive_batch_chunks = []
+        for sample_idx, item in enumerate(batch):
+            positive_tail_ids = item['positive_tail_ids'].long()
+            positive_tail_chunks.append(positive_tail_ids)
+            positive_batch_chunks.append(
+                torch.full(
+                    (positive_tail_ids.numel(),),
+                    sample_idx,
+                    dtype=torch.long,
+                )
+            )
+        positive_tail_ids = torch.cat(positive_tail_chunks, dim=0)
+        positive_batch_index = torch.cat(positive_batch_chunks, dim=0)
 
         # Build ragged context representation: flattened edges + edge->sample index.
         context_entity_chunks = []
@@ -161,6 +216,10 @@ class CollateFN:
             'h_batch': {'id': h_ids},
             'r_batch': {'id': r_ids},
             't_batch': {'id': t_ids},
+            'positive_batch': {
+                'id': positive_tail_ids,
+                'batch_index': positive_batch_index,
+            },
             'context_batch': {
                 'id': context_entity_ids,
                 'rel_id': context_relation_ids,

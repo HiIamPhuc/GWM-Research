@@ -14,6 +14,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.dataset import CollateFN, GWMDataset
+from model.model import MULTI_LABEL_SMOOTHING
 from studies.ablation_models import build_model
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
@@ -143,6 +144,10 @@ def train(args):
     # Load Dataset
     print(f"Loading data from {config.data_dir}...")
     train_dataset = GWMDataset(config.data_dir, split='train')
+    print(
+        f"Built {len(train_dataset)} unique training queries from "
+        f"{train_dataset.num_input_triples} triples."
+    )
     
     # Infer input dimensions from dataset
     # e.g., number of entities/relations for embedding layers
@@ -159,6 +164,8 @@ def train(args):
     print("Initializing model...")
     model = build_model(config).to(device)
     decoder_name = getattr(model, 'decoder_name', 'dot')
+    config.training_objective = 'smoothed_multi_label_bce'
+    config.label_smoothing = MULTI_LABEL_SMOOTHING
 
     # Collater
     collate_fn = CollateFN()
@@ -224,8 +231,9 @@ def train(args):
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     grad_clip_norm = float(getattr(config, 'grad_clip_norm', 1.0))
     print(
-        f"Training objective: Full-Entity CE | Decoder: {decoder_name} | "
-        f"Optimizer: AdamW | Scheduler: cosine"
+        f"Training objective: Smoothed Multi-Label BCE | Decoder: {decoder_name} | "
+        f"Optimizer: AdamW | Scheduler: cosine | "
+        f"Label smoothing: {MULTI_LABEL_SMOOTHING:g}"
     )
     
     # Validation Loader
@@ -290,7 +298,9 @@ def train(args):
             # Move batch to device (handle nested dicts)
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
-            t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
+            positive_batch = {
+                k: v.to(device) for k, v in batch['positive_batch'].items()
+            }
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             optimizer.zero_grad()
@@ -300,7 +310,11 @@ def train(args):
                 r_batch,
                 context_batch,
             )
-            loss = model.compute_loss(scores, t_batch['id'])
+            loss = model.compute_loss(
+                scores,
+                positive_batch['id'],
+                positive_batch['batch_index'],
+            )
             gate_stats = model.pop_gate_stats()
 
             if not torch.isfinite(loss):
@@ -329,7 +343,7 @@ def train(args):
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-            f"Objective: Full-Entity CE | "
+            f"Objective: Smoothed Multi-Label BCE | "
             f"Decoder: {decoder_name} | "
             f"Candidates/Query: {config.num_entities} | "
             f"Train Time: {epoch_train_seconds:.2f}s"

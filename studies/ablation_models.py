@@ -156,8 +156,12 @@ class SingleModalityGWM(nn.Module):
         return F.normalize(self.output_projection(target), p=2, dim=1)
 
     @staticmethod
-    def compute_loss(scores, target_ids):
-        return GWM.compute_loss(scores, target_ids)
+    def compute_loss(scores, positive_tail_ids, positive_batch_index):
+        return GWM.compute_loss(
+            scores,
+            positive_tail_ids,
+            positive_batch_index,
+        )
 
     def score_candidates(
         self,

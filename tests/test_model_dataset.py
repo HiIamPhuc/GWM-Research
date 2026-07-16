@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from model.dataset import CollateFN, GWMDataset
-from model.model import ContextAggregator, GWM
+from model.model import ContextAggregator, GWM, MULTI_LABEL_SMOOTHING
 from utils.eval import (
     build_bidirectional_eval_dataset,
     build_bidirectional_hr_map_for_filtering,
@@ -122,7 +122,11 @@ class ModelTests(unittest.TestCase):
             'batch_index': torch.tensor([0, 1]),
         }
         scores = model.score_all_entities(h_batch, r_batch, context_batch)
-        loss = model.compute_loss(scores, t_batch['id'])
+        loss = model.compute_loss(
+            scores,
+            t_batch['id'],
+            torch.arange(t_batch['id'].numel()),
+        )
         self.assertEqual(scores.shape, (2, 4))
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
@@ -141,7 +145,11 @@ class ModelTests(unittest.TestCase):
         }
 
         scores = model.score_all_entities(h_batch, r_batch, context_batch)
-        loss = model.compute_loss(scores, t_batch['id'])
+        loss = model.compute_loss(
+            scores,
+            t_batch['id'],
+            torch.arange(t_batch['id'].numel()),
+        )
 
         self.assertEqual(scores.shape, (2, 4))
         self.assertTrue(torch.isfinite(loss))
@@ -150,6 +158,32 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.decoder.fc.weight.grad)
         self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
         self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
+
+    def test_sparse_multi_positive_loss_matches_dense_smoothed_bce(self):
+        scores = torch.tensor(
+            [[0.2, -0.3, 1.1, 0.5], [-0.7, 0.4, 0.8, -0.2]],
+            requires_grad=True,
+        )
+        positive_tail_ids = torch.tensor([1, 3, 2])
+        positive_batch_index = torch.tensor([0, 0, 1])
+
+        actual = GWM.compute_loss(
+            scores,
+            positive_tail_ids,
+            positive_batch_index,
+        )
+        targets = torch.zeros_like(scores)
+        targets[positive_batch_index, positive_tail_ids] = 1.0
+        smoothed_targets = (
+            (1.0 - MULTI_LABEL_SMOOTHING) * targets
+            + MULTI_LABEL_SMOOTHING / scores.size(1)
+        )
+        expected = torch.nn.functional.binary_cross_entropy_with_logits(
+            scores,
+            smoothed_targets,
+        )
+
+        self.assertTrue(torch.allclose(actual, expected))
 
     def test_decoder_defaults_to_legacy_dot_scoring(self):
         model = GWM(make_config())
@@ -215,6 +249,27 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(
                 set(batch['context_batch']),
                 {'id', 'rel_id', 'batch_index'},
+            )
+
+    def test_training_queries_merge_positives_and_mask_all_answer_edges(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_data(root)
+            torch.save(
+                torch.tensor([[0, 0, 1], [0, 0, 2]]),
+                Path(root) / 'train_triples.pt',
+            )
+
+            dataset = GWMDataset(root, split='train')
+            self.assertEqual(len(dataset), 1)
+            item = dataset[0]
+            self.assertEqual(item['positive_tail_ids'].tolist(), [1, 2])
+            self.assertEqual(item['context_mask'].tolist(), [False, False])
+
+            batch = CollateFN()([item])
+            self.assertEqual(batch['positive_batch']['id'].tolist(), [1, 2])
+            self.assertEqual(
+                batch['positive_batch']['batch_index'].tolist(),
+                [0, 0],
             )
 
     def test_bidirectional_eval_dataset_builds_inverse_queries_on_the_fly(self):

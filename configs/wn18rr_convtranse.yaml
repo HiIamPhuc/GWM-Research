@@ -1,4 +1,4 @@
-# Static GWM with ConvTransE and full-entity cross-entropy.
+# Static GWM with ConvTransE and smoothed full-entity multi-label BCE.
 text_emb_dim: 768
 struct_emb_dim: 384
 fusion_dim: 1024

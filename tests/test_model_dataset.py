@@ -8,6 +8,7 @@ import torch
 
 from model.dataset import CollateFN, GWMDataset
 from model.model import ContextAggregator, GWM
+from train import build_optimizers
 from utils.eval import (
     build_bidirectional_eval_dataset,
     build_bidirectional_hr_map_for_filtering,
@@ -121,22 +122,15 @@ class ModelTests(unittest.TestCase):
             'rel_id': torch.tensor([0, 1]),
             'batch_index': torch.tensor([0, 1]),
         }
-        query, relation = model.encode_query(h_batch, r_batch, context_batch)
-        targets = model.encode_target(t_batch)
-        loss, scores = model.compute_loss(
-            query,
-            targets,
-            relation_vectors=relation,
-        )
-        self.assertEqual(scores.shape, (2, 2))
-        self.assertEqual(query.shape, (2, 10))
-        self.assertEqual(targets.shape, (2, 10))
+        scores = model.score_all_entities(h_batch, r_batch, context_batch)
+        loss = model.compute_loss(scores, t_batch['id'])
+        self.assertEqual(scores.shape, (2, 4))
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
         self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
 
-    def test_convtranse_in_batch_loss_and_full_entity_scoring(self):
+    def test_convtranse_full_entity_loss_and_scoring(self):
         model = GWM(make_config(decoder='convtranse'))
         h_batch = {'id': torch.tensor([0, 1])}
         r_batch = {'id': torch.tensor([0, 1])}
@@ -147,28 +141,69 @@ class ModelTests(unittest.TestCase):
             'batch_index': torch.tensor([0, 1]),
         }
 
-        query, relation = model.encode_query(h_batch, r_batch, context_batch)
-        targets = model.encode_target(t_batch)
-        loss, scores = model.compute_loss(
-            query,
-            targets,
-            relation_vectors=relation,
-        )
-        with torch.no_grad():
-            all_scores = model.score_all_entities(
-                h_batch,
-                r_batch,
-                context_batch,
-            )
+        scores = model.score_all_entities(h_batch, r_batch, context_batch)
+        loss = model.compute_loss(scores, t_batch['id'])
 
-        self.assertEqual(scores.shape, (2, 2))
-        self.assertEqual(all_scores.shape, (2, 4))
+        self.assertEqual(scores.shape, (2, 4))
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertIsNotNone(model.decoder.conv.weight.grad)
         self.assertIsNotNone(model.decoder.fc.weight.grad)
         self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
         self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
+
+    def test_n3_regularizer_uses_positive_structural_factors(self):
+        model = GWM(make_config())
+        with torch.no_grad():
+            model.struct_ent_embs.weight.fill_(2.0)
+            model.struct_rel_embs.weight.fill_(2.0)
+
+        penalty = model.compute_n3_regularizer(
+            head_ids=torch.tensor([0, 1]),
+            relation_ids=torch.tensor([0, 1]),
+            tail_ids=torch.tensor([2, 3]),
+        )
+
+        self.assertEqual(penalty.item(), 96.0)
+        penalty.backward()
+        self.assertIsNotNone(model.struct_ent_embs.weight.grad)
+        self.assertIsNotNone(model.struct_rel_embs.weight.grad)
+
+    def test_adagrad_only_owns_structural_embedding_tables(self):
+        model = GWM(make_config())
+        model.text_ent_embs.weight.requires_grad = False
+        model.text_rel_embs.weight.requires_grad = False
+        config = SimpleNamespace(
+            optimizer='structural_adagrad',
+            learning_rate=5e-4,
+            structural_learning_rate=0.01,
+            weight_decay=1e-4,
+            adagrad_initial_accumulator_value=0.0,
+        )
+
+        name, optimizer, structural_optimizer = build_optimizers(model, config)
+
+        self.assertEqual(name, 'structural_adagrad')
+        self.assertIsInstance(optimizer, torch.optim.AdamW)
+        self.assertIsInstance(structural_optimizer, torch.optim.Adagrad)
+        shared_parameters = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group['params']
+        }
+        structural_parameters = {
+            id(parameter)
+            for group in structural_optimizer.param_groups
+            for parameter in group['params']
+        }
+        expected_structural_parameters = {
+            id(model.struct_ent_embs.weight),
+            id(model.struct_rel_embs.weight),
+        }
+        self.assertEqual(structural_parameters, expected_structural_parameters)
+        self.assertTrue(shared_parameters.isdisjoint(structural_parameters))
+        self.assertNotIn(id(model.text_ent_embs.weight), shared_parameters)
+        self.assertNotIn(id(model.text_rel_embs.weight), shared_parameters)
 
     def test_decoder_defaults_to_legacy_dot_scoring(self):
         model = GWM(make_config())

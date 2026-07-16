@@ -1,4 +1,4 @@
-# Static GWM with ConvTransE and full-entity cross-entropy.
+# ConvTransE with structural-only N3 and Adagrad; shared modules keep AdamW.
 text_emb_dim: 768
 struct_emb_dim: 896
 fusion_dim: 1024
@@ -12,12 +12,14 @@ adapter_dropout: 0.1
 dropout: 0.2
 
 learning_rate: 5e-4
-optimizer: adamw
+optimizer: structural_adagrad
+structural_learning_rate: 0.01
+adagrad_initial_accumulator_value: 0.0
 weight_decay: 0.0001
 lr_scheduler: cosine
 min_lr: 1e-5
 warmup_ratio: 0.1
-n3_weight: 0.0
+n3_weight: 1e-5
 grad_clip_norm: 1.0
 num_epochs: 500
 early_stopping_patience: 7
@@ -33,14 +35,14 @@ convtranse_channels: 50
 convtranse_kernel_size: 3
 
 data_dir: data-processed/fb15k-237
-output_dir: output/fb15k-237
-    
+output_dir: output/fb15k-237-convtranse-n3-adagrad
+
 add_inverse: true
 context_k: 10
-    
+
 device: cuda
 seed: 42
 
 save_eval_predictions: true
 eval_topk: 10
-eval_predictions_dir: output/fb15k-237/predictions
+eval_predictions_dir: output/fb15k-237-convtranse-n3-adagrad/predictions

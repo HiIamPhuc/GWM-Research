@@ -111,14 +111,30 @@ def _sync_device(device):
         torch.cuda.synchronize(device)
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    epoch,
+    best_mrr,
+    early_stopping,
+    structural_optimizer=None,
+):
     torch.save(
         {
             'epoch': epoch,
             'best_mrr': best_mrr,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
+            'structural_optimizer_state_dict': (
+                structural_optimizer.state_dict()
+                if structural_optimizer is not None
+                else None
+            ),
+            'scheduler_state_dict': (
+                scheduler.state_dict() if scheduler is not None else None
+            ),
             'early_stopping_state': {
                 'best_value': early_stopping.best_value,
                 'counter': early_stopping.counter,
@@ -127,6 +143,63 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_st
         },
         path,
     )
+
+
+def build_optimizers(model, config):
+    optimizer_name = str(getattr(config, 'optimizer', 'adamw')).lower()
+    learning_rate = float(config.learning_rate)
+    weight_decay = float(getattr(config, 'weight_decay', 0.0))
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+
+    if optimizer_name == 'adamw':
+        optimizer = torch.optim.AdamW(
+            trainable_parameters,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+        structural_optimizer = None
+    elif optimizer_name == 'structural_adagrad':
+        structural_parameters = [
+            parameter
+            for parameter in model.structural_factor_parameters()
+            if parameter.requires_grad
+        ]
+        if not structural_parameters:
+            raise ValueError(
+                "structural_adagrad requires trainable structural ID embeddings."
+            )
+
+        structural_parameter_ids = {
+            id(parameter) for parameter in structural_parameters
+        }
+        shared_parameters = [
+            parameter
+            for parameter in trainable_parameters
+            if id(parameter) not in structural_parameter_ids
+        ]
+        optimizer = torch.optim.AdamW(
+            shared_parameters,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+        structural_optimizer = torch.optim.Adagrad(
+            structural_parameters,
+            lr=float(getattr(config, 'structural_learning_rate', 0.01)),
+            weight_decay=0.0,
+            initial_accumulator_value=float(
+                getattr(config, 'adagrad_initial_accumulator_value', 0.0)
+            ),
+        )
+    else:
+        raise ValueError(
+            "Unsupported optimizer. Expected 'adamw' or "
+            "'structural_adagrad', "
+            f"got: {optimizer_name}"
+        )
+
+    return optimizer_name, optimizer, structural_optimizer
 
 def train(args):
     # Load Config
@@ -159,6 +232,19 @@ def train(args):
     print("Initializing model...")
     model = build_model(config).to(device)
     decoder_name = getattr(model, 'decoder_name', 'dot')
+    n3_weight = float(getattr(config, 'n3_weight', 0.0))
+    if n3_weight < 0.0:
+        raise ValueError("n3_weight must be non-negative.")
+    if n3_weight > 0.0 and getattr(model, 'modality_name', None) == 'text':
+        raise ValueError(
+            "N3 regularization requires trainable structural ID embeddings "
+            "and is not available for the text-only ablation."
+        )
+    config.n3_weight = n3_weight
+    config.optimizer = str(getattr(config, 'optimizer', 'adamw')).lower()
+    config.lr_scheduler = str(
+        getattr(config, 'lr_scheduler', 'cosine')
+    ).lower()
 
     # Collater
     collate_fn = CollateFN()
@@ -170,7 +256,7 @@ def train(args):
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=(device.type == 'cuda'),
-        drop_last=True,
+        drop_last=False,
         generator=make_torch_generator(seed),
         worker_init_fn=make_worker_init_fn(seed),
     )
@@ -197,32 +283,55 @@ def train(args):
     save_training_config(config, config.output_dir, args=args, model=model)
 
     base_lr = float(config.learning_rate)
-    weight_decay = float(getattr(config, 'weight_decay', 0.0))
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=base_lr,
-        weight_decay=weight_decay,
+    optimizer_name, optimizer, structural_optimizer = build_optimizers(
+        model,
+        config,
     )
 
     total_steps = max(1, config.num_epochs * len(train_loader))
-    warmup_ratio = float(getattr(config, 'warmup_ratio', 0.0))
-    warmup_steps = min(int(total_steps * warmup_ratio), total_steps)
-    min_lr = float(getattr(config, 'min_lr', 0.0))
-    min_lr_ratio = 0.0 if base_lr <= 0 else max(min_lr / base_lr, 0.0)
+    scheduler_name = str(getattr(config, 'lr_scheduler', 'cosine')).lower()
+    if scheduler_name == 'none':
+        scheduler = None
+    elif scheduler_name == 'cosine':
+        warmup_ratio = float(getattr(config, 'warmup_ratio', 0.0))
+        warmup_steps = min(int(total_steps * warmup_ratio), total_steps)
+        min_lr = float(getattr(config, 'min_lr', 0.0))
+        min_lr_ratio = 0.0 if base_lr <= 0 else max(min_lr / base_lr, 0.0)
 
-    def lr_lambda(step_index):
-        if total_steps <= 1:
-            return 1.0
-        if warmup_steps > 0 and step_index < warmup_steps:
-            return float(step_index + 1) / float(max(1, warmup_steps))
+        def lr_lambda(step_index):
+            if total_steps <= 1:
+                return 1.0
+            if warmup_steps > 0 and step_index < warmup_steps:
+                return float(step_index + 1) / float(max(1, warmup_steps))
 
-        decay_steps = max(1, total_steps - warmup_steps)
-        progress = min(max((step_index - warmup_steps) / decay_steps, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+            decay_steps = max(1, total_steps - warmup_steps)
+            progress = min(max((step_index - warmup_steps) / decay_steps, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
-    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    else:
+        raise ValueError(
+            "Unsupported lr_scheduler. Expected 'cosine' or 'none', "
+            f"got: {scheduler_name}"
+        )
     grad_clip_norm = float(getattr(config, 'grad_clip_norm', 1.0))
+
+    if structural_optimizer is None:
+        optimizer_summary = "AdamW(all trainable parameters)"
+    else:
+        structural_lr = float(
+            getattr(config, 'structural_learning_rate', 0.01)
+        )
+        optimizer_summary = (
+            "AdamW(shared parameters) + "
+            f"Adagrad(structural embeddings, lr={structural_lr:g})"
+        )
+    print(
+        f"Training objective: Full-Entity CE | Decoder: {decoder_name} | "
+        f"Optimizer: {optimizer_summary} | Scheduler: {scheduler_name} | "
+        f"N3 weight: {n3_weight:g}"
+    )
     
     # Validation Loader
     if os.path.exists(os.path.join(config.data_dir, 'valid_triples.pt')):
@@ -278,6 +387,9 @@ def train(args):
         _sync_device(device)
         model.train()
         total_loss = 0
+        total_ce_loss = 0
+        total_n3_penalty = 0
+        total_n3_loss = 0
         gate_stat_sums = {}
         gate_stat_counts = {}
         
@@ -290,38 +402,56 @@ def train(args):
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             optimizer.zero_grad()
+            if structural_optimizer is not None:
+                structural_optimizer.zero_grad()
 
-            query_vector, relation_vector = model.encode_query(
+            scores = model.score_all_entities(
                 h_batch,
                 r_batch,
                 context_batch,
             )
-            target_vector = model.encode_target(t_batch)
-            loss, _ = model.compute_loss(
-                query_vector,
-                target_vector,
-                relation_vectors=relation_vector,
-            )
+            ce_loss = model.compute_loss(scores, t_batch['id'])
+            if n3_weight > 0.0:
+                n3_penalty = model.compute_n3_regularizer(
+                    h_batch['id'],
+                    r_batch['id'],
+                    t_batch['id'],
+                )
+            else:
+                n3_penalty = ce_loss.new_zeros(())
+            n3_loss = n3_weight * n3_penalty
+            loss = ce_loss + n3_loss
             gate_stats = model.pop_gate_stats()
 
             if not torch.isfinite(loss):
                 print("Warning: non-finite loss detected; skipping batch to avoid corrupting model weights.")
                 optimizer.zero_grad(set_to_none=True)
+                if structural_optimizer is not None:
+                    structural_optimizer.zero_grad(set_to_none=True)
                 continue
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
-            scheduler.step()
+            if structural_optimizer is not None:
+                structural_optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             total_loss += loss.item()
+            total_ce_loss += ce_loss.item()
+            total_n3_penalty += n3_penalty.item()
+            total_n3_loss += n3_loss.item()
             _update_metric_sums(gate_stat_sums, gate_stat_counts, gate_stats)
-            pbar.set_postfix({'loss': loss.item()})
+            pbar.set_postfix({'loss': loss.item(), 'ce': ce_loss.item()})
 
         _sync_device(device)
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
+        avg_ce_loss = total_ce_loss / len(train_loader)
+        avg_n3_penalty = total_n3_penalty / len(train_loader)
+        avg_n3_loss = total_n3_loss / len(train_loader)
         avg_gate_stats = _average_metric_sums(
             gate_stat_sums,
             gate_stat_counts,
@@ -330,9 +460,10 @@ def train(args):
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-            f"Objective: Unfiltered In-Batch CE | "
+            f"CE: {avg_ce_loss:.4f} | N3: {avg_n3_loss:.4f} | "
+            f"Objective: Full-Entity CE | "
             f"Decoder: {decoder_name} | "
-            f"Candidates/Query: {config.batch_size} | "
+            f"Candidates/Query: {config.num_entities} | "
             f"Train Time: {epoch_train_seconds:.2f}s"
         )
         
@@ -378,6 +509,9 @@ def train(args):
             epoch_log = {
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
+                'train_ce_loss': avg_ce_loss,
+                'train_n3_penalty': avg_n3_penalty,
+                'train_n3_loss': avg_n3_loss,
                 'val_mrr': val_mrr, 
                 'val_mr': val_mr,
                 'val_hits1': val_h1,
@@ -406,6 +540,7 @@ def train(args):
                     epoch,
                     best_mrr,
                     early_stopping,
+                    structural_optimizer=structural_optimizer,
                 )
             if should_stop:
                 print(f"\n✓ Early stopping triggered at epoch {epoch + 1}")
@@ -416,7 +551,10 @@ def train(args):
              # Log train only
             epoch_log = {
                 'epoch': epoch + 1,
-                'train_loss': avg_train_loss
+                'train_loss': avg_train_loss,
+                'train_ce_loss': avg_ce_loss,
+                'train_n3_penalty': avg_n3_penalty,
+                'train_n3_loss': avg_n3_loss,
             }
             epoch_log.update(avg_gate_stats)
             history.append(epoch_log)
@@ -431,6 +569,7 @@ def train(args):
             epoch,
             best_mrr,
             early_stopping,
+            structural_optimizer=structural_optimizer,
         )
         if should_stop:
             break

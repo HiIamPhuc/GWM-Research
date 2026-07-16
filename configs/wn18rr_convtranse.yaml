@@ -1,4 +1,4 @@
-# Static GWM with a ConvTransE decoder and unfiltered in-batch negatives.
+# Static GWM with ConvTransE and full-entity cross-entropy.
 text_emb_dim: 768
 struct_emb_dim: 384
 fusion_dim: 1024
@@ -12,9 +12,12 @@ adapter_dropout: 0.1
 dropout: 0.2
 
 learning_rate: 5e-4
+optimizer: adamw
 weight_decay: 0.0001
+lr_scheduler: cosine
 min_lr: 1e-5
 warmup_ratio: 0.1
+n3_weight: 0.0
 grad_clip_norm: 1.0
 num_epochs: 500
 early_stopping_patience: 15

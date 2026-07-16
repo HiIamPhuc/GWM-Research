@@ -4,6 +4,21 @@ import torch.nn.functional as F
 import math
 
 
+def n3_factor_regularizer(factors):
+    """Return the batch-mean cubic norm used by N3 regularization."""
+    if not factors:
+        raise ValueError("N3 regularization requires at least one factor tensor.")
+
+    batch_size = factors[0].size(0)
+    if batch_size == 0:
+        return factors[0].new_zeros(())
+    if any(factor.size(0) != batch_size for factor in factors):
+        raise ValueError("All N3 factors must have the same batch dimension.")
+
+    penalty = sum(factor.abs().pow(3).sum() for factor in factors)
+    return penalty / batch_size
+
+
 class ContextAggregator(nn.Module):
     """Pool relation-composed facts, add the head residual, and normalize."""
 
@@ -368,26 +383,34 @@ class GWM(nn.Module):
             dim=1,
         )
 
-    def compute_loss(
-        self,
-        query_vectors,
-        target_vectors,
-        relation_vectors=None,
-    ):
-        scores = self.score_candidates(
-            query_vectors,
-            target_vectors,
-            relation_vectors=relation_vectors,
+    @staticmethod
+    def compute_loss(scores, target_ids):
+        if scores.dim() != 2:
+            raise ValueError("Full-entity scores must have shape (B, |E|).")
+
+        target_ids = torch.as_tensor(
+            target_ids,
+            dtype=torch.long,
+            device=scores.device,
+        ).reshape(-1)
+        if target_ids.numel() != scores.size(0):
+            raise ValueError("target_ids must contain one entity ID per score row.")
+        return F.cross_entropy(scores, target_ids)
+
+    def compute_n3_regularizer(self, head_ids, relation_ids, tail_ids):
+        return n3_factor_regularizer(
+            [
+                self.struct_ent_embs(head_ids),
+                self.struct_rel_embs(relation_ids),
+                self.struct_ent_embs(tail_ids),
+            ]
         )
-        expected_shape = (query_vectors.size(0), query_vectors.size(0))
-        if tuple(scores.shape) != expected_shape:
-            raise ValueError(
-                "Unfiltered in-batch loss requires one candidate tail per query "
-                f"and a score matrix of shape {expected_shape}, got {tuple(scores.shape)}."
-            )
-        labels = torch.arange(scores.size(0), device=scores.device)
-        loss = F.cross_entropy(scores, labels)
-        return loss, scores
+
+    def structural_factor_parameters(self):
+        return (
+            self.struct_ent_embs.weight,
+            self.struct_rel_embs.weight,
+        )
 
     def score_candidates(
         self,

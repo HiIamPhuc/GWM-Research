@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 
-def full_entity_cross_entropy(scores, target_ids, label_smoothing=0.0):
+def full_entity_cross_entropy(scores, target_ids):
     if scores.dim() != 2:
         raise ValueError("Full-entity scores must have shape (B, |E|).")
 
@@ -15,87 +15,92 @@ def full_entity_cross_entropy(scores, target_ids, label_smoothing=0.0):
     ).reshape(-1)
     if target_ids.numel() != scores.size(0):
         raise ValueError("target_ids must contain one entity ID per score row.")
-    return F.cross_entropy(
-        scores,
-        target_ids,
-        label_smoothing=float(label_smoothing),
-    )
-
-
-class DirectionalCandidateBias(nn.Module):
-    """Separate candidate priors for original and inverse-relation queries."""
-
-    def __init__(self, num_entities, num_relations, inverse_relation_ids):
-        super().__init__()
-        inverse_relation_mask = torch.zeros(num_relations, dtype=torch.bool)
-        inverse_relation_ids = torch.as_tensor(
-            inverse_relation_ids,
-            dtype=torch.long,
-        ).reshape(-1)
-        if inverse_relation_ids.numel() == 0:
-            raise ValueError(
-                "Directional candidate bias requires inverse relation IDs."
-            )
-        if (
-            inverse_relation_ids.min() < 0
-            or inverse_relation_ids.max() >= num_relations
-        ):
-            raise ValueError("Inverse relation IDs are outside the relation vocabulary.")
-        inverse_relation_mask[inverse_relation_ids] = True
-        self.register_buffer('inverse_relation_mask', inverse_relation_mask)
-        self.bias = nn.Parameter(torch.zeros(2, num_entities))
-
-    def forward(self, scores, relation_ids):
-        if scores.dim() != 2 or scores.size(1) != self.bias.size(1):
-            raise ValueError(
-                "Directional candidate bias expects full-entity scores."
-            )
-        relation_ids = torch.as_tensor(
-            relation_ids,
-            dtype=torch.long,
-            device=scores.device,
-        ).reshape(-1)
-        if relation_ids.numel() != scores.size(0):
-            raise ValueError("Expected one relation ID per score row.")
-        direction_ids = self.inverse_relation_mask[relation_ids].long()
-        return scores + self.bias[direction_ids]
+    return F.cross_entropy(scores, target_ids)
 
 
 class ContextAggregator(nn.Module):
-    """Pool relation-composed facts, add the head residual, and normalize."""
+    """Attend to relation-composed facts using the query relation."""
 
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, dropout=0.0, attention_dim=128):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.attention_dim = min(int(attention_dim), hidden_dim)
+        self.query_projection = nn.Linear(
+            hidden_dim,
+            self.attention_dim,
+            bias=False,
+        )
+        self.key_projection = nn.Linear(
+            hidden_dim,
+            self.attention_dim,
+            bias=False,
+        )
+        self.score_projection = nn.Linear(self.attention_dim, 1, bias=False)
         self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
 
-    def _aggregate(self, messages, batch_index, batch_size, reference):
-        aggregated = torch.zeros_like(reference)
+    def _attention_weights(self, messages, query_relation, batch_index):
+        batch_size = query_relation.size(0)
         if messages.numel() == 0:
-            return aggregated
+            return messages.new_empty(0)
+        if batch_index.min() < 0 or batch_index.max() >= batch_size:
+            raise ValueError("Context batch index is outside the current batch.")
 
-        aggregated.index_add_(0, batch_index, messages)
-        counts = torch.zeros(batch_size, 1, device=reference.device, dtype=reference.dtype)
-        counts.index_add_(0, batch_index, torch.ones(messages.size(0), 1, device=reference.device, dtype=reference.dtype))
+        query = self.query_projection(query_relation)[batch_index]
+        key = self.key_projection(messages)
+        scores = self.score_projection(torch.tanh(query + key)).squeeze(-1)
 
-        return aggregated / counts.clamp_min(1.0)
+        max_scores = scores.new_full((batch_size,), float('-inf'))
+        max_scores.scatter_reduce_(
+            0,
+            batch_index,
+            scores,
+            reduce='amax',
+            include_self=True,
+        )
+        unnormalized = torch.exp(scores - max_scores[batch_index])
+        denominators = scores.new_zeros(batch_size)
+        denominators.index_add_(0, batch_index, unnormalized)
+        return unnormalized / denominators[batch_index].clamp_min(1e-12)
 
-    def forward(self, head_feat, nbr_entity_feat, nbr_relation_feat, nbr_batch_index):
+    def forward(
+        self,
+        head_feat,
+        query_relation_feat,
+        nbr_entity_feat,
+        nbr_relation_feat,
+        nbr_batch_index,
+    ):
         """
         head_feat: (B, H)
+        query_relation_feat: (B, H)
         nbr_entity_feat: (E, H)
         nbr_relation_feat: (E, H)
         nbr_batch_index: (E,) long, edge -> head index in batch
         """
-        
+        if head_feat.shape != query_relation_feat.shape:
+            raise ValueError("Head and query relation features must have equal shapes.")
+        if nbr_entity_feat.shape != nbr_relation_feat.shape:
+            raise ValueError("Context entity and relation features must have equal shapes.")
+        if nbr_batch_index.numel() != nbr_entity_feat.size(0):
+            raise ValueError("Each context fact requires one batch index.")
+
+        if nbr_entity_feat.numel() == 0:
+            return self.norm(head_feat)
+
         composed_facts = nbr_entity_feat * nbr_relation_feat
-        agg = self._aggregate(
+        weights = self._attention_weights(
             composed_facts,
+            query_relation_feat,
             nbr_batch_index,
-            head_feat.size(0),
-            head_feat,
         )
-        return self.norm(head_feat + agg)
+        attended = torch.zeros_like(head_feat)
+        attended.index_add_(
+            0,
+            nbr_batch_index,
+            weights.unsqueeze(-1) * composed_facts,
+        )
+        return self.norm(head_feat + self.dropout(attended))
 
 
 class MLPAdapter(nn.Module):
@@ -192,21 +197,31 @@ class GWM(nn.Module):
         self.text_ent_embs = nn.Embedding(config.num_entities, self.text_emb_dim)
         self.text_rel_embs = nn.Embedding(config.num_relations, self.text_emb_dim)
 
-        self.text_adapter = MLPAdapter(self.text_emb_dim,
+        self.text_entity_adapter = MLPAdapter(self.text_emb_dim,
             int(getattr(config, 'text_adapter_dim')),
             dropout=self.adapter_dropout
             )
+        self.text_relation_adapter = MLPAdapter(
+            self.text_emb_dim,
+            int(getattr(config, 'text_adapter_dim')),
+            dropout=self.adapter_dropout,
+        )
 
         # 2. Structural Components (Entity/Relation Embeddings)
         self.struct_emb_dim = int(getattr(config, 'struct_emb_dim'))
         self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
         self.struct_rel_embs = nn.Embedding(config.num_relations, self.struct_emb_dim)
 
-        self.struct_adapter = MLPAdapter(
+        self.struct_entity_adapter = MLPAdapter(
             self.struct_emb_dim, 
             int(getattr(config, 'struct_adapter_dim')),
             dropout=self.adapter_dropout
             )
+        self.struct_relation_adapter = MLPAdapter(
+            self.struct_emb_dim,
+            int(getattr(config, 'struct_adapter_dim')),
+            dropout=self.adapter_dropout,
+        )
 
         # 3. Early Fusion and Shared Dynamics
         self.fusion_dim = int(getattr(config, 'fusion_dim'))
@@ -223,7 +238,11 @@ class GWM(nn.Module):
             dropout=self.dropout,
         )
 
-        self.fused_context_aggregator = ContextAggregator(hidden_dim=self.fusion_dim)
+        self.fused_context_aggregator = ContextAggregator(
+            hidden_dim=self.fusion_dim,
+            dropout=self.dropout,
+            attention_dim=int(getattr(config, 'context_attention_dim', 128)),
+        )
         self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
 
@@ -241,7 +260,6 @@ class GWM(nn.Module):
         )
 
         self.temperature = float(getattr(config, 'temperature'))
-        self.label_smoothing = float(getattr(config, 'label_smoothing', 0.0))
         self.decoder_name = str(getattr(config, 'decoder', 'dot')).lower()
         if self.decoder_name == 'convtranse':
             self.decoder = ConvTransEDecoder(
@@ -254,14 +272,6 @@ class GWM(nn.Module):
             self.decoder = None
         else:
             raise ValueError(f"Unsupported decoder: {self.decoder_name}")
-        if bool(getattr(config, 'directional_candidate_bias', False)):
-            self.directional_candidate_bias = DirectionalCandidateBias(
-                num_entities=int(config.num_entities),
-                num_relations=int(config.num_relations),
-                inverse_relation_ids=getattr(config, 'inverse_relation_ids', []),
-            )
-        else:
-            self.directional_candidate_bias = None
         self._last_gate_stats = {}
 
     def reset_gate_stats(self):
@@ -383,20 +393,20 @@ class GWM(nn.Module):
 
     def encode_query(self, h_batch, r_batch, context_batch):
         self.reset_gate_stats()
-        h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
-        r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
-        h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
-        r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
+        h_text = self.text_entity_adapter(self.text_ent_embs(h_batch['id']))
+        r_text = self.text_relation_adapter(self.text_rel_embs(r_batch['id']))
+        h_struct = self.struct_entity_adapter(self.struct_ent_embs(h_batch['id']))
+        r_struct = self.struct_relation_adapter(self.struct_rel_embs(r_batch['id']))
         h_fused, h_gate = self.entity_fusion(h_text, h_struct)
         r_fused, r_gate = self.relation_fusion(r_text, r_struct)
         self._record_gate_stats('entity_gate', h_gate)
         self._record_gate_stats('relation_gate', r_gate)
 
         flat_context_entity_ids, flat_context_relation_ids, context_batch_index = self._prepare_context_batch(context_batch)
-        ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
-        ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
-        ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
-        ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
+        ctx_ent_text = self.text_entity_adapter(self.text_ent_embs(flat_context_entity_ids))
+        ctx_rel_text = self.text_relation_adapter(self.text_rel_embs(flat_context_relation_ids))
+        ctx_ent_struct = self.struct_entity_adapter(self.struct_ent_embs(flat_context_entity_ids))
+        ctx_rel_struct = self.struct_relation_adapter(self.struct_rel_embs(flat_context_relation_ids))
         ctx_ent_fused, ctx_ent_gate = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
         ctx_rel_fused, ctx_rel_gate = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
         self._record_gate_stats('entity_gate', ctx_ent_gate)
@@ -404,6 +414,7 @@ class GWM(nn.Module):
 
         world_state = self.fused_context_aggregator(
             head_feat=h_fused,
+            query_relation_feat=r_fused,
             nbr_entity_feat=ctx_ent_fused,
             nbr_relation_feat=ctx_rel_fused,
             nbr_batch_index=context_batch_index,
@@ -424,8 +435,8 @@ class GWM(nn.Module):
         return query
 
     def encode_target(self, t_batch):
-        t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
-        t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
+        t_text = self.text_entity_adapter(self.text_ent_embs(t_batch['id']))
+        t_struct = self.struct_entity_adapter(self.struct_ent_embs(t_batch['id']))
         t_fused, t_gate = self.entity_fusion(t_text, t_struct)
         self._record_gate_stats('entity_gate', t_gate)
         return F.normalize(
@@ -436,11 +447,7 @@ class GWM(nn.Module):
 
     def compute_loss(self, scores, target_ids):
         """Full-entity cross-entropy with one target tail per triple."""
-        return full_entity_cross_entropy(
-            scores,
-            target_ids,
-            label_smoothing=self.label_smoothing,
-        )
+        return full_entity_cross_entropy(scores, target_ids)
 
     def score_candidates(
         self,
@@ -485,6 +492,4 @@ class GWM(nn.Module):
             candidate_vectors,
             relation_vectors=relation_vectors,
         )
-        if self.directional_candidate_bias is not None:
-            scores = self.directional_candidate_bias(scores, r_batch['id'])
         return scores

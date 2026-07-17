@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from model.model import (
     ContextAggregator,
     ConvTransEDecoder,
-    DirectionalCandidateBias,
     GWM,
     MLPAdapter,
     full_entity_cross_entropy,
@@ -50,14 +49,23 @@ class SingleModalityGWM(nn.Module):
 
         self.ent_embs = nn.Embedding(config.num_entities, self.embedding_dim)
         self.rel_embs = nn.Embedding(config.num_relations, self.embedding_dim)
-        self.adapter = MLPAdapter(
+        self.entity_adapter = MLPAdapter(
+            self.embedding_dim,
+            int(adapter_dim),
+            dropout=self.adapter_dropout,
+        )
+        self.relation_adapter = MLPAdapter(
             self.embedding_dim,
             int(adapter_dim),
             dropout=self.adapter_dropout,
         )
         self.input_projection = nn.Linear(self.embedding_dim, self.fusion_dim)
 
-        self.context_aggregator = ContextAggregator(hidden_dim=self.fusion_dim)
+        self.context_aggregator = ContextAggregator(
+            hidden_dim=self.fusion_dim,
+            dropout=self.dropout,
+            attention_dim=int(getattr(config, 'context_attention_dim', 128)),
+        )
         self.h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
 
@@ -71,7 +79,6 @@ class SingleModalityGWM(nn.Module):
         )
         self.output_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.temperature = float(getattr(config, 'temperature'))
-        self.label_smoothing = float(getattr(config, 'label_smoothing', 0.0))
         self.decoder_name = str(getattr(config, 'decoder', 'dot')).lower()
         if self.decoder_name == 'convtranse':
             self.decoder = ConvTransEDecoder(
@@ -84,14 +91,6 @@ class SingleModalityGWM(nn.Module):
             self.decoder = None
         else:
             raise ValueError(f"Unsupported decoder: {self.decoder_name}")
-        if bool(getattr(config, 'directional_candidate_bias', False)):
-            self.directional_candidate_bias = DirectionalCandidateBias(
-                num_entities=int(config.num_entities),
-                num_relations=int(config.num_relations),
-                inverse_relation_ids=getattr(config, 'inverse_relation_ids', []),
-            )
-        else:
-            self.directional_candidate_bias = None
 
     def reset_gate_stats(self):
         pass
@@ -122,11 +121,11 @@ class SingleModalityGWM(nn.Module):
         return context_entity_ids, context_relation_ids, context_batch_index
 
     def _encode_entities(self, entity_ids):
-        features = self.adapter(self.ent_embs(entity_ids))
+        features = self.entity_adapter(self.ent_embs(entity_ids))
         return self.input_projection(features)
 
     def _encode_relations(self, relation_ids):
-        features = self.adapter(self.rel_embs(relation_ids))
+        features = self.relation_adapter(self.rel_embs(relation_ids))
         return self.input_projection(features)
 
     def _run_dynamics(self, world_state, head_emb, relation_emb):
@@ -155,6 +154,7 @@ class SingleModalityGWM(nn.Module):
 
         world_state = self.context_aggregator(
             head_feat=h_emb,
+            query_relation_feat=r_emb,
             nbr_entity_feat=ctx_ent,
             nbr_relation_feat=ctx_rel,
             nbr_batch_index=context_batch_index,
@@ -172,11 +172,7 @@ class SingleModalityGWM(nn.Module):
         return F.normalize(self.output_projection(target), p=2, dim=1)
 
     def compute_loss(self, scores, target_ids):
-        return full_entity_cross_entropy(
-            scores,
-            target_ids,
-            label_smoothing=self.label_smoothing,
-        )
+        return full_entity_cross_entropy(scores, target_ids)
 
     def score_candidates(
         self,
@@ -221,8 +217,6 @@ class SingleModalityGWM(nn.Module):
             candidate_vectors,
             relation_vectors=relation_vectors,
         )
-        if self.directional_candidate_bias is not None:
-            scores = self.directional_candidate_bias(scores, r_batch['id'])
         return scores
 
 

@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import torch
 
 from model.dataset import CollateFN, GWMDataset
-from model.model import ContextAggregator, DirectionalCandidateBias, GWM
+from model.model import ContextAggregator, GWM
+from studies.ablation_models import build_model
 from utils.eval import (
     build_bidirectional_eval_dataset,
     build_bidirectional_hr_map_for_filtering,
@@ -18,8 +19,6 @@ from utils.eval import (
 def make_config(
     context_agg='mean',
     decoder=None,
-    label_smoothing=0.0,
-    directional_candidate_bias=False,
 ):
     config = SimpleNamespace(
         num_entities=4,
@@ -34,8 +33,6 @@ def make_config(
         adapter_dropout=0.0,
         temperature=0.1,
         context_agg=context_agg,
-        label_smoothing=label_smoothing,
-        directional_candidate_bias=directional_candidate_bias,
         inverse_relation_ids=[2, 3],
     )
     if decoder is not None:
@@ -67,6 +64,7 @@ class ModelTests(unittest.TestCase):
         layer = ContextAggregator(hidden_dim=4)
         output = layer(
             head_feat=torch.randn(2, 4),
+            query_relation_feat=torch.randn(2, 4),
             nbr_entity_feat=torch.empty(0, 4),
             nbr_relation_feat=torch.empty(0, 4),
             nbr_batch_index=torch.empty(0, dtype=torch.long),
@@ -75,25 +73,25 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
         self.assertFalse(torch.equal(output, torch.zeros_like(output)))
 
-    def test_context_aggregator_mean_reduction(self):
-        messages = torch.tensor(
-            [[1.0, 3.0], [5.0, 2.0], [7.0, 9.0]]
+    def test_context_attention_normalizes_per_query(self):
+        messages = torch.randn(4, 3)
+        batch_index = torch.tensor([0, 0, 1, 1])
+        query_relations = torch.randn(2, 3)
+        layer = ContextAggregator(3)
+
+        weights = layer._attention_weights(
+            messages,
+            query_relations,
+            batch_index,
         )
-        batch_index = torch.tensor([0, 0, 1])
-        reference = torch.zeros(2, 2)
+        weight_sums = torch.zeros(2)
+        weight_sums.index_add_(0, batch_index, weights)
 
-        mean_layer = ContextAggregator(2)
+        self.assertTrue(torch.allclose(weight_sums, torch.ones(2)))
 
-        mean_result = mean_layer._aggregate(
-            messages, batch_index, batch_size=2, reference=reference
-        )
-
-        self.assertTrue(
-            torch.equal(mean_result, torch.tensor([[3.0, 2.5], [7.0, 9.0]]))
-        )
-
-    def test_context_aggregator_forward_is_residual_pooling_then_norm(self):
+    def test_uniform_attention_matches_residual_mean_pooling(self):
         head = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        query_relations = torch.tensor([[0.5, 1.0], [1.5, 0.5]])
         neighbor_entities = torch.tensor(
             [[2.0, 1.0], [4.0, 2.0], [1.0, 3.0]]
         )
@@ -103,8 +101,13 @@ class ModelTests(unittest.TestCase):
         batch_index = torch.tensor([0, 0, 1])
 
         layer = ContextAggregator(2)
+        with torch.no_grad():
+            layer.query_projection.weight.zero_()
+            layer.key_projection.weight.zero_()
+            layer.score_projection.weight.zero_()
         output = layer(
             head,
+            query_relations,
             neighbor_entities,
             neighbor_relations,
             batch_index,
@@ -119,6 +122,51 @@ class ModelTests(unittest.TestCase):
             normalized_shape=(2,),
         )
         self.assertTrue(torch.allclose(output, expected))
+
+    def test_context_attention_is_conditioned_on_query_relation(self):
+        layer = ContextAggregator(3)
+        head = torch.randn(1, 3)
+        query_relation = torch.randn(1, 3, requires_grad=True)
+        neighbor_entities = torch.randn(2, 3)
+        neighbor_relations = torch.randn(2, 3)
+        batch_index = torch.tensor([0, 0])
+
+        output = layer(
+            head,
+            query_relation,
+            neighbor_entities,
+            neighbor_relations,
+            batch_index,
+        )
+        output[0, 0].backward()
+
+        self.assertIsNotNone(query_relation.grad)
+        self.assertGreater(query_relation.grad.abs().sum().item(), 0.0)
+        self.assertIsNotNone(layer.query_projection.weight.grad)
+
+    def test_entity_and_relation_adapters_are_separate(self):
+        model = GWM(make_config())
+        self.assertIsNot(model.text_entity_adapter, model.text_relation_adapter)
+        self.assertIsNot(model.struct_entity_adapter, model.struct_relation_adapter)
+
+    def test_single_modality_variants_use_relation_aware_pooling(self):
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        context_batch = {
+            'id': torch.tensor([1, 2, 0]),
+            'rel_id': torch.tensor([0, 1, 2]),
+            'batch_index': torch.tensor([0, 0, 1]),
+        }
+
+        for variant in ('text_only', 'structure_only'):
+            config = make_config(decoder='convtranse')
+            config.model_variant = variant
+            model = build_model(config)
+            scores = model.score_all_entities(h_batch, r_batch, context_batch)
+
+            self.assertEqual(scores.shape, (2, 4))
+            self.assertTrue(torch.isfinite(scores).all())
+            self.assertIsNot(model.entity_adapter, model.relation_adapter)
 
     def test_early_fusion_loss_backpropagates_to_gate(self):
         model = GWM(make_config())
@@ -172,75 +220,6 @@ class ModelTests(unittest.TestCase):
         expected = torch.nn.functional.cross_entropy(scores, target_ids)
 
         self.assertTrue(torch.allclose(actual, expected))
-
-    def test_full_entity_loss_applies_label_smoothing(self):
-        scores = torch.tensor(
-            [[0.2, -0.3, 1.1, 0.5], [-0.7, 0.4, 0.8, -0.2]],
-            requires_grad=True,
-        )
-        target_ids = torch.tensor([3, 2])
-        model = GWM(make_config(label_smoothing=0.05))
-
-        actual = model.compute_loss(scores, target_ids)
-        expected = torch.nn.functional.cross_entropy(
-            scores,
-            target_ids,
-            label_smoothing=0.05,
-        )
-
-        self.assertTrue(torch.allclose(actual, expected))
-
-    def test_directional_candidate_bias_selects_forward_and_inverse_rows(self):
-        layer = DirectionalCandidateBias(
-            num_entities=4,
-            num_relations=4,
-            inverse_relation_ids=[2, 3],
-        )
-        with torch.no_grad():
-            layer.bias[0].copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
-            layer.bias[1].copy_(torch.tensor([5.0, 6.0, 7.0, 8.0]))
-
-        output = layer(torch.zeros(2, 4), torch.tensor([0, 2]))
-        self.assertTrue(torch.equal(output[0], layer.bias[0]))
-        self.assertTrue(torch.equal(output[1], layer.bias[1]))
-
-        output.sum().backward()
-        self.assertTrue(torch.equal(layer.bias.grad, torch.ones_like(layer.bias)))
-
-    def test_score_all_entities_applies_directional_candidate_bias(self):
-        model = GWM(
-            make_config(
-                decoder='convtranse',
-                directional_candidate_bias=True,
-            )
-        )
-        model.eval()
-        with torch.no_grad():
-            for parameter in model.decoder.parameters():
-                parameter.zero_()
-            model.directional_candidate_bias.bias[0].copy_(
-                torch.tensor([1.0, 2.0, 3.0, 4.0])
-            )
-            model.directional_candidate_bias.bias[1].copy_(
-                torch.tensor([5.0, 6.0, 7.0, 8.0])
-            )
-
-        scores = model.score_all_entities(
-            h_batch={'id': torch.tensor([0, 1])},
-            r_batch={'id': torch.tensor([0, 2])},
-            context_batch={
-                'id': torch.empty(0, dtype=torch.long),
-                'rel_id': torch.empty(0, dtype=torch.long),
-                'batch_index': torch.empty(0, dtype=torch.long),
-            },
-        )
-
-        self.assertTrue(
-            torch.equal(scores[0], model.directional_candidate_bias.bias[0])
-        )
-        self.assertTrue(
-            torch.equal(scores[1], model.directional_candidate_bias.bias[1])
-        )
 
     def test_decoder_defaults_to_legacy_dot_scoring(self):
         model = GWM(make_config())

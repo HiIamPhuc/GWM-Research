@@ -231,11 +231,6 @@ def train(args):
         f"Training objective: Full-Entity Cross-Entropy | "
         f"Decoder: {decoder_name} | Optimizer: AdamW | Scheduler: cosine"
     )
-    print(
-        f"Label smoothing: {float(getattr(config, 'label_smoothing', 0.0)):g} | "
-        f"Directional candidate bias: "
-        f"{bool(getattr(config, 'directional_candidate_bias', False))}"
-    )
     
     # Validation Loader
     if os.path.exists(os.path.join(config.data_dir, 'valid_triples.pt')):

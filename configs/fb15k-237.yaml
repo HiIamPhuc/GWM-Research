@@ -17,7 +17,7 @@ min_lr: 1e-5
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
 num_epochs: 500
-early_stopping_patience: 5
+early_stopping_patience: 7
 eval_every: 1
 
 batch_size: 2048

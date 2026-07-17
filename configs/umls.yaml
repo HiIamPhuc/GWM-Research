@@ -24,7 +24,8 @@ batch_size: 512
 eval_batch_size: 512
 candidate_batch_size: 512
 
-temperature: 0.07
+convtranse_channels: 50
+convtranse_kernel_size: 3
 
 data_dir: data-processed/umls
 output_dir: output/umls

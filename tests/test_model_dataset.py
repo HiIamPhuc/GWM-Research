@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from model.dataset import CollateFN, GWMDataset
-from model.model import ContextAggregator, GWM
+from model.model import ContextAggregator, ConvTransEDecoder, GWM
 from studies.ablation_models import build_model
 from utils.eval import (
     build_bidirectional_eval_dataset,
@@ -16,11 +16,8 @@ from utils.eval import (
 )
 
 
-def make_config(
-    context_agg='mean',
-    decoder=None,
-):
-    config = SimpleNamespace(
+def make_config():
+    return SimpleNamespace(
         num_entities=4,
         num_relations=4,
         text_emb_dim=6,
@@ -31,15 +28,10 @@ def make_config(
         dynamics_layers=1,
         dropout=0.0,
         adapter_dropout=0.0,
-        temperature=0.1,
-        context_agg=context_agg,
         inverse_relation_ids=[2, 3],
+        convtranse_channels=2,
+        convtranse_kernel_size=3,
     )
-    if decoder is not None:
-        config.decoder = decoder
-        config.convtranse_channels = 2
-        config.convtranse_kernel_size = 3
-    return config
 
 
 class ModelTests(unittest.TestCase):
@@ -64,7 +56,6 @@ class ModelTests(unittest.TestCase):
         layer = ContextAggregator(hidden_dim=4)
         output = layer(
             head_feat=torch.randn(2, 4),
-            query_relation_feat=torch.randn(2, 4),
             nbr_entity_feat=torch.empty(0, 4),
             nbr_relation_feat=torch.empty(0, 4),
             nbr_batch_index=torch.empty(0, dtype=torch.long),
@@ -73,25 +64,27 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
         self.assertFalse(torch.equal(output, torch.zeros_like(output)))
 
-    def test_context_attention_normalizes_per_query(self):
-        messages = torch.randn(4, 3)
-        batch_index = torch.tensor([0, 0, 1, 1])
-        query_relations = torch.randn(2, 3)
-        layer = ContextAggregator(3)
-
-        weights = layer._attention_weights(
-            messages,
-            query_relations,
-            batch_index,
+    def test_context_aggregator_mean_reduction(self):
+        messages = torch.tensor(
+            [[1.0, 3.0], [5.0, 2.0], [7.0, 9.0]]
         )
-        weight_sums = torch.zeros(2)
-        weight_sums.index_add_(0, batch_index, weights)
+        batch_index = torch.tensor([0, 0, 1])
+        reference = torch.zeros(2, 2)
+        layer = ContextAggregator(2)
 
-        self.assertTrue(torch.allclose(weight_sums, torch.ones(2)))
+        result = layer._aggregate(
+            messages,
+            batch_index,
+            batch_size=2,
+            reference=reference,
+        )
 
-    def test_uniform_attention_matches_residual_mean_pooling(self):
+        self.assertTrue(
+            torch.equal(result, torch.tensor([[3.0, 2.5], [7.0, 9.0]]))
+        )
+
+    def test_context_aggregator_forward_is_residual_mean_pooling(self):
         head = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-        query_relations = torch.tensor([[0.5, 1.0], [1.5, 0.5]])
         neighbor_entities = torch.tensor(
             [[2.0, 1.0], [4.0, 2.0], [1.0, 3.0]]
         )
@@ -101,13 +94,8 @@ class ModelTests(unittest.TestCase):
         batch_index = torch.tensor([0, 0, 1])
 
         layer = ContextAggregator(2)
-        with torch.no_grad():
-            layer.query_projection.weight.zero_()
-            layer.key_projection.weight.zero_()
-            layer.score_projection.weight.zero_()
         output = layer(
             head,
-            query_relations,
             neighbor_entities,
             neighbor_relations,
             batch_index,
@@ -123,33 +111,14 @@ class ModelTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(output, expected))
 
-    def test_context_attention_is_conditioned_on_query_relation(self):
-        layer = ContextAggregator(3)
-        head = torch.randn(1, 3)
-        query_relation = torch.randn(1, 3, requires_grad=True)
-        neighbor_entities = torch.randn(2, 3)
-        neighbor_relations = torch.randn(2, 3)
-        batch_index = torch.tensor([0, 0])
-
-        output = layer(
-            head,
-            query_relation,
-            neighbor_entities,
-            neighbor_relations,
-            batch_index,
-        )
-        output[0, 0].backward()
-
-        self.assertIsNotNone(query_relation.grad)
-        self.assertGreater(query_relation.grad.abs().sum().item(), 0.0)
-        self.assertIsNotNone(layer.query_projection.weight.grad)
-
-    def test_entity_and_relation_adapters_are_separate(self):
+    def test_baseline_uses_shared_modality_adapters(self):
         model = GWM(make_config())
-        self.assertIsNot(model.text_entity_adapter, model.text_relation_adapter)
-        self.assertIsNot(model.struct_entity_adapter, model.struct_relation_adapter)
+        self.assertIsInstance(model.text_adapter, torch.nn.Module)
+        self.assertIsInstance(model.struct_adapter, torch.nn.Module)
+        self.assertFalse(hasattr(model, 'text_entity_adapter'))
+        self.assertFalse(hasattr(model, 'struct_entity_adapter'))
 
-    def test_single_modality_variants_use_relation_aware_pooling(self):
+    def test_single_modality_variants_use_baseline_pooling(self):
         h_batch = {'id': torch.tensor([0, 1])}
         r_batch = {'id': torch.tensor([0, 1])}
         context_batch = {
@@ -159,14 +128,14 @@ class ModelTests(unittest.TestCase):
         }
 
         for variant in ('text_only', 'structure_only'):
-            config = make_config(decoder='convtranse')
+            config = make_config()
             config.model_variant = variant
             model = build_model(config)
             scores = model.score_all_entities(h_batch, r_batch, context_batch)
 
             self.assertEqual(scores.shape, (2, 4))
             self.assertTrue(torch.isfinite(scores).all())
-            self.assertIsNot(model.entity_adapter, model.relation_adapter)
+            self.assertIsInstance(model.adapter, torch.nn.Module)
 
     def test_early_fusion_loss_backpropagates_to_gate(self):
         model = GWM(make_config())
@@ -187,7 +156,7 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
 
     def test_convtranse_full_entity_loss_and_scoring(self):
-        model = GWM(make_config(decoder='convtranse'))
+        model = GWM(make_config())
         h_batch = {'id': torch.tensor([0, 1])}
         r_batch = {'id': torch.tensor([0, 1])}
         t_batch = {'id': torch.tensor([2, 3])}
@@ -221,10 +190,58 @@ class ModelTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected))
 
-    def test_decoder_defaults_to_legacy_dot_scoring(self):
+    def test_convtranse_is_the_only_decoder(self):
         model = GWM(make_config())
-        self.assertEqual(model.decoder_name, 'dot')
-        self.assertIsNone(model.decoder)
+        self.assertIsInstance(model.decoder, ConvTransEDecoder)
+        self.assertFalse(hasattr(model, 'decoder_name'))
+        self.assertFalse(hasattr(model, 'temperature'))
+
+    def test_convtranse_eval_is_consistent_for_batch_size_one(self):
+        decoder = ConvTransEDecoder(
+            embedding_dim=4,
+            dropout=0.0,
+            channels=2,
+            kernel_size=3,
+        )
+        decoder.eval()
+        query = torch.randn(1, 4)
+        relation = torch.randn(1, 4)
+
+        single = decoder.decode_query(query, relation)
+        duplicated = decoder.decode_query(
+            query.expand(2, -1),
+            relation.expand(2, -1),
+        )
+
+        self.assertTrue(torch.allclose(single[0], duplicated[0], atol=1e-6))
+
+    def test_convtranse_rejects_even_kernel_size(self):
+        with self.assertRaisesRegex(ValueError, "positive odd"):
+            ConvTransEDecoder(
+                embedding_dim=4,
+                channels=2,
+                kernel_size=2,
+            )
+
+    def test_target_projection_is_candidate_only(self):
+        model = GWM(make_config())
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        context_batch = {
+            'id': torch.tensor([1, 2]),
+            'rel_id': torch.tensor([0, 1]),
+            'batch_index': torch.tensor([0, 1]),
+        }
+
+        query, _ = model.encode_query(h_batch, r_batch, context_batch)
+        query.sum().backward()
+        self.assertIsNone(model.target_projection.weight.grad)
+
+        model.zero_grad(set_to_none=True)
+        target = model.encode_target({'id': torch.tensor([2, 3])})
+        target[:, 0].sum().backward()
+        self.assertIsNotNone(model.target_projection.weight.grad)
+        self.assertFalse(hasattr(model, 'fused_output_projection'))
 
     def test_gate_statistics_are_recorded_and_consumed(self):
         model = GWM(make_config())

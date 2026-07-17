@@ -1,4 +1,4 @@
-# ConvTransE with full-entity cross-entropy and relation-aware context pooling.
+# Baseline GWM with ConvTransE and full-entity cross-entropy.
 text_emb_dim: 768
 struct_emb_dim: 896
 fusion_dim: 1024
@@ -7,7 +7,6 @@ text_adapter_dim: 768
 struct_adapter_dim: 896
 
 dynamics_layers: 2
-context_attention_dim: 128
 
 adapter_dropout: 0.1
 dropout: 0.2
@@ -25,8 +24,6 @@ batch_size: 2048
 eval_batch_size: 2048
 candidate_batch_size: 2048
 
-temperature: 0.07
-decoder: convtranse
 convtranse_channels: 50
 convtranse_kernel_size: 3
 data_dir: data-processed/fb15k-237

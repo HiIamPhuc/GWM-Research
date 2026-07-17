@@ -19,88 +19,63 @@ def full_entity_cross_entropy(scores, target_ids):
 
 
 class ContextAggregator(nn.Module):
-    """Attend to relation-composed facts using the query relation."""
+    """Mean-pool relation-composed facts and retain the head residual."""
 
-    def __init__(self, hidden_dim, dropout=0.0, attention_dim=128):
+    def __init__(self, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.attention_dim = min(int(attention_dim), hidden_dim)
-        self.query_projection = nn.Linear(
-            hidden_dim,
-            self.attention_dim,
-            bias=False,
-        )
-        self.key_projection = nn.Linear(
-            hidden_dim,
-            self.attention_dim,
-            bias=False,
-        )
-        self.score_projection = nn.Linear(self.attention_dim, 1, bias=False)
         self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
 
-    def _attention_weights(self, messages, query_relation, batch_index):
-        batch_size = query_relation.size(0)
+    def _aggregate(self, messages, batch_index, batch_size, reference):
+        aggregated = torch.zeros_like(reference)
         if messages.numel() == 0:
-            return messages.new_empty(0)
-        if batch_index.min() < 0 or batch_index.max() >= batch_size:
-            raise ValueError("Context batch index is outside the current batch.")
+            return aggregated
 
-        query = self.query_projection(query_relation)[batch_index]
-        key = self.key_projection(messages)
-        scores = self.score_projection(torch.tanh(query + key)).squeeze(-1)
-
-        max_scores = scores.new_full((batch_size,), float('-inf'))
-        max_scores.scatter_reduce_(
+        aggregated.index_add_(0, batch_index, messages)
+        counts = torch.zeros(
+            batch_size,
+            1,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        counts.index_add_(
             0,
             batch_index,
-            scores,
-            reduce='amax',
-            include_self=True,
+            torch.ones(
+                messages.size(0),
+                1,
+                device=reference.device,
+                dtype=reference.dtype,
+            ),
         )
-        unnormalized = torch.exp(scores - max_scores[batch_index])
-        denominators = scores.new_zeros(batch_size)
-        denominators.index_add_(0, batch_index, unnormalized)
-        return unnormalized / denominators[batch_index].clamp_min(1e-12)
+        return aggregated / counts.clamp_min(1.0)
 
     def forward(
         self,
         head_feat,
-        query_relation_feat,
         nbr_entity_feat,
         nbr_relation_feat,
         nbr_batch_index,
     ):
         """
         head_feat: (B, H)
-        query_relation_feat: (B, H)
         nbr_entity_feat: (E, H)
         nbr_relation_feat: (E, H)
         nbr_batch_index: (E,) long, edge -> head index in batch
         """
-        if head_feat.shape != query_relation_feat.shape:
-            raise ValueError("Head and query relation features must have equal shapes.")
         if nbr_entity_feat.shape != nbr_relation_feat.shape:
             raise ValueError("Context entity and relation features must have equal shapes.")
         if nbr_batch_index.numel() != nbr_entity_feat.size(0):
             raise ValueError("Each context fact requires one batch index.")
 
-        if nbr_entity_feat.numel() == 0:
-            return self.norm(head_feat)
-
         composed_facts = nbr_entity_feat * nbr_relation_feat
-        weights = self._attention_weights(
+        aggregated = self._aggregate(
             composed_facts,
-            query_relation_feat,
             nbr_batch_index,
+            head_feat.size(0),
+            head_feat,
         )
-        attended = torch.zeros_like(head_feat)
-        attended.index_add_(
-            0,
-            nbr_batch_index,
-            weights.unsqueeze(-1) * composed_facts,
-        )
-        return self.norm(head_feat + self.dropout(attended))
+        return self.norm(head_feat + aggregated)
 
 
 class MLPAdapter(nn.Module):
@@ -147,11 +122,19 @@ class GatedFusion(nn.Module):
 
 
 class ConvTransEDecoder(nn.Module):
-    """ConvTransE decoder shared with the temporal GWM architecture."""
+    """Decode a query/relation pair and score it against target vectors."""
 
     def __init__(self, embedding_dim, dropout=0.0, channels=50, kernel_size=3):
         super().__init__()
         self.embedding_dim = int(embedding_dim)
+        channels = int(channels)
+        kernel_size = int(kernel_size)
+        if self.embedding_dim <= 0:
+            raise ValueError("ConvTransE embedding_dim must be positive.")
+        if channels <= 0:
+            raise ValueError("ConvTransE channels must be positive.")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("ConvTransE kernel_size must be a positive odd integer.")
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -167,7 +150,17 @@ class ConvTransEDecoder(nn.Module):
         )
         self.fc = nn.Linear(self.embedding_dim * channels, self.embedding_dim)
 
-    def forward(self, query_vectors, relation_vectors, candidate_vectors):
+    def decode_query(self, query_vectors, relation_vectors):
+        if query_vectors.dim() != 2 or relation_vectors.dim() != 2:
+            raise ValueError("ConvTransE query and relation vectors must be rank-2.")
+        if query_vectors.shape != relation_vectors.shape:
+            raise ValueError("ConvTransE query and relation vectors must have equal shapes.")
+        if query_vectors.size(1) != self.embedding_dim:
+            raise ValueError(
+                f"ConvTransE expected width {self.embedding_dim}, "
+                f"got {query_vectors.size(1)}."
+            )
+
         batch_size = query_vectors.size(0)
         stacked_inputs = torch.stack([query_vectors, relation_vectors], dim=1)
         x = self.bn0(stacked_inputs)
@@ -179,10 +172,20 @@ class ConvTransEDecoder(nn.Module):
         x = x.reshape(batch_size, -1)
         x = self.fc(x)
         x = self.dropout3(x)
-        if batch_size > 1:
+        if not self.training or batch_size > 1:
             x = self.bn2(x)
-        x = F.relu(x)
-        return torch.mm(x, torch.tanh(candidate_vectors).t())
+        return F.relu(x)
+
+    def forward(self, query_vectors, relation_vectors, candidate_vectors):
+        if candidate_vectors.dim() != 2:
+            raise ValueError("ConvTransE candidate vectors must be rank-2.")
+        if candidate_vectors.size(1) != self.embedding_dim:
+            raise ValueError(
+                f"ConvTransE expected candidate width {self.embedding_dim}, "
+                f"got {candidate_vectors.size(1)}."
+            )
+        decoded_query = self.decode_query(query_vectors, relation_vectors)
+        return torch.mm(decoded_query, torch.tanh(candidate_vectors).t())
 
 
 class GWM(nn.Module):
@@ -197,11 +200,7 @@ class GWM(nn.Module):
         self.text_ent_embs = nn.Embedding(config.num_entities, self.text_emb_dim)
         self.text_rel_embs = nn.Embedding(config.num_relations, self.text_emb_dim)
 
-        self.text_entity_adapter = MLPAdapter(self.text_emb_dim,
-            int(getattr(config, 'text_adapter_dim')),
-            dropout=self.adapter_dropout
-            )
-        self.text_relation_adapter = MLPAdapter(
+        self.text_adapter = MLPAdapter(
             self.text_emb_dim,
             int(getattr(config, 'text_adapter_dim')),
             dropout=self.adapter_dropout,
@@ -212,13 +211,8 @@ class GWM(nn.Module):
         self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
         self.struct_rel_embs = nn.Embedding(config.num_relations, self.struct_emb_dim)
 
-        self.struct_entity_adapter = MLPAdapter(
+        self.struct_adapter = MLPAdapter(
             self.struct_emb_dim, 
-            int(getattr(config, 'struct_adapter_dim')),
-            dropout=self.adapter_dropout
-            )
-        self.struct_relation_adapter = MLPAdapter(
-            self.struct_emb_dim,
             int(getattr(config, 'struct_adapter_dim')),
             dropout=self.adapter_dropout,
         )
@@ -238,11 +232,7 @@ class GWM(nn.Module):
             dropout=self.dropout,
         )
 
-        self.fused_context_aggregator = ContextAggregator(
-            hidden_dim=self.fusion_dim,
-            dropout=self.dropout,
-            attention_dim=int(getattr(config, 'context_attention_dim', 128)),
-        )
+        self.fused_context_aggregator = ContextAggregator(hidden_dim=self.fusion_dim)
         self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
 
@@ -254,24 +244,17 @@ class GWM(nn.Module):
             batch_first=True,
             dropout=self.dropout if dynamics_layers > 1 else 0.0,
         )
-        self.fused_output_projection = nn.Linear(
+        self.target_projection = nn.Linear(
             self.fusion_dim,
             self.fusion_dim,
         )
 
-        self.temperature = float(getattr(config, 'temperature'))
-        self.decoder_name = str(getattr(config, 'decoder', 'dot')).lower()
-        if self.decoder_name == 'convtranse':
-            self.decoder = ConvTransEDecoder(
-                embedding_dim=self.fusion_dim,
-                dropout=self.dropout,
-                channels=int(getattr(config, 'convtranse_channels', 50)),
-                kernel_size=int(getattr(config, 'convtranse_kernel_size', 3)),
-            )
-        elif self.decoder_name in {'dot', 'contrastive'}:
-            self.decoder = None
-        else:
-            raise ValueError(f"Unsupported decoder: {self.decoder_name}")
+        self.decoder = ConvTransEDecoder(
+            embedding_dim=self.fusion_dim,
+            dropout=self.dropout,
+            channels=int(getattr(config, 'convtranse_channels', 50)),
+            kernel_size=int(getattr(config, 'convtranse_kernel_size', 3)),
+        )
         self._last_gate_stats = {}
 
     def reset_gate_stats(self):
@@ -310,7 +293,6 @@ class GWM(nn.Module):
             raise ValueError("Ragged context tensors must have equal lengths.")
         return context_entity_ids, context_relation_ids, context_batch_index
 
-    # def _run_dynamics(self, world_state, head_emb, relation_emb, mixer, lstm, h0_proj, c0_proj):
     def _run_dynamics(self, world_state, head_emb, relation_emb, lstm, h0_proj, c0_proj):
         """
         Run recurrent dynamics over a sequence of steps.
@@ -393,20 +375,20 @@ class GWM(nn.Module):
 
     def encode_query(self, h_batch, r_batch, context_batch):
         self.reset_gate_stats()
-        h_text = self.text_entity_adapter(self.text_ent_embs(h_batch['id']))
-        r_text = self.text_relation_adapter(self.text_rel_embs(r_batch['id']))
-        h_struct = self.struct_entity_adapter(self.struct_ent_embs(h_batch['id']))
-        r_struct = self.struct_relation_adapter(self.struct_rel_embs(r_batch['id']))
+        h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
+        r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
+        h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
+        r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
         h_fused, h_gate = self.entity_fusion(h_text, h_struct)
         r_fused, r_gate = self.relation_fusion(r_text, r_struct)
         self._record_gate_stats('entity_gate', h_gate)
         self._record_gate_stats('relation_gate', r_gate)
 
         flat_context_entity_ids, flat_context_relation_ids, context_batch_index = self._prepare_context_batch(context_batch)
-        ctx_ent_text = self.text_entity_adapter(self.text_ent_embs(flat_context_entity_ids))
-        ctx_rel_text = self.text_relation_adapter(self.text_rel_embs(flat_context_relation_ids))
-        ctx_ent_struct = self.struct_entity_adapter(self.struct_ent_embs(flat_context_entity_ids))
-        ctx_rel_struct = self.struct_relation_adapter(self.struct_rel_embs(flat_context_relation_ids))
+        ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
+        ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
+        ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
+        ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
         ctx_ent_fused, ctx_ent_gate = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
         ctx_rel_fused, ctx_rel_gate = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
         self._record_gate_stats('entity_gate', ctx_ent_gate)
@@ -414,7 +396,6 @@ class GWM(nn.Module):
 
         world_state = self.fused_context_aggregator(
             head_feat=h_fused,
-            query_relation_feat=r_fused,
             nbr_entity_feat=ctx_ent_fused,
             nbr_relation_feat=ctx_rel_fused,
             nbr_batch_index=context_batch_index,
@@ -427,7 +408,6 @@ class GWM(nn.Module):
             self.fused_h0_projection,
             self.fused_c0_projection,
         )
-        query = F.normalize(self.fused_output_projection(query), p=2, dim=1)
         return query, r_fused
 
     def forward(self, h_batch, r_batch, context_batch):
@@ -435,12 +415,12 @@ class GWM(nn.Module):
         return query
 
     def encode_target(self, t_batch):
-        t_text = self.text_entity_adapter(self.text_ent_embs(t_batch['id']))
-        t_struct = self.struct_entity_adapter(self.struct_ent_embs(t_batch['id']))
+        t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
+        t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
         t_fused, t_gate = self.entity_fusion(t_text, t_struct)
         self._record_gate_stats('entity_gate', t_gate)
         return F.normalize(
-            self.fused_output_projection(t_fused),
+            self.target_projection(t_fused),
             p=2,
             dim=1,
         )
@@ -452,20 +432,14 @@ class GWM(nn.Module):
     def score_candidates(
         self,
         query_vectors,
+        relation_vectors,
         candidate_vectors,
-        relation_vectors=None,
     ):
-        if self.decoder_name == 'convtranse':
-            if relation_vectors is None:
-                raise ValueError(
-                    "ConvTransE scoring requires relation vectors."
-                )
-            return self.decoder(
-                query_vectors,
-                relation_vectors,
-                candidate_vectors,
-            )
-        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
+        return self.decoder(
+            query_vectors,
+            relation_vectors,
+            candidate_vectors,
+        )
 
     def score_all_entities(
         self,
@@ -489,7 +463,7 @@ class GWM(nn.Module):
 
         scores = self.score_candidates(
             query_vectors,
+            relation_vectors,
             candidate_vectors,
-            relation_vectors=relation_vectors,
         )
         return scores

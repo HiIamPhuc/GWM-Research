@@ -161,7 +161,7 @@ def train(args):
     # Init Model
     print("Initializing model...")
     model = build_model(config).to(device)
-    decoder_name = getattr(model, 'decoder_name', 'dot')
+    config.decoder = 'convtranse'
     config.training_objective = 'full_entity_cross_entropy'
 
     # Collater
@@ -227,10 +227,6 @@ def train(args):
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     grad_clip_norm = float(getattr(config, 'grad_clip_norm', 1.0))
-    print(
-        f"Training objective: Full-Entity Cross-Entropy | "
-        f"Decoder: {decoder_name} | Optimizer: AdamW | Scheduler: cosine"
-    )
     
     # Validation Loader
     if os.path.exists(os.path.join(config.data_dir, 'valid_triples.pt')):
@@ -333,9 +329,6 @@ def train(args):
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-            f"Objective: Full-Entity Cross-Entropy | "
-            f"Decoder: {decoder_name} | "
-            f"Candidates/Query: {config.num_entities} | "
             f"Train Time: {epoch_train_seconds:.2f}s"
         )
         

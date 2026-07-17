@@ -359,17 +359,12 @@ def compute_filtered_ranking_metrics(
             h_ids = h_ids_tensor.cpu().numpy()
             r_ids = r_ids_tensor.cpu().numpy()
 
-            if getattr(model, 'decoder_name', 'dot') == 'convtranse':
-                scores = model.score_all_entities(
-                    h_batch,
-                    r_batch,
-                    context_batch,
-                    candidate_vectors=all_entity_embeddings,
-                )
-            else:
-                query_vectors = model(h_batch, r_batch, context_batch)
-                scores = torch.mm(query_vectors, all_entity_embeddings.t())
-                scores = scores / model.temperature
+            scores = model.score_all_entities(
+                h_batch,
+                r_batch,
+                context_batch,
+                candidate_vectors=all_entity_embeddings,
+            )
 
             # Prevent NaNs/Infs from masquerading as perfect ranks.
             scores = torch.nan_to_num(scores, nan=-1e9, posinf=1e9, neginf=-1e9)

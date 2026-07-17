@@ -14,7 +14,6 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.dataset import CollateFN, GWMDataset
-from model.model import MULTI_LABEL_SMOOTHING
 from studies.ablation_models import build_model
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
@@ -22,6 +21,7 @@ from utils.eval import (
     build_entity_loader,
     compute_bidirectional_filtered_ranking_metrics,
     encode_all_entities_as_targets,
+    load_inverse_relation_ids,
 )
 from utils.early_stopping import EarlyStopping
 
@@ -144,10 +144,7 @@ def train(args):
     # Load Dataset
     print(f"Loading data from {config.data_dir}...")
     train_dataset = GWMDataset(config.data_dir, split='train')
-    print(
-        f"Built {len(train_dataset)} unique training queries from "
-        f"{train_dataset.num_input_triples} triples."
-    )
+    print(f"Loaded {len(train_dataset)} training triples.")
     
     # Infer input dimensions from dataset
     # e.g., number of entities/relations for embedding layers
@@ -159,13 +156,13 @@ def train(args):
         
     config.num_entities = num_ent
     config.num_relations = num_rel
+    config.inverse_relation_ids = load_inverse_relation_ids(config.data_dir)
     
     # Init Model
     print("Initializing model...")
     model = build_model(config).to(device)
     decoder_name = getattr(model, 'decoder_name', 'dot')
-    config.training_objective = 'smoothed_multi_label_bce'
-    config.label_smoothing = MULTI_LABEL_SMOOTHING
+    config.training_objective = 'full_entity_cross_entropy'
 
     # Collater
     collate_fn = CollateFN()
@@ -231,9 +228,13 @@ def train(args):
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     grad_clip_norm = float(getattr(config, 'grad_clip_norm', 1.0))
     print(
-        f"Training objective: Smoothed Multi-Label BCE | Decoder: {decoder_name} | "
-        f"Optimizer: AdamW | Scheduler: cosine | "
-        f"Label smoothing: {MULTI_LABEL_SMOOTHING:g}"
+        f"Training objective: Full-Entity Cross-Entropy | "
+        f"Decoder: {decoder_name} | Optimizer: AdamW | Scheduler: cosine"
+    )
+    print(
+        f"Label smoothing: {float(getattr(config, 'label_smoothing', 0.0)):g} | "
+        f"Directional candidate bias: "
+        f"{bool(getattr(config, 'directional_candidate_bias', False))}"
     )
     
     # Validation Loader
@@ -298,9 +299,7 @@ def train(args):
             # Move batch to device (handle nested dicts)
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
-            positive_batch = {
-                k: v.to(device) for k, v in batch['positive_batch'].items()
-            }
+            t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
             context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             optimizer.zero_grad()
@@ -310,11 +309,7 @@ def train(args):
                 r_batch,
                 context_batch,
             )
-            loss = model.compute_loss(
-                scores,
-                positive_batch['id'],
-                positive_batch['batch_index'],
-            )
+            loss = model.compute_loss(scores, t_batch['id'])
             gate_stats = model.pop_gate_stats()
 
             if not torch.isfinite(loss):
@@ -343,7 +338,7 @@ def train(args):
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-            f"Objective: Smoothed Multi-Label BCE | "
+            f"Objective: Full-Entity Cross-Entropy | "
             f"Decoder: {decoder_name} | "
             f"Candidates/Query: {config.num_entities} | "
             f"Train Time: {epoch_train_seconds:.2f}s"

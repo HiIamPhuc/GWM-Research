@@ -7,14 +7,20 @@ from types import SimpleNamespace
 import torch
 
 from model.dataset import CollateFN, GWMDataset
-from model.model import ContextAggregator, GWM, MULTI_LABEL_SMOOTHING
+from model.model import ContextAggregator, DirectionalCandidateBias, GWM
 from utils.eval import (
     build_bidirectional_eval_dataset,
     build_bidirectional_hr_map_for_filtering,
+    load_inverse_relation_ids,
 )
 
 
-def make_config(context_agg='mean', decoder=None):
+def make_config(
+    context_agg='mean',
+    decoder=None,
+    label_smoothing=0.0,
+    directional_candidate_bias=False,
+):
     config = SimpleNamespace(
         num_entities=4,
         num_relations=4,
@@ -28,6 +34,9 @@ def make_config(context_agg='mean', decoder=None):
         adapter_dropout=0.0,
         temperature=0.1,
         context_agg=context_agg,
+        label_smoothing=label_smoothing,
+        directional_candidate_bias=directional_candidate_bias,
+        inverse_relation_ids=[2, 3],
     )
     if decoder is not None:
         config.decoder = decoder
@@ -122,11 +131,7 @@ class ModelTests(unittest.TestCase):
             'batch_index': torch.tensor([0, 1]),
         }
         scores = model.score_all_entities(h_batch, r_batch, context_batch)
-        loss = model.compute_loss(
-            scores,
-            t_batch['id'],
-            torch.arange(t_batch['id'].numel()),
-        )
+        loss = model.compute_loss(scores, t_batch['id'])
         self.assertEqual(scores.shape, (2, 4))
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
@@ -145,11 +150,7 @@ class ModelTests(unittest.TestCase):
         }
 
         scores = model.score_all_entities(h_batch, r_batch, context_batch)
-        loss = model.compute_loss(
-            scores,
-            t_batch['id'],
-            torch.arange(t_batch['id'].numel()),
-        )
+        loss = model.compute_loss(scores, t_batch['id'])
 
         self.assertEqual(scores.shape, (2, 4))
         self.assertTrue(torch.isfinite(loss))
@@ -159,31 +160,87 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
         self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
 
-    def test_sparse_multi_positive_loss_matches_dense_smoothed_bce(self):
+    def test_full_entity_loss_matches_cross_entropy(self):
         scores = torch.tensor(
             [[0.2, -0.3, 1.1, 0.5], [-0.7, 0.4, 0.8, -0.2]],
             requires_grad=True,
         )
-        positive_tail_ids = torch.tensor([1, 3, 2])
-        positive_batch_index = torch.tensor([0, 0, 1])
+        target_ids = torch.tensor([3, 2])
 
-        actual = GWM.compute_loss(
-            scores,
-            positive_tail_ids,
-            positive_batch_index,
+        model = GWM(make_config())
+        actual = model.compute_loss(scores, target_ids)
+        expected = torch.nn.functional.cross_entropy(scores, target_ids)
+
+        self.assertTrue(torch.allclose(actual, expected))
+
+    def test_full_entity_loss_applies_label_smoothing(self):
+        scores = torch.tensor(
+            [[0.2, -0.3, 1.1, 0.5], [-0.7, 0.4, 0.8, -0.2]],
+            requires_grad=True,
         )
-        targets = torch.zeros_like(scores)
-        targets[positive_batch_index, positive_tail_ids] = 1.0
-        smoothed_targets = (
-            (1.0 - MULTI_LABEL_SMOOTHING) * targets
-            + MULTI_LABEL_SMOOTHING / scores.size(1)
-        )
-        expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        target_ids = torch.tensor([3, 2])
+        model = GWM(make_config(label_smoothing=0.05))
+
+        actual = model.compute_loss(scores, target_ids)
+        expected = torch.nn.functional.cross_entropy(
             scores,
-            smoothed_targets,
+            target_ids,
+            label_smoothing=0.05,
         )
 
         self.assertTrue(torch.allclose(actual, expected))
+
+    def test_directional_candidate_bias_selects_forward_and_inverse_rows(self):
+        layer = DirectionalCandidateBias(
+            num_entities=4,
+            num_relations=4,
+            inverse_relation_ids=[2, 3],
+        )
+        with torch.no_grad():
+            layer.bias[0].copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+            layer.bias[1].copy_(torch.tensor([5.0, 6.0, 7.0, 8.0]))
+
+        output = layer(torch.zeros(2, 4), torch.tensor([0, 2]))
+        self.assertTrue(torch.equal(output[0], layer.bias[0]))
+        self.assertTrue(torch.equal(output[1], layer.bias[1]))
+
+        output.sum().backward()
+        self.assertTrue(torch.equal(layer.bias.grad, torch.ones_like(layer.bias)))
+
+    def test_score_all_entities_applies_directional_candidate_bias(self):
+        model = GWM(
+            make_config(
+                decoder='convtranse',
+                directional_candidate_bias=True,
+            )
+        )
+        model.eval()
+        with torch.no_grad():
+            for parameter in model.decoder.parameters():
+                parameter.zero_()
+            model.directional_candidate_bias.bias[0].copy_(
+                torch.tensor([1.0, 2.0, 3.0, 4.0])
+            )
+            model.directional_candidate_bias.bias[1].copy_(
+                torch.tensor([5.0, 6.0, 7.0, 8.0])
+            )
+
+        scores = model.score_all_entities(
+            h_batch={'id': torch.tensor([0, 1])},
+            r_batch={'id': torch.tensor([0, 2])},
+            context_batch={
+                'id': torch.empty(0, dtype=torch.long),
+                'rel_id': torch.empty(0, dtype=torch.long),
+                'batch_index': torch.empty(0, dtype=torch.long),
+            },
+        )
+
+        self.assertTrue(
+            torch.equal(scores[0], model.directional_candidate_bias.bias[0])
+        )
+        self.assertTrue(
+            torch.equal(scores[1], model.directional_candidate_bias.bias[1])
+        )
 
     def test_decoder_defaults_to_legacy_dot_scoring(self):
         model = GWM(make_config())
@@ -251,7 +308,7 @@ class DatasetTests(unittest.TestCase):
                 {'id', 'rel_id', 'batch_index'},
             )
 
-    def test_training_queries_merge_positives_and_mask_all_answer_edges(self):
+    def test_training_preserves_triples_and_masks_each_target_edge(self):
         with tempfile.TemporaryDirectory() as root:
             self._write_data(root)
             torch.save(
@@ -260,17 +317,13 @@ class DatasetTests(unittest.TestCase):
             )
 
             dataset = GWMDataset(root, split='train')
-            self.assertEqual(len(dataset), 1)
-            item = dataset[0]
-            self.assertEqual(item['positive_tail_ids'].tolist(), [1, 2])
-            self.assertEqual(item['context_mask'].tolist(), [False, False])
+            self.assertEqual(len(dataset), 2)
+            self.assertEqual(dataset[0]['context_mask'].tolist(), [False, True])
+            self.assertEqual(dataset[1]['context_mask'].tolist(), [True, False])
 
-            batch = CollateFN()([item])
-            self.assertEqual(batch['positive_batch']['id'].tolist(), [1, 2])
-            self.assertEqual(
-                batch['positive_batch']['batch_index'].tolist(),
-                [0, 0],
-            )
+            batch = CollateFN()([dataset[0], dataset[1]])
+            self.assertEqual(batch['t_batch']['id'].tolist(), [1, 2])
+            self.assertNotIn('positive_batch', batch)
 
     def test_bidirectional_eval_dataset_builds_inverse_queries_on_the_fly(self):
         with tempfile.TemporaryDirectory() as root:
@@ -312,6 +365,7 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(hr_map[(0, 0)], {1, 2})
             self.assertEqual(hr_map[(1, 1)], {0})
             self.assertEqual(hr_map[(2, 1)], {0})
+            self.assertEqual(load_inverse_relation_ids(root), [1])
 
 if __name__ == '__main__':
     unittest.main()

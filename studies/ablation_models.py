@@ -9,7 +9,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.model import ContextAggregator, ConvTransEDecoder, GWM, MLPAdapter
+from model.model import (
+    ContextAggregator,
+    ConvTransEDecoder,
+    DirectionalCandidateBias,
+    GWM,
+    MLPAdapter,
+    full_entity_cross_entropy,
+)
 
 
 def build_model(config):
@@ -64,6 +71,7 @@ class SingleModalityGWM(nn.Module):
         )
         self.output_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.temperature = float(getattr(config, 'temperature'))
+        self.label_smoothing = float(getattr(config, 'label_smoothing', 0.0))
         self.decoder_name = str(getattr(config, 'decoder', 'dot')).lower()
         if self.decoder_name == 'convtranse':
             self.decoder = ConvTransEDecoder(
@@ -76,6 +84,14 @@ class SingleModalityGWM(nn.Module):
             self.decoder = None
         else:
             raise ValueError(f"Unsupported decoder: {self.decoder_name}")
+        if bool(getattr(config, 'directional_candidate_bias', False)):
+            self.directional_candidate_bias = DirectionalCandidateBias(
+                num_entities=int(config.num_entities),
+                num_relations=int(config.num_relations),
+                inverse_relation_ids=getattr(config, 'inverse_relation_ids', []),
+            )
+        else:
+            self.directional_candidate_bias = None
 
     def reset_gate_stats(self):
         pass
@@ -155,12 +171,11 @@ class SingleModalityGWM(nn.Module):
         target = self._encode_entities(t_batch['id'])
         return F.normalize(self.output_projection(target), p=2, dim=1)
 
-    @staticmethod
-    def compute_loss(scores, positive_tail_ids, positive_batch_index):
-        return GWM.compute_loss(
+    def compute_loss(self, scores, target_ids):
+        return full_entity_cross_entropy(
             scores,
-            positive_tail_ids,
-            positive_batch_index,
+            target_ids,
+            label_smoothing=self.label_smoothing,
         )
 
     def score_candidates(
@@ -201,11 +216,14 @@ class SingleModalityGWM(nn.Module):
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        return self.score_candidates(
+        scores = self.score_candidates(
             query_vectors,
             candidate_vectors,
             relation_vectors=relation_vectors,
         )
+        if self.directional_candidate_bias is not None:
+            scores = self.directional_candidate_bias(scores, r_batch['id'])
+        return scores
 
 
 class TextOnlyGWM(SingleModalityGWM):

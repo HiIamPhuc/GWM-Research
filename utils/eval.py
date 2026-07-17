@@ -125,6 +125,23 @@ def load_inverse_relation_id_map(data_dir):
     return inverse_relation_ids
 
 
+def load_inverse_relation_ids(data_dir):
+    """Return IDs explicitly assigned to `_inv` relation vocabulary entries."""
+    with open(os.path.join(data_dir, 'relation2id.json'), 'r', encoding='utf-8') as f:
+        relation2id = json.load(f)
+
+    inverse_relation_ids = sorted(
+        int(relation_id)
+        for relation, relation_id in relation2id.items()
+        if relation.endswith('_inv')
+    )
+    if not inverse_relation_ids:
+        raise ValueError(
+            "Directional scoring requires relation names ending in `_inv`."
+        )
+    return inverse_relation_ids
+
+
 def build_inverse_triples(triples, inverse_relation_ids):
     triples = torch.as_tensor(triples, dtype=torch.long)
     inverse_rows = []

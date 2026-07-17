@@ -4,7 +4,61 @@ import torch.nn.functional as F
 import math
 
 
-MULTI_LABEL_SMOOTHING = 0.05
+def full_entity_cross_entropy(scores, target_ids, label_smoothing=0.0):
+    if scores.dim() != 2:
+        raise ValueError("Full-entity scores must have shape (B, |E|).")
+
+    target_ids = torch.as_tensor(
+        target_ids,
+        dtype=torch.long,
+        device=scores.device,
+    ).reshape(-1)
+    if target_ids.numel() != scores.size(0):
+        raise ValueError("target_ids must contain one entity ID per score row.")
+    return F.cross_entropy(
+        scores,
+        target_ids,
+        label_smoothing=float(label_smoothing),
+    )
+
+
+class DirectionalCandidateBias(nn.Module):
+    """Separate candidate priors for original and inverse-relation queries."""
+
+    def __init__(self, num_entities, num_relations, inverse_relation_ids):
+        super().__init__()
+        inverse_relation_mask = torch.zeros(num_relations, dtype=torch.bool)
+        inverse_relation_ids = torch.as_tensor(
+            inverse_relation_ids,
+            dtype=torch.long,
+        ).reshape(-1)
+        if inverse_relation_ids.numel() == 0:
+            raise ValueError(
+                "Directional candidate bias requires inverse relation IDs."
+            )
+        if (
+            inverse_relation_ids.min() < 0
+            or inverse_relation_ids.max() >= num_relations
+        ):
+            raise ValueError("Inverse relation IDs are outside the relation vocabulary.")
+        inverse_relation_mask[inverse_relation_ids] = True
+        self.register_buffer('inverse_relation_mask', inverse_relation_mask)
+        self.bias = nn.Parameter(torch.zeros(2, num_entities))
+
+    def forward(self, scores, relation_ids):
+        if scores.dim() != 2 or scores.size(1) != self.bias.size(1):
+            raise ValueError(
+                "Directional candidate bias expects full-entity scores."
+            )
+        relation_ids = torch.as_tensor(
+            relation_ids,
+            dtype=torch.long,
+            device=scores.device,
+        ).reshape(-1)
+        if relation_ids.numel() != scores.size(0):
+            raise ValueError("Expected one relation ID per score row.")
+        direction_ids = self.inverse_relation_mask[relation_ids].long()
+        return scores + self.bias[direction_ids]
 
 
 class ContextAggregator(nn.Module):
@@ -187,6 +241,7 @@ class GWM(nn.Module):
         )
 
         self.temperature = float(getattr(config, 'temperature'))
+        self.label_smoothing = float(getattr(config, 'label_smoothing', 0.0))
         self.decoder_name = str(getattr(config, 'decoder', 'dot')).lower()
         if self.decoder_name == 'convtranse':
             self.decoder = ConvTransEDecoder(
@@ -199,6 +254,14 @@ class GWM(nn.Module):
             self.decoder = None
         else:
             raise ValueError(f"Unsupported decoder: {self.decoder_name}")
+        if bool(getattr(config, 'directional_candidate_bias', False)):
+            self.directional_candidate_bias = DirectionalCandidateBias(
+                num_entities=int(config.num_entities),
+                num_relations=int(config.num_relations),
+                inverse_relation_ids=getattr(config, 'inverse_relation_ids', []),
+            )
+        else:
+            self.directional_candidate_bias = None
         self._last_gate_stats = {}
 
     def reset_gate_stats(self):
@@ -371,51 +434,13 @@ class GWM(nn.Module):
             dim=1,
         )
 
-    @staticmethod
-    def compute_loss(scores, positive_tail_ids, positive_batch_index):
-        """Smoothed full-entity BCE using sparse multi-positive labels."""
-        if scores.dim() != 2:
-            raise ValueError("Full-entity scores must have shape (B, |E|).")
-
-        positive_tail_ids = torch.as_tensor(
-            positive_tail_ids,
-            dtype=torch.long,
-            device=scores.device,
-        ).reshape(-1)
-        positive_batch_index = torch.as_tensor(
-            positive_batch_index,
-            dtype=torch.long,
-            device=scores.device,
-        ).reshape(-1)
-        if positive_tail_ids.numel() != positive_batch_index.numel():
-            raise ValueError(
-                "positive_tail_ids and positive_batch_index must have equal lengths."
-            )
-        if positive_tail_ids.numel() == 0:
-            raise ValueError("Every training batch must contain a positive target.")
-        if (
-            positive_tail_ids.min() < 0
-            or positive_tail_ids.max() >= scores.size(1)
-            or positive_batch_index.min() < 0
-            or positive_batch_index.max() >= scores.size(0)
-        ):
-            raise ValueError("Multi-positive indices are outside the score matrix.")
-
-        batch_size, num_entities = scores.shape
-        positive_scores = scores[
-            positive_batch_index,
-            positive_tail_ids,
-        ]
-        loss = F.softplus(scores).mean()
-        loss = loss - (
-            MULTI_LABEL_SMOOTHING / num_entities
-        ) * scores.mean()
-        loss = loss - (
-            (1.0 - MULTI_LABEL_SMOOTHING)
-            * positive_scores.sum()
-            / (batch_size * num_entities)
+    def compute_loss(self, scores, target_ids):
+        """Full-entity cross-entropy with one target tail per triple."""
+        return full_entity_cross_entropy(
+            scores,
+            target_ids,
+            label_smoothing=self.label_smoothing,
         )
-        return loss
 
     def score_candidates(
         self,
@@ -455,8 +480,11 @@ class GWM(nn.Module):
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        return self.score_candidates(
+        scores = self.score_candidates(
             query_vectors,
             candidate_vectors,
             relation_vectors=relation_vectors,
         )
+        if self.directional_candidate_bias is not None:
+            scores = self.directional_candidate_bias(scores, r_batch['id'])
+        return scores

@@ -24,8 +24,7 @@ batch_size: 2048
 eval_batch_size: 2048
 candidate_batch_size: 2048
 
-convtranse_channels: 50
-convtranse_kernel_size: 3
+temperature: 0.07
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237

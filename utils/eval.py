@@ -30,6 +30,7 @@ class TensorTripleDataset(Dataset):
         self.num_relations = base_dataset.num_relations
         self.context_entity_ids = base_dataset.context_entity_ids
         self.context_relation_ids = base_dataset.context_relation_ids
+        self.context_direction_ids = base_dataset.context_direction_ids
         self.context_mask = base_dataset.context_mask
         self.context_pad_value = base_dataset.context_pad_value
         self.triples = torch.as_tensor(triples, dtype=torch.long)
@@ -43,6 +44,7 @@ class TensorTripleDataset(Dataset):
 
         ctx_entity_ids = self.context_entity_ids[h_idx]
         ctx_relation_ids = self.context_relation_ids[h_idx]
+        ctx_direction_ids = self.context_direction_ids[h_idx]
         ctx_mask = self.context_mask[h_idx].clone()
 
         target_edge = (
@@ -57,6 +59,7 @@ class TensorTripleDataset(Dataset):
             't_id': t.long(),
             'context_entity_ids': ctx_entity_ids.long(),
             'context_relation_ids': ctx_relation_ids.long(),
+            'context_direction_ids': ctx_direction_ids.long(),
             'context_mask': ctx_mask.bool(),
         }
 

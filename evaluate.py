@@ -17,7 +17,6 @@ from utils.eval import (
     compute_bidirectional_filtered_ranking_metrics,
     compute_filtered_ranking_metrics,
     encode_all_entities_as_targets,
-    load_inverse_relation_ids,
     load_hr_map_for_filtering,
 )
 
@@ -49,7 +48,6 @@ def evaluate(args):
         config.num_entities = len(json.load(f))
     with open(os.path.join(config.data_dir, 'relation2id.json')) as f:
         config.num_relations = len(json.load(f))
-    config.inverse_relation_ids = load_inverse_relation_ids(config.data_dir)
 
     model = build_model(config).to(device)
     
@@ -88,7 +86,7 @@ def evaluate(args):
         entity_loader=entity_loader,
         device=device
     )
-    print(f"Encoded {all_entity_embeddings[0].size(0)} entities.")
+    print(f"Encoded {all_entity_embeddings.size(0)} entities.")
 
     # 3. Evaluation Loop
     split = 'test'

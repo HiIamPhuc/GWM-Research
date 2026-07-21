@@ -10,11 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.model import (
-    ContextAggregator,
-    ConvTransEDecoder,
+    CompGCNWorldStateEncoder,
     GWM,
     MLPAdapter,
-    full_entity_cross_entropy,
+    filtered_in_batch_contrastive_loss,
 )
 
 
@@ -56,7 +55,10 @@ class SingleModalityGWM(nn.Module):
         )
         self.input_projection = nn.Linear(self.embedding_dim, self.fusion_dim)
 
-        self.context_aggregator = ContextAggregator(hidden_dim=self.fusion_dim)
+        self.world_state_encoder = CompGCNWorldStateEncoder(
+            hidden_dim=self.fusion_dim,
+            dropout=self.dropout,
+        )
         self.h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
         self.c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
 
@@ -68,13 +70,8 @@ class SingleModalityGWM(nn.Module):
             batch_first=True,
             dropout=self.dropout if dynamics_layers > 1 else 0.0,
         )
-        self.target_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
-        self.decoder = ConvTransEDecoder(
-            embedding_dim=self.fusion_dim,
-            dropout=self.dropout,
-            channels=int(getattr(config, 'convtranse_channels', 50)),
-            kernel_size=int(getattr(config, 'convtranse_kernel_size', 3)),
-        )
+        self.output_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
+        self.temperature = float(getattr(config, 'temperature', 0.07))
 
     def reset_gate_stats(self):
         pass
@@ -85,24 +82,37 @@ class SingleModalityGWM(nn.Module):
     def _prepare_context_batch(self, context_batch):
         context_entity_ids = context_batch['id']
         context_relation_ids = context_batch.get('rel_id')
+        context_direction_ids = context_batch.get('direction_id')
         context_batch_index = context_batch.get('batch_index')
-        if context_relation_ids is None or context_batch_index is None:
+        if (
+            context_relation_ids is None
+            or context_direction_ids is None
+            or context_batch_index is None
+        ):
             raise ValueError(
-                "context_batch requires 'id', 'rel_id', and 'batch_index'."
+                "context_batch requires 'id', 'rel_id', 'direction_id', "
+                "and 'batch_index'."
             )
         if (
             context_entity_ids.dim() != 1
             or context_relation_ids.dim() != 1
+            or context_direction_ids.dim() != 1
             or context_batch_index.dim() != 1
         ):
             raise ValueError("Ragged context tensors must all be one-dimensional.")
         if not (
             context_entity_ids.numel()
             == context_relation_ids.numel()
+            == context_direction_ids.numel()
             == context_batch_index.numel()
         ):
             raise ValueError("Ragged context tensors must have equal lengths.")
-        return context_entity_ids, context_relation_ids, context_batch_index
+        return (
+            context_entity_ids,
+            context_relation_ids,
+            context_direction_ids,
+            context_batch_index,
+        )
 
     def _encode_entities(self, entity_ids):
         features = self.adapter(self.ent_embs(entity_ids))
@@ -130,20 +140,28 @@ class SingleModalityGWM(nn.Module):
         h_emb = self._encode_entities(h_batch['id'])
         r_emb = self._encode_relations(r_batch['id'])
 
-        flat_context_entity_ids, flat_context_relation_ids, context_batch_index = (
+        (
+            flat_context_entity_ids,
+            flat_context_relation_ids,
+            context_direction_ids,
+            context_batch_index,
+        ) = (
             self._prepare_context_batch(context_batch)
         )
         ctx_ent = self._encode_entities(flat_context_entity_ids)
         ctx_rel = self._encode_relations(flat_context_relation_ids)
 
-        world_state = self.context_aggregator(
+        world_state = self.world_state_encoder(
             head_feat=h_emb,
             nbr_entity_feat=ctx_ent,
             nbr_relation_feat=ctx_rel,
+            nbr_direction=context_direction_ids,
             nbr_batch_index=context_batch_index,
         )
-        query = self._run_dynamics(world_state, h_emb, r_emb)
-        return query, r_emb
+        relation_action = self.world_state_encoder.update_relation(r_emb)
+        query = self._run_dynamics(world_state, h_emb, relation_action)
+        query = F.normalize(self.output_projection(query), p=2, dim=1)
+        return query, relation_action
 
     def forward(self, h_batch, r_batch, context_batch):
         query, _ = self.encode_query(h_batch, r_batch, context_batch)
@@ -151,22 +169,20 @@ class SingleModalityGWM(nn.Module):
 
     def encode_target(self, t_batch):
         target = self._encode_entities(t_batch['id'])
-        return F.normalize(self.target_projection(target), p=2, dim=1)
+        return F.normalize(self.output_projection(target), p=2, dim=1)
 
-    def compute_loss(self, scores, target_ids):
-        return full_entity_cross_entropy(scores, target_ids)
-
-    def score_candidates(
+    def compute_loss(
         self,
         query_vectors,
-        relation_vectors,
-        candidate_vectors,
+        target_vectors,
+        truth_mask=None,
     ):
-        return self.decoder(
-            query_vectors,
-            relation_vectors,
-            candidate_vectors,
-        )
+        scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
+        loss = filtered_in_batch_contrastive_loss(
+            scores,
+            truth_mask=truth_mask,
+        ).mean()
+        return loss, scores
 
     def score_all_entities(
         self,
@@ -175,7 +191,7 @@ class SingleModalityGWM(nn.Module):
         context_batch,
         candidate_vectors=None,
     ):
-        query_vectors, relation_vectors = self.encode_query(
+        query_vectors, _ = self.encode_query(
             h_batch,
             r_batch,
             context_batch,
@@ -188,12 +204,7 @@ class SingleModalityGWM(nn.Module):
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        scores = self.score_candidates(
-            query_vectors,
-            relation_vectors,
-            candidate_vectors,
-        )
-        return scores
+        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
 
 
 class TextOnlyGWM(SingleModalityGWM):

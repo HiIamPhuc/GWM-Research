@@ -87,7 +87,12 @@ class ContextProcessor:
         # Store fixed-width tensors with a sentinel mask value.
         context_entity_ids = torch.full((num_entities, max_k), pad_value, dtype=torch.long)
         context_relation_ids = torch.full((num_entities, max_k), pad_value, dtype=torch.long)
+        context_direction_ids = torch.zeros((num_entities, max_k), dtype=torch.long)
         context_mask = torch.zeros((num_entities, max_k), dtype=torch.bool)
+        relation_direction_lookup = torch.zeros(len(self.relation2id), dtype=torch.long)
+        for relation, relation_id in self.relation2id.items():
+            if relation.endswith('_inv'):
+                relation_direction_lookup[int(relation_id)] = 1
 
         for i in tqdm(range(num_entities), desc="Random context"):
             neighbors = adj.get(i, [])  # list[(r, t)]
@@ -112,6 +117,9 @@ class ContextProcessor:
             if count > 0:
                 context_entity_ids[i, :count] = selected_ent_ids[:count]
                 context_relation_ids[i, :count] = selected_rel_ids[:count]
+                context_direction_ids[i, :count] = relation_direction_lookup[
+                    selected_rel_ids[:count]
+                ]
                 context_mask[i, :count] = True
 
         # Save one compact artifact.
@@ -120,6 +128,7 @@ class ContextProcessor:
             {
                 'entity_ids': context_entity_ids,
                 'relation_ids': context_relation_ids,
+                'direction_ids': context_direction_ids,
                 'mask': context_mask,
                 'pad_value': pad_value,
                 'k_requested': limit,

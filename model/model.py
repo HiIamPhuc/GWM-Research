@@ -28,400 +28,47 @@ def filtered_in_batch_contrastive_loss(scores, truth_mask=None):
     return F.cross_entropy(filtered_scores, labels, reduction='none')
 
 
-class CompGCNWorldStateEncoder(nn.Module):
-    """One-layer, direction-aware CompGCN encoder for a query head state."""
-
-    OUTGOING = 0
-    INCOMING = 1
-
-    def __init__(self, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.hidden_dim = int(hidden_dim)
-        self.outgoing_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.incoming_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.self_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.relation_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.state_norm = nn.LayerNorm(hidden_dim)
-        self.relation_norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    @staticmethod
-    def _sum_by_batch(messages, batch_index, batch_size, reference):
-        aggregated = torch.zeros_like(reference)
-        if messages.numel() == 0:
-            return aggregated
-        aggregated.index_add_(0, batch_index, messages)
-        return aggregated
-
-    def update_relation(self, relation_feat):
-        """Transform relation/action states as in a CompGCN layer."""
-        transformed = self.relation_projection(relation_feat)
-        return self.relation_norm(relation_feat + self.dropout(transformed))
-
-    def forward(
-        self,
-        head_feat,
-        nbr_entity_feat,
-        nbr_relation_feat,
-        nbr_direction,
-        nbr_batch_index,
-    ):
-        if nbr_entity_feat.shape != nbr_relation_feat.shape:
-            raise ValueError("Context entity and relation features must have equal shapes.")
-        edge_count = nbr_entity_feat.size(0)
-        if nbr_direction.dim() != 1 or nbr_batch_index.dim() != 1:
-            raise ValueError("Context direction and batch indices must be one-dimensional.")
-        if nbr_direction.numel() != edge_count or nbr_batch_index.numel() != edge_count:
-            raise ValueError("Each context fact requires a direction and batch index.")
-        if edge_count and (
-            nbr_batch_index.min() < 0
-            or nbr_batch_index.max() >= head_feat.size(0)
-        ):
-            raise ValueError("Context batch index is outside the current batch.")
-        if edge_count and not torch.all((nbr_direction == 0) | (nbr_direction == 1)):
-            raise ValueError("Context direction IDs must be 0 (outgoing) or 1 (incoming).")
-
-        composed_facts = nbr_entity_feat * nbr_relation_feat
-        outgoing_mask = nbr_direction == self.OUTGOING
-        incoming_mask = nbr_direction == self.INCOMING
-        outgoing_sum = self._sum_by_batch(
-            composed_facts[outgoing_mask],
-            nbr_batch_index[outgoing_mask],
-            head_feat.size(0),
-            head_feat,
-        )
-        incoming_sum = self._sum_by_batch(
-            composed_facts[incoming_mask],
-            nbr_batch_index[incoming_mask],
-            head_feat.size(0),
-            head_feat,
-        )
-
-        counts = torch.zeros(
-            head_feat.size(0),
-            1,
-            device=head_feat.device,
-            dtype=head_feat.dtype,
-        )
-        if edge_count:
-            counts.index_add_(
-                0,
-                nbr_batch_index,
-                torch.ones(edge_count, 1, device=head_feat.device, dtype=head_feat.dtype),
-            )
-
-        neighbor_update = (
-            self.outgoing_projection(outgoing_sum)
-            + self.incoming_projection(incoming_sum)
-        ) / counts.clamp_min(1.0)
-        compgcn_update = F.gelu(self.self_projection(head_feat) + neighbor_update)
-        return self.state_norm(head_feat + self.dropout(compgcn_update))
-
-
-class MLPAdapter(nn.Module):
-    def __init__(self, in_dim, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.norm = nn.LayerNorm(in_dim)
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, in_dim)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return residual + x
-
-
-class GatedFusion(nn.Module):
-    """Project two modalities into one space and combine them feature-wise."""
-
-    def __init__(self, text_dim, struct_dim, fusion_dim, dropout=0.0):
-        super().__init__()
-        self.text_projection = nn.Linear(text_dim, fusion_dim)
-        self.struct_projection = nn.Linear(struct_dim, fusion_dim)
-        self.gate = nn.Sequential(
-            nn.LayerNorm(fusion_dim * 2),
-            nn.Linear(fusion_dim * 2, fusion_dim),
-            nn.Sigmoid(),
-        )
-        self.output_norm = nn.LayerNorm(fusion_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, text_features, struct_features):
-        text_projected = self.text_projection(text_features)
-        struct_projected = self.struct_projection(struct_features)
-        gate = self.gate(torch.cat([text_projected, struct_projected], dim=-1))
-        fused = gate * text_projected + (1.0 - gate) * struct_projected
-        fused = self.dropout(fused)
-        return self.output_norm(fused), gate
-
-
 class GWM(nn.Module):
+    """Basic structural baseline: [head, relation] -> LSTM -> tail retrieval."""
+
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.dropout = float(getattr(config, 'dropout'))
-        self.adapter_dropout = float(getattr(config, 'adapter_dropout', self.dropout))
+        self.embedding_dim = int(getattr(config, 'struct_emb_dim'))
+        self.temperature = float(getattr(config, 'temperature', 0.07))
 
-        # 1. Text Components (Entity/Relation Embeddings)
-        self.text_emb_dim = int(getattr(config, 'text_emb_dim'))
-        self.text_ent_embs = nn.Embedding(config.num_entities, self.text_emb_dim)
-        self.text_rel_embs = nn.Embedding(config.num_relations, self.text_emb_dim)
-
-        self.text_adapter = MLPAdapter(
-            self.text_emb_dim,
-            int(getattr(config, 'text_adapter_dim')),
-            dropout=self.adapter_dropout,
+        self.struct_ent_embs = nn.Embedding(
+            int(config.num_entities),
+            self.embedding_dim,
         )
-
-        # 2. Structural Components (Entity/Relation Embeddings)
-        self.struct_emb_dim = int(getattr(config, 'struct_emb_dim'))
-        self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
-        self.struct_rel_embs = nn.Embedding(config.num_relations, self.struct_emb_dim)
-
-        self.struct_adapter = MLPAdapter(
-            self.struct_emb_dim, 
-            int(getattr(config, 'struct_adapter_dim')),
-            dropout=self.adapter_dropout,
+        self.struct_rel_embs = nn.Embedding(
+            int(config.num_relations),
+            self.embedding_dim,
         )
-
-        # 3. Early Fusion and Shared Dynamics
-        self.fusion_dim = int(getattr(config, 'fusion_dim'))
-        self.entity_fusion = GatedFusion(
-            self.text_emb_dim,
-            self.struct_emb_dim,
-            self.fusion_dim,
-            dropout=self.dropout,
-        )
-        self.relation_fusion = GatedFusion(
-            self.text_emb_dim,
-            self.struct_emb_dim,
-            self.fusion_dim,
-            dropout=self.dropout,
-        )
-
-        self.world_state_encoder = CompGCNWorldStateEncoder(
-            hidden_dim=self.fusion_dim,
-            dropout=self.dropout,
-        )
-        self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
-        self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
 
         dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
-        self.fused_lstm = nn.LSTM(
-            input_size=self.fusion_dim,
-            hidden_size=self.fusion_dim,
+        self.lstm = nn.LSTM(
+            input_size=self.embedding_dim,
+            hidden_size=self.embedding_dim,
             num_layers=dynamics_layers,
             batch_first=True,
-            dropout=self.dropout if dynamics_layers > 1 else 0.0,
-        )
-        self.fused_output_projection = nn.Linear(
-            self.fusion_dim,
-            self.fusion_dim,
-        )
-        self.temperature = float(getattr(config, 'temperature', 0.07))
-        self._last_gate_stats = {}
-
-    def reset_gate_stats(self):
-        self._last_gate_stats = {}
-
-    def _record_gate_stats(self, name, gate):
-        if gate.numel() == 0:
-            return
-
-        self._last_gate_stats[name] = gate.detach().float().mean().item()
-
-    def pop_gate_stats(self):
-        stats = dict(self._last_gate_stats)
-        self.reset_gate_stats()
-        return stats
-        
-    def _prepare_context_batch(self, context_batch):
-        context_entity_ids = context_batch['id']
-        context_relation_ids = context_batch.get('rel_id')
-        context_direction_ids = context_batch.get('direction_id')
-        context_batch_index = context_batch.get('batch_index')
-        if (
-            context_relation_ids is None
-            or context_direction_ids is None
-            or context_batch_index is None
-        ):
-            raise ValueError(
-                "context_batch requires 'id', 'rel_id', 'direction_id', "
-                "and 'batch_index'."
-            )
-        if (
-            context_entity_ids.dim() != 1
-            or context_relation_ids.dim() != 1
-            or context_direction_ids.dim() != 1
-            or context_batch_index.dim() != 1
-        ):
-            raise ValueError("Ragged context tensors must all be one-dimensional.")
-        if not (
-            context_entity_ids.numel()
-            == context_relation_ids.numel()
-            == context_direction_ids.numel()
-            == context_batch_index.numel()
-        ):
-            raise ValueError("Ragged context tensors must have equal lengths.")
-        return (
-            context_entity_ids,
-            context_relation_ids,
-            context_direction_ids,
-            context_batch_index,
         )
 
-    def _run_dynamics(self, world_state, head_emb, relation_emb, lstm, h0_proj, c0_proj):
-        """
-        Run recurrent dynamics over a sequence of steps.
+    def encode_query(self, h_batch, r_batch):
+        head = self.struct_ent_embs(h_batch['id'])
+        relation = self.struct_rel_embs(r_batch['id'])
+        sequence = torch.stack([head, relation], dim=1)
+        _, (hidden, _) = self.lstm(sequence)
+        return F.normalize(hidden[-1], p=2, dim=-1)
 
-        world_state: (B, fusion_dim) used to initialise h0/c0
-        head_emb: (B, D) head embedding for this path
-        relation_emb: (B, D_rel) relation embedding for this path
-        """
-        h_0 = torch.tanh(h0_proj(world_state))
-        c_0 = torch.tanh(c0_proj(world_state))
-
-        # Prepare initial LSTM states
-        num_layers = lstm.num_layers
-        h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
-        c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
-
-        # Run LSTM over the sequence
-        _, (h_n, _) = lstm(torch.stack([head_emb, relation_emb], dim=1), (h_0_lstm, c_0_lstm))
-        query_vector = h_n[-1]
-        return query_vector
-
-    def _load_text_embedding_tensor(self, source, expected_rows, expected_dim, name):
-        if isinstance(source, str):
-            loaded = torch.load(source, map_location='cpu')
-        elif torch.is_tensor(source):
-            loaded = source.detach().cpu()
-        else:
-            raise TypeError(f"Unsupported {name} cache source: {type(source)}")
-
-        if isinstance(loaded, dict):
-            if 'embeddings' in loaded:
-                loaded = loaded['embeddings']
-            elif 'tensor' in loaded:
-                loaded = loaded['tensor']
-            else:
-                raise ValueError(f"{name} cache dict must contain 'embeddings' or 'tensor'.")
-
-        if not torch.is_tensor(loaded):
-            raise TypeError(f"{name} cache must resolve to a torch.Tensor.")
-
-        loaded = loaded.float().contiguous()
-        if loaded.dim() != 2:
-            raise ValueError(f"{name} cache must be rank-2. Got shape {tuple(loaded.shape)}")
-        if loaded.size(0) != expected_rows:
-            raise ValueError(
-                f"{name} cache row count mismatch. Expected {expected_rows}, got {loaded.size(0)}"
-            )
-        if loaded.size(1) != expected_dim:
-            raise ValueError(
-                f"{name} cache dimension mismatch. Expected {expected_dim}, got {loaded.size(1)}"
-            )
-        return loaded      
-
-    def load_text_embeddings(self, entity_source, relation_source, freeze=True):
-        entity_cache = self._load_text_embedding_tensor(
-            source=entity_source,
-            expected_rows=self.text_ent_embs.num_embeddings,
-            expected_dim=self.text_emb_dim,
-            name='text_entity',
-        )
-        relation_cache = self._load_text_embedding_tensor(
-            source=relation_source,
-            expected_rows=self.text_rel_embs.num_embeddings,
-            expected_dim=self.text_emb_dim,
-            name='text_relation',
-        )
-
-        if entity_cache.size(1) != relation_cache.size(1):
-            raise ValueError(
-                "text_entity and text_relation embeddings must share the same embedding dimension. "
-                f"Got {entity_cache.size(1)} and {relation_cache.size(1)}"
-            )
-
-        self.text_ent_embs.weight.data.copy_(entity_cache)
-        self.text_rel_embs.weight.data.copy_(relation_cache)
-
-        if freeze:
-            self.text_ent_embs.weight.requires_grad = False
-            self.text_rel_embs.weight.requires_grad = False
-
-    def encode_query(self, h_batch, r_batch, context_batch):
-        self.reset_gate_stats()
-        h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
-        r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
-        h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
-        r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
-        h_fused, h_gate = self.entity_fusion(h_text, h_struct)
-        r_fused, r_gate = self.relation_fusion(r_text, r_struct)
-        self._record_gate_stats('entity_gate', h_gate)
-        self._record_gate_stats('relation_gate', r_gate)
-
-        (
-            flat_context_entity_ids,
-            flat_context_relation_ids,
-            context_direction_ids,
-            context_batch_index,
-        ) = self._prepare_context_batch(context_batch)
-        ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
-        ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
-        ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
-        ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
-        ctx_ent_fused, ctx_ent_gate = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
-        ctx_rel_fused, ctx_rel_gate = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
-        self._record_gate_stats('entity_gate', ctx_ent_gate)
-        self._record_gate_stats('relation_gate', ctx_rel_gate)
-
-        world_state = self.world_state_encoder(
-            head_feat=h_fused,
-            nbr_entity_feat=ctx_ent_fused,
-            nbr_relation_feat=ctx_rel_fused,
-            nbr_direction=context_direction_ids,
-            nbr_batch_index=context_batch_index,
-        )
-        relation_action = self.world_state_encoder.update_relation(r_fused)
-        query = self._run_dynamics(
-            world_state,
-            h_fused,
-            relation_action,
-            self.fused_lstm,
-            self.fused_h0_projection,
-            self.fused_c0_projection,
-        )
-        query = F.normalize(self.fused_output_projection(query), p=2, dim=1)
-        return query, relation_action
-
-    def forward(self, h_batch, r_batch, context_batch):
-        query, _ = self.encode_query(h_batch, r_batch, context_batch)
-        return query
+    def forward(self, h_batch, r_batch):
+        return self.encode_query(h_batch, r_batch)
 
     def encode_target(self, t_batch):
-        t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
-        t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
-        t_fused, t_gate = self.entity_fusion(t_text, t_struct)
-        self._record_gate_stats('entity_gate', t_gate)
-        return F.normalize(
-            self.fused_output_projection(t_fused),
-            p=2,
-            dim=1,
-        )
+        target = self.struct_ent_embs(t_batch['id'])
+        return F.normalize(target, p=2, dim=-1)
 
-    def compute_loss(
-        self,
-        query_vectors,
-        target_vectors,
-        truth_mask=None,
-    ):
+    def compute_loss(self, query_vectors, target_vectors, truth_mask=None):
         scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
         loss = filtered_in_batch_contrastive_loss(
             scores,
@@ -433,14 +80,9 @@ class GWM(nn.Module):
         self,
         h_batch,
         r_batch,
-        context_batch,
         candidate_vectors=None,
     ):
-        query_vectors, _ = self.encode_query(
-            h_batch,
-            r_batch,
-            context_batch,
-        )
+        query_vectors = self.encode_query(h_batch, r_batch)
         if candidate_vectors is None:
             entity_ids = torch.arange(
                 int(self.config.num_entities),

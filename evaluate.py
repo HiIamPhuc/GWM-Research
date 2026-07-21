@@ -10,7 +10,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.dataset import GWMDataset, CollateFN
-from studies.ablation_models import build_model
+from model.model import GWM
 from utils.eval import (
     build_bidirectional_hr_map_for_filtering,
     build_entity_loader,
@@ -49,7 +49,7 @@ def evaluate(args):
     with open(os.path.join(config.data_dir, 'relation2id.json')) as f:
         config.num_relations = len(json.load(f))
 
-    model = build_model(config).to(device)
+    model = GWM(config).to(device)
     
     # Load Checkpoint
     checkpoint_path = os.path.join(config.output_dir, 'best_checkpoint.pt')

@@ -1,15 +1,7 @@
-# Config for context-aware GWM with frozen text and trainable structural embeddings
-text_emb_dim: 768
+# Structural head-relation LSTM baseline
 struct_emb_dim: 384
-fusion_dim: 1024
-
-text_adapter_dim: 768
-struct_adapter_dim: 384
-
-dynamics_layers: 2
-
-adapter_dropout: 0.1
-dropout: 0.2
+dynamics_layers: 1
+temperature: 0.07
 
 learning_rate: 5e-4
 weight_decay: 0.0001
@@ -24,17 +16,11 @@ batch_size: 2048
 eval_batch_size: 2048
 candidate_batch_size: 2048
 
-temperature: 0.07
-
 data_dir: data-processed/wn18rr
-output_dir: output/wn18rr
-
+output_dir: output/wn18rr-basic-lstm
 add_inverse: true
-context_k: 5
-
-device: cuda
 seed: 42
 
 save_eval_predictions: true
 eval_topk: 10
-eval_predictions_dir: output/wn18rr/predictions
+eval_predictions_dir: output/wn18rr-basic-lstm/predictions

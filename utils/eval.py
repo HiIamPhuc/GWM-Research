@@ -23,16 +23,10 @@ class EntityDataset(Dataset):
 
 class TensorTripleDataset(Dataset):
     def __init__(self, base_dataset, triples):
-        self.base_dataset = base_dataset
         self.data_dir = base_dataset.data_dir
         self.split = base_dataset.split
         self.num_entities = base_dataset.num_entities
         self.num_relations = base_dataset.num_relations
-        self.context_entity_ids = base_dataset.context_entity_ids
-        self.context_relation_ids = base_dataset.context_relation_ids
-        self.context_direction_ids = base_dataset.context_direction_ids
-        self.context_mask = base_dataset.context_mask
-        self.context_pad_value = base_dataset.context_pad_value
         self.triples = torch.as_tensor(triples, dtype=torch.long)
 
     def __len__(self):
@@ -40,27 +34,10 @@ class TensorTripleDataset(Dataset):
 
     def __getitem__(self, idx):
         h, r, t = self.triples[idx]
-        h_idx = int(h.item())
-
-        ctx_entity_ids = self.context_entity_ids[h_idx]
-        ctx_relation_ids = self.context_relation_ids[h_idx]
-        ctx_direction_ids = self.context_direction_ids[h_idx]
-        ctx_mask = self.context_mask[h_idx].clone()
-
-        target_edge = (
-            ctx_entity_ids.eq(int(t.item()))
-            & ctx_relation_ids.eq(int(r.item()))
-        )
-        ctx_mask &= ~target_edge
-
         return {
             'h_id': h.long(),
             'r_id': r.long(),
             't_id': t.long(),
-            'context_entity_ids': ctx_entity_ids.long(),
-            'context_relation_ids': ctx_relation_ids.long(),
-            'context_direction_ids': ctx_direction_ids.long(),
-            'context_mask': ctx_mask.bool(),
         }
 
 
@@ -354,7 +331,6 @@ def compute_filtered_ranking_metrics(
         for batch in tqdm(data_loader, desc=desc):
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
-            context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             t_ids = batch['t_batch']['id'].to(device)
             h_ids_tensor = batch['h_batch']['id']
@@ -365,7 +341,6 @@ def compute_filtered_ranking_metrics(
             scores = model.score_all_entities(
                 h_batch,
                 r_batch,
-                context_batch,
                 candidate_vectors=all_entity_embeddings,
             )
 

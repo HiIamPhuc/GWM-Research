@@ -14,7 +14,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
-from studies.ablation_models import build_model
+from model.model import GWM
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 from utils.eval import (
     build_bidirectional_hr_map_for_filtering,
@@ -61,22 +61,6 @@ def _get_model_parameter_info(model):
     }
 
 
-def _update_metric_sums(sums, counts, values):
-    for key, value in values.items():
-        if value is None:
-            continue
-        sums[key] = sums.get(key, 0.0) + float(value)
-        counts[key] = counts.get(key, 0) + 1
-
-
-def _average_metric_sums(sums, counts, prefix=''):
-    return {
-        f'{prefix}{key}': sums[key] / counts[key]
-        for key in sorted(sums)
-        if counts.get(key, 0) > 0
-    }
-
-
 def save_training_config(config, output_dir, args=None, model=None):
     """Persist the effective training config used for this run."""
     config_dict = {k: _to_serializable(v) for k, v in vars(config).items()}
@@ -116,7 +100,7 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'dual_view_compgcn_world_state_lstm_dot',
+            'architecture': 'structural_head_relation_lstm_dot',
             'training_objective': getattr(
                 model.config,
                 'training_objective',
@@ -167,7 +151,7 @@ def train(args):
     
     # Init Model
     print("Initializing model...")
-    model = build_model(config).to(device)
+    model = GWM(config).to(device)
     config.training_objective = 'single_positive_filtered_in_batch'
 
     # Collater
@@ -185,23 +169,7 @@ def train(args):
         worker_init_fn=make_worker_init_fn(seed),
     )
 
-    if getattr(model, 'requires_text_embeddings', True):
-        entity_emb_path = os.path.join(config.data_dir, 'entity_text_embeddings.pt')
-        relation_emb_path = os.path.join(config.data_dir, 'relation_text_embeddings.pt')
-        if not os.path.exists(entity_emb_path) or not os.path.exists(relation_emb_path):
-            raise FileNotFoundError(
-                "Missing precomputed text embedding cache files. "
-                "Expected entity_text_embeddings.pt and relation_text_embeddings.pt in data_dir."
-            )
-
-        model.load_text_embeddings(
-            entity_source=entity_emb_path,
-            relation_source=relation_emb_path,
-            freeze=True,
-        )
-        print("Loaded text embeddings into text embedding tables...")
-    else:
-        print("Skipping precomputed text embeddings for structure-only ablation.")
+    print("Using trainable structural entity and relation embeddings.")
     
     # Save effective config (including inferred dimensions, CLI overrides, and model params).
     save_training_config(config, config.output_dir, args=args, model=model)
@@ -288,12 +256,6 @@ def train(args):
         _sync_device(device)
         model.train()
         total_loss = 0
-        total_filtered_truth_count = 0
-        total_query_rows = 0
-        filtered_query_rows = 0
-        gate_stat_sums = {}
-        gate_stat_counts = {}
-        
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
         for batch in pbar:
             truth_mask = train_truth_index.build_in_batch_truth_mask(
@@ -307,19 +269,16 @@ def train(args):
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
             t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
-            context_batch = {k: v.to(device) for k, v in batch['context_batch'].items()}
 
             optimizer.zero_grad()
 
-            query_vectors = model(h_batch, r_batch, context_batch)
+            query_vectors = model(h_batch, r_batch)
             target_vectors = model.encode_target(t_batch)
             loss, _ = model.compute_loss(
                 query_vectors,
                 target_vectors,
                 truth_mask=truth_mask,
             )
-            gate_stats = model.pop_gate_stats()
-
             if not torch.isfinite(loss):
                 print("Warning: non-finite loss detected; skipping batch to avoid corrupting model weights.")
                 optimizer.zero_grad(set_to_none=True)
@@ -331,18 +290,12 @@ def train(args):
             scheduler.step()
 
             total_loss += loss.item()
-            _update_metric_sums(gate_stat_sums, gate_stat_counts, gate_stats)
             pbar.set_postfix({'loss': loss.item()})
 
         _sync_device(device)
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
-        avg_gate_stats = _average_metric_sums(
-            gate_stat_sums,
-            gate_stat_counts,
-            prefix='train_',
-        )
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
@@ -399,7 +352,6 @@ def train(args):
                 'val_forward_mrr': directional_val_metrics['forward']['MRR'],
                 'val_backward_mrr': directional_val_metrics['backward']['MRR'],
             }
-            epoch_log.update(avg_gate_stats)
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                 json.dump(history, f, indent=2)
@@ -431,7 +383,6 @@ def train(args):
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
             }
-            epoch_log.update(avg_gate_stats)
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                   json.dump(history, f, indent=2)

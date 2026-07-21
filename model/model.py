@@ -29,7 +29,7 @@ def filtered_in_batch_contrastive_loss(scores, truth_mask=None):
 
 
 class GWM(nn.Module):
-    """Basic structural baseline: [head, relation] -> LSTM -> tail retrieval."""
+    """Structural LSTM initialized by a mean-composed local graph state."""
 
     def __init__(self, config):
         super().__init__()
@@ -54,15 +54,70 @@ class GWM(nn.Module):
             batch_first=True,
         )
 
-    def encode_query(self, h_batch, r_batch):
+    def _mean_context_state(self, context_batch, batch_size):
+        context_entity_ids = context_batch['id']
+        context_relation_ids = context_batch['rel_id']
+        context_batch_index = context_batch['batch_index']
+
+        if not (
+            context_entity_ids.dim()
+            == context_relation_ids.dim()
+            == context_batch_index.dim()
+            == 1
+        ):
+            raise ValueError("Ragged context tensors must be one-dimensional.")
+        if not (
+            context_entity_ids.numel()
+            == context_relation_ids.numel()
+            == context_batch_index.numel()
+        ):
+            raise ValueError("Ragged context tensors must have equal lengths.")
+        if context_batch_index.numel() and (
+            context_batch_index.min() < 0
+            or context_batch_index.max() >= batch_size
+        ):
+            raise ValueError("Context batch index is outside the current batch.")
+
+        state = self.struct_ent_embs.weight.new_zeros(
+            batch_size,
+            self.embedding_dim,
+        )
+        counts = self.struct_ent_embs.weight.new_zeros(batch_size, 1)
+        if context_entity_ids.numel() == 0:
+            return state
+
+        context_entities = self.struct_ent_embs(context_entity_ids)
+        context_relations = self.struct_rel_embs(context_relation_ids)
+        composed_facts = context_entities * context_relations
+        state.index_add_(0, context_batch_index, composed_facts)
+        counts.index_add_(
+            0,
+            context_batch_index,
+            counts.new_ones(context_batch_index.numel(), 1),
+        )
+        return state / counts.clamp_min(1.0)
+
+    def encode_query(self, h_batch, r_batch, context_batch):
         head = self.struct_ent_embs(h_batch['id'])
         relation = self.struct_rel_embs(r_batch['id'])
+        world_state = self._mean_context_state(
+            context_batch,
+            batch_size=head.size(0),
+        )
+        initial_state = world_state.unsqueeze(0).expand(
+            self.lstm.num_layers,
+            -1,
+            -1,
+        ).contiguous()
         sequence = torch.stack([head, relation], dim=1)
-        _, (hidden, _) = self.lstm(sequence)
+        _, (hidden, _) = self.lstm(
+            sequence,
+            (initial_state, initial_state.clone()),
+        )
         return F.normalize(hidden[-1], p=2, dim=-1)
 
-    def forward(self, h_batch, r_batch):
-        return self.encode_query(h_batch, r_batch)
+    def forward(self, h_batch, r_batch, context_batch):
+        return self.encode_query(h_batch, r_batch, context_batch)
 
     def encode_target(self, t_batch):
         target = self.struct_ent_embs(t_batch['id'])
@@ -80,9 +135,10 @@ class GWM(nn.Module):
         self,
         h_batch,
         r_batch,
+        context_batch,
         candidate_vectors=None,
     ):
-        query_vectors = self.encode_query(h_batch, r_batch)
+        query_vectors = self.encode_query(h_batch, r_batch, context_batch)
         if candidate_vectors is None:
             entity_ids = torch.arange(
                 int(self.config.num_entities),

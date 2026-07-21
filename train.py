@@ -100,7 +100,7 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'structural_head_relation_lstm_dot',
+            'architecture': 'structural_mean_context_head_relation_lstm_dot',
             'training_objective': getattr(
                 model.config,
                 'training_objective',
@@ -137,6 +137,13 @@ def train(args):
     train_dataset = GWMDataset(config.data_dir, split='train')
     train_truth_index = TrainTruthIndex(train_dataset.triples)
     print(f"Loaded {len(train_dataset)} training triples.")
+    config.context_k_requested = train_dataset.context_k_requested
+    config.context_k_effective = train_dataset.context_k_effective
+    print(
+        "Using precomputed mean context "
+        f"(k_requested={config.context_k_requested}, "
+        f"k_effective={config.context_k_effective})."
+    )
     
     # Infer input dimensions from dataset
     # e.g., number of entities/relations for embedding layers
@@ -269,10 +276,13 @@ def train(args):
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
             t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
+            context_batch = {
+                k: v.to(device) for k, v in batch['context_batch'].items()
+            }
 
             optimizer.zero_grad()
 
-            query_vectors = model(h_batch, r_batch)
+            query_vectors = model(h_batch, r_batch, context_batch)
             target_vectors = model.encode_target(t_batch)
             loss, _ = model.compute_loss(
                 query_vectors,

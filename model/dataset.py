@@ -55,7 +55,7 @@ class TrainTruthIndex:
 
 
 class GWMDataset(Dataset):
-    """ID-only knowledge graph triples for the structural LSTM baseline."""
+    """Knowledge graph triples with fixed relation-aware head context."""
 
     def __init__(self, data_dir, split='train'):
         self.data_dir = data_dir
@@ -78,24 +78,138 @@ class GWMDataset(Dataset):
                 f"Expected triples with shape (N, 3), got {tuple(self.triples.shape)}"
             )
 
+        context_path = os.path.join(data_dir, 'context_neighbors.pt')
+        if not os.path.exists(context_path):
+            raise FileNotFoundError(
+                f"Context tensor not found: {context_path}. "
+                "Run utils/compute_context.py first."
+            )
+
+        context = torch.load(context_path, map_location='cpu')
+        self.context_entity_ids = context['entity_ids'].long()
+        self.context_relation_ids = context['relation_ids'].long()
+        self.context_mask = context['mask'].bool()
+        self.context_k_requested = int(context.get('k_requested', -1))
+        self.context_k_effective = int(
+            context.get('k_effective', self.context_entity_ids.size(1))
+        )
+
+        expected_shape = self.context_entity_ids.shape
+        if (
+            self.context_entity_ids.dim() != 2
+            or self.context_relation_ids.shape != expected_shape
+            or self.context_mask.shape != expected_shape
+        ):
+            raise ValueError(
+                "Context entity IDs, relation IDs, and mask must share "
+                "the same rank-2 shape."
+            )
+        if self.context_entity_ids.size(0) != self.num_entities:
+            raise ValueError(
+                "Context artifact row count must equal the entity vocabulary size."
+            )
+
+        valid_entities = self.context_entity_ids[self.context_mask]
+        valid_relations = self.context_relation_ids[self.context_mask]
+        if valid_entities.numel() and (
+            valid_entities.min() < 0
+            or valid_entities.max() >= self.num_entities
+        ):
+            raise ValueError("Context artifact contains invalid entity IDs.")
+        if valid_relations.numel() and (
+            valid_relations.min() < 0
+            or valid_relations.max() >= self.num_relations
+        ):
+            raise ValueError("Context artifact contains invalid relation IDs.")
+
     def __len__(self):
         return int(self.triples.size(0))
 
-    def __getitem__(self, idx):
-        h, r, t = self.triples[idx]
+    def make_item(self, h, r, t):
+        h = torch.as_tensor(h, dtype=torch.long)
+        r = torch.as_tensor(r, dtype=torch.long)
+        t = torch.as_tensor(t, dtype=torch.long)
+        h_idx = int(h.item())
+
+        context_entity_ids = self.context_entity_ids[h_idx]
+        context_relation_ids = self.context_relation_ids[h_idx]
+        context_mask = self.context_mask[h_idx].clone()
+
+        # A training query must never receive its answer edge as context.
+        answer_edge = (
+            context_entity_ids.eq(int(t.item()))
+            & context_relation_ids.eq(int(r.item()))
+        )
+        context_mask &= ~answer_edge
+
         return {
             'h_id': h.long(),
             'r_id': r.long(),
             't_id': t.long(),
+            'context_entity_ids': context_entity_ids.long(),
+            'context_relation_ids': context_relation_ids.long(),
+            'context_mask': context_mask,
         }
+
+    def __getitem__(self, idx):
+        return self.make_item(*self.triples[idx])
 
 
 class CollateFN:
-    """Collate structural IDs without text or graph-context features."""
+    """Collate triples and valid context edges into a ragged representation."""
 
     def __call__(self, batch):
+        context_entity_chunks = []
+        context_relation_chunks = []
+        context_batch_chunks = []
+
+        for sample_index, item in enumerate(batch):
+            entity_ids = item['context_entity_ids']
+            relation_ids = item['context_relation_ids']
+            mask = item['context_mask'].bool()
+            if not (
+                entity_ids.dim() == relation_ids.dim() == mask.dim() == 1
+            ):
+                raise ValueError("Each context row must be one-dimensional.")
+            if not (
+                entity_ids.numel() == relation_ids.numel() == mask.numel()
+            ):
+                raise ValueError("Context entity, relation, and mask lengths differ.")
+
+            valid_entities = entity_ids[mask]
+            valid_relations = relation_ids[mask]
+            valid = (valid_entities >= 0) & (valid_relations >= 0)
+            valid_entities = valid_entities[valid]
+            valid_relations = valid_relations[valid]
+            if valid_entities.numel() == 0:
+                continue
+
+            context_entity_chunks.append(valid_entities.long())
+            context_relation_chunks.append(valid_relations.long())
+            context_batch_chunks.append(
+                torch.full(
+                    (valid_entities.numel(),),
+                    sample_index,
+                    dtype=torch.long,
+                )
+            )
+
+        if context_entity_chunks:
+            context_entity_ids = torch.cat(context_entity_chunks)
+            context_relation_ids = torch.cat(context_relation_chunks)
+            context_batch_index = torch.cat(context_batch_chunks)
+        else:
+            context_entity_ids = torch.zeros(0, dtype=torch.long)
+            context_relation_ids = torch.zeros(0, dtype=torch.long)
+            context_batch_index = torch.zeros(0, dtype=torch.long)
+
         return {
             'h_batch': {'id': torch.stack([item['h_id'] for item in batch])},
             'r_batch': {'id': torch.stack([item['r_id'] for item in batch])},
             't_batch': {'id': torch.stack([item['t_id'] for item in batch])},
+            'context_batch': {
+                'id': context_entity_ids,
+                'rel_id': context_relation_ids,
+                'batch_index': context_batch_index,
+            },
         }

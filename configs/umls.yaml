@@ -1,4 +1,4 @@
-# Structural head-relation LSTM baseline
+# Structural LSTM with a precomputed mean-composed context state
 struct_emb_dim: 128
 dynamics_layers: 1
 temperature: 0.07
@@ -17,10 +17,10 @@ eval_batch_size: 512
 candidate_batch_size: 512
 
 data_dir: data-processed/umls
-output_dir: output/umls-basic-lstm
+output_dir: output/umls-mean-context
 add_inverse: true
 seed: 42
 
 save_eval_predictions: true
 eval_topk: 10
-eval_predictions_dir: output/umls-basic-lstm/predictions
+eval_predictions_dir: output/umls-mean-context/predictions

@@ -27,8 +27,16 @@ def make_config():
     )
 
 
+def make_context_batch():
+    return {
+        'id': torch.tensor([1, 2, 0]),
+        'rel_id': torch.tensor([0, 1, 2]),
+        'batch_index': torch.tensor([0, 0, 1]),
+    }
+
+
 class ModelTests(unittest.TestCase):
-    def test_model_contains_only_structural_embeddings_and_lstm(self):
+    def test_mean_context_adds_no_trainable_module(self):
         model = GWM(make_config())
         child_modules = set(dict(model.named_children()))
 
@@ -52,7 +60,7 @@ class ModelTests(unittest.TestCase):
         handle = model.lstm.register_forward_pre_hook(capture_input)
         h_ids = torch.tensor([0, 1])
         r_ids = torch.tensor([2, 3])
-        model({'id': h_ids}, {'id': r_ids})
+        model({'id': h_ids}, {'id': r_ids}, make_context_batch())
         handle.remove()
 
         expected = torch.stack(
@@ -61,11 +69,45 @@ class ModelTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(captured['sequence'], expected))
 
+    def test_mean_context_initializes_hidden_and_cell_states(self):
+        model = GWM(make_config())
+        with torch.no_grad():
+            model.struct_ent_embs.weight.zero_()
+            model.struct_rel_embs.weight.fill_(1.0)
+            model.struct_ent_embs.weight[1] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+            model.struct_ent_embs.weight[2] = torch.tensor([3.0, 4.0, 5.0, 6.0])
+
+        context_batch = {
+            'id': torch.tensor([1, 2]),
+            'rel_id': torch.tensor([0, 0]),
+            'batch_index': torch.tensor([0, 0]),
+        }
+        captured = {}
+
+        def capture_state(module, inputs):
+            captured['hidden'] = inputs[1][0].detach().clone()
+            captured['cell'] = inputs[1][1].detach().clone()
+
+        handle = model.lstm.register_forward_pre_hook(capture_state)
+        model(
+            {'id': torch.tensor([0, 3])},
+            {'id': torch.tensor([2, 3])},
+            context_batch,
+        )
+        handle.remove()
+
+        expected = torch.tensor(
+            [[[2.0, 3.0, 4.0, 5.0], [0.0, 0.0, 0.0, 0.0]]]
+        )
+        self.assertTrue(torch.equal(captured['hidden'], expected))
+        self.assertTrue(torch.equal(captured['cell'], expected))
+
     def test_query_target_loss_backpropagates(self):
         model = GWM(make_config())
         query = model(
             {'id': torch.tensor([0, 1])},
             {'id': torch.tensor([0, 1])},
+            make_context_batch(),
         )
         targets = model.encode_target({'id': torch.tensor([2, 3])})
         loss, scores = model.compute_loss(
@@ -93,6 +135,7 @@ class ModelTests(unittest.TestCase):
         scores = model.score_all_entities(
             {'id': torch.tensor([0, 1])},
             {'id': torch.tensor([0, 1])},
+            make_context_batch(),
         )
         self.assertEqual(scores.shape, (2, 4))
         self.assertTrue(torch.isfinite(scores).all())
@@ -126,22 +169,55 @@ class DatasetTests(unittest.TestCase):
             json.dumps({'r': 0, 'r_inv': 1}), encoding='utf-8'
         )
         torch.save(torch.tensor([[0, 0, 1]]), root / 'train_triples.pt')
+        torch.save(
+            {
+                'entity_ids': torch.tensor([[1, 2], [0, -1], [-1, -1]]),
+                'relation_ids': torch.tensor([[0, 0], [1, -1], [-1, -1]]),
+                'mask': torch.tensor(
+                    [[True, True], [True, False], [False, False]]
+                ),
+                'pad_value': -1,
+                'k_requested': 2,
+                'k_effective': 2,
+            },
+            root / 'context_neighbors.pt',
+        )
 
-    def test_dataset_does_not_require_context_or_text_artifacts(self):
+    def test_answer_edge_is_removed_from_training_context(self):
         with tempfile.TemporaryDirectory() as root:
             self._write_data(root)
             dataset = GWMDataset(root, split='train')
             item = dataset[0]
             batch = CollateFN()([item])
 
-            self.assertEqual(set(item), {'h_id', 'r_id', 't_id'})
+            self.assertEqual(
+                set(item),
+                {
+                    'h_id',
+                    'r_id',
+                    't_id',
+                    'context_entity_ids',
+                    'context_relation_ids',
+                    'context_mask',
+                },
+            )
             self.assertEqual(
                 set(batch),
-                {'h_batch', 'r_batch', 't_batch'},
+                {'h_batch', 'r_batch', 't_batch', 'context_batch'},
             )
             self.assertEqual(batch['h_batch']['id'].tolist(), [0])
             self.assertEqual(batch['r_batch']['id'].tolist(), [0])
             self.assertEqual(batch['t_batch']['id'].tolist(), [1])
+            self.assertEqual(batch['context_batch']['id'].tolist(), [2])
+            self.assertEqual(batch['context_batch']['rel_id'].tolist(), [0])
+            self.assertEqual(batch['context_batch']['batch_index'].tolist(), [0])
+
+    def test_dataset_requires_precomputed_context(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_data(root)
+            (Path(root) / 'context_neighbors.pt').unlink()
+            with self.assertRaises(FileNotFoundError):
+                GWMDataset(root, split='train')
 
     def test_train_truth_index_marks_all_known_in_batch_tails(self):
         index = TrainTruthIndex(
@@ -171,8 +247,16 @@ class DatasetTests(unittest.TestCase):
 
             self.assertEqual(forward_dataset.triples.tolist(), [[0, 0, 1]])
             self.assertEqual(backward_dataset.triples.tolist(), [[1, 1, 0]])
-            self.assertEqual(set(forward_dataset[0]), {'h_id', 'r_id', 't_id'})
-            self.assertEqual(set(backward_dataset[0]), {'h_id', 'r_id', 't_id'})
+            expected_keys = {
+                'h_id',
+                'r_id',
+                't_id',
+                'context_entity_ids',
+                'context_relation_ids',
+                'context_mask',
+            }
+            self.assertEqual(set(forward_dataset[0]), expected_keys)
+            self.assertEqual(set(backward_dataset[0]), expected_keys)
 
     def test_bidirectional_filter_map_adds_inverse_truths(self):
         with tempfile.TemporaryDirectory() as root:

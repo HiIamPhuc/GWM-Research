@@ -1,7 +1,7 @@
 """Model factory retained for study scripts.
 
-The current starting point has one architecture only: trainable structural
-embeddings followed by a two-step head-relation LSTM.
+The current experiment has one architecture only: trainable structural
+embeddings and mean-composed context followed by a two-step head-relation LSTM.
 """
 
 from model.model import GWM

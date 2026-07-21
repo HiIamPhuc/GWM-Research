@@ -23,6 +23,7 @@ class EntityDataset(Dataset):
 
 class TensorTripleDataset(Dataset):
     def __init__(self, base_dataset, triples):
+        self.base_dataset = base_dataset
         self.data_dir = base_dataset.data_dir
         self.split = base_dataset.split
         self.num_entities = base_dataset.num_entities
@@ -33,12 +34,7 @@ class TensorTripleDataset(Dataset):
         return int(self.triples.size(0))
 
     def __getitem__(self, idx):
-        h, r, t = self.triples[idx]
-        return {
-            'h_id': h.long(),
-            'r_id': r.long(),
-            't_id': t.long(),
-        }
+        return self.base_dataset.make_item(*self.triples[idx])
 
 
 def load_triples_for_filtering(data_dir, splits=None):
@@ -331,6 +327,9 @@ def compute_filtered_ranking_metrics(
         for batch in tqdm(data_loader, desc=desc):
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
+            context_batch = {
+                k: v.to(device) for k, v in batch['context_batch'].items()
+            }
 
             t_ids = batch['t_batch']['id'].to(device)
             h_ids_tensor = batch['h_batch']['id']
@@ -341,6 +340,7 @@ def compute_filtered_ranking_metrics(
             scores = model.score_all_entities(
                 h_batch,
                 r_batch,
+                context_batch,
                 candidate_vectors=all_entity_embeddings,
             )
 

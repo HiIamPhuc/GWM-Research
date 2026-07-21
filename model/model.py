@@ -1,146 +1,320 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
-
-try:
-    from peft import LoraConfig, get_peft_model
-except ImportError:
-    LoraConfig = None
-    get_peft_model = None
+import torch.nn.functional as F
+import math
 
 
-class CompGCNLayer(nn.Module):
-    """A lightweight CompGCN-style layer for head-centric aggregation."""
+def full_entity_cross_entropy(scores, target_ids):
+    if scores.dim() != 2:
+        raise ValueError("Full-entity scores must have shape (B, |E|).")
 
-    def __init__(self, hidden_dim, comp_op='sub'):
+    target_ids = torch.as_tensor(
+        target_ids,
+        dtype=torch.long,
+        device=scores.device,
+    ).reshape(-1)
+    if target_ids.numel() != scores.size(0):
+        raise ValueError("target_ids must contain one entity ID per score row.")
+    return F.cross_entropy(scores, target_ids)
+
+
+class ContextAggregator(nn.Module):
+    """Mean-pool relation-composed facts and retain the head residual."""
+
+    def __init__(self, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.comp_op = comp_op
-        self.lin_self = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.lin_msg = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.lin_out = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
 
-    def _compose(self, entity_feat, relation_feat):
-        if self.comp_op == 'sub':
-            return entity_feat - relation_feat
-        if self.comp_op == 'mult':
-            return entity_feat * relation_feat
-        raise ValueError(f"Unsupported compgcn_op: {self.comp_op}")
+    def _aggregate(self, messages, batch_index, batch_size, reference):
+        aggregated = torch.zeros_like(reference)
+        if messages.numel() == 0:
+            return aggregated
 
-    def forward(self, head_feat, nbr_entity_feat, nbr_relation_feat, nbr_batch_index):
-        B = head_feat.size(0)
-        composed = self._compose(nbr_entity_feat, nbr_relation_feat)
-        msg = self.lin_msg(composed)
+        aggregated.index_add_(0, batch_index, messages)
+        counts = torch.zeros(
+            batch_size,
+            1,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        counts.index_add_(
+            0,
+            batch_index,
+            torch.ones(
+                messages.size(0),
+                1,
+                device=reference.device,
+                dtype=reference.dtype,
+            ),
+        )
+        return aggregated / counts.clamp_min(1.0)
 
-        agg = torch.zeros_like(head_feat)
-        if msg.numel() > 0:
-            agg.index_add_(0, nbr_batch_index, msg)
+    def forward(
+        self,
+        head_feat,
+        nbr_entity_feat,
+        nbr_relation_feat,
+        nbr_batch_index,
+    ):
+        """
+        head_feat: (B, H)
+        nbr_entity_feat: (E, H)
+        nbr_relation_feat: (E, H)
+        nbr_batch_index: (E,) long, edge -> head index in batch
+        """
+        if nbr_entity_feat.shape != nbr_relation_feat.shape:
+            raise ValueError("Context entity and relation features must have equal shapes.")
+        if nbr_batch_index.numel() != nbr_entity_feat.size(0):
+            raise ValueError("Each context fact requires one batch index.")
 
-        denom = torch.zeros(B, 1, device=head_feat.device, dtype=head_feat.dtype)
-        if msg.numel() > 0:
-            ones = torch.ones(msg.size(0), 1, device=head_feat.device, dtype=head_feat.dtype)
-            denom.index_add_(0, nbr_batch_index, ones)
-        denom = denom.clamp(min=1.0)
-        agg = agg / denom
+        composed_facts = nbr_entity_feat * nbr_relation_feat
+        aggregated = self._aggregate(
+            composed_facts,
+            nbr_batch_index,
+            head_feat.size(0),
+            head_feat,
+        )
+        return self.norm(head_feat + aggregated)
 
-        return head_feat + self.lin_out(agg)
+
+class MLPAdapter(nn.Module):
+    def __init__(self, in_dim, hidden_dim, dropout=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, in_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return residual + x
+
+
+class GatedFusion(nn.Module):
+    """Project two modalities into one space and combine them feature-wise."""
+
+    def __init__(self, text_dim, struct_dim, fusion_dim, dropout=0.0):
+        super().__init__()
+        self.text_projection = nn.Linear(text_dim, fusion_dim)
+        self.struct_projection = nn.Linear(struct_dim, fusion_dim)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(fusion_dim * 2),
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.Sigmoid(),
+        )
+        self.output_norm = nn.LayerNorm(fusion_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, text_features, struct_features):
+        text_projected = self.text_projection(text_features)
+        struct_projected = self.struct_projection(struct_features)
+        gate = self.gate(torch.cat([text_projected, struct_projected], dim=-1))
+        fused = gate * text_projected + (1.0 - gate) * struct_projected
+        fused = self.dropout(fused)
+        return self.output_norm(fused), gate
+
+
+class ConvTransEDecoder(nn.Module):
+    """Decode a query/relation pair and score it against target vectors."""
+
+    def __init__(self, embedding_dim, dropout=0.0, channels=50, kernel_size=3):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        channels = int(channels)
+        kernel_size = int(kernel_size)
+        if self.embedding_dim <= 0:
+            raise ValueError("ConvTransE embedding_dim must be positive.")
+        if channels <= 0:
+            raise ValueError("ConvTransE channels must be positive.")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("ConvTransE kernel_size must be a positive odd integer.")
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.bn0 = nn.BatchNorm1d(2)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.bn2 = nn.BatchNorm1d(self.embedding_dim)
+        self.conv = nn.Conv1d(
+            2,
+            channels,
+            kernel_size,
+            stride=1,
+            padding=int(math.floor(kernel_size / 2)),
+        )
+        self.fc = nn.Linear(self.embedding_dim * channels, self.embedding_dim)
+
+    def decode_query(self, query_vectors, relation_vectors):
+        if query_vectors.dim() != 2 or relation_vectors.dim() != 2:
+            raise ValueError("ConvTransE query and relation vectors must be rank-2.")
+        if query_vectors.shape != relation_vectors.shape:
+            raise ValueError("ConvTransE query and relation vectors must have equal shapes.")
+        if query_vectors.size(1) != self.embedding_dim:
+            raise ValueError(
+                f"ConvTransE expected width {self.embedding_dim}, "
+                f"got {query_vectors.size(1)}."
+            )
+
+        batch_size = query_vectors.size(0)
+        stacked_inputs = torch.stack([query_vectors, relation_vectors], dim=1)
+        x = self.bn0(stacked_inputs)
+        x = self.dropout1(x)
+        x = self.conv(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = x.reshape(batch_size, -1)
+        x = self.fc(x)
+        x = self.dropout3(x)
+        if not self.training or batch_size > 1:
+            x = self.bn2(x)
+        return F.relu(x)
+
+    def forward(self, query_vectors, relation_vectors, candidate_vectors):
+        if candidate_vectors.dim() != 2:
+            raise ValueError("ConvTransE candidate vectors must be rank-2.")
+        if candidate_vectors.size(1) != self.embedding_dim:
+            raise ValueError(
+                f"ConvTransE expected candidate width {self.embedding_dim}, "
+                f"got {candidate_vectors.size(1)}."
+            )
+        decoded_query = self.decode_query(query_vectors, relation_vectors)
+        return torch.mm(decoded_query, torch.tanh(candidate_vectors).t())
 
 
 class GWM(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.dropout = float(getattr(config, 'dropout'))
+        self.adapter_dropout = float(getattr(config, 'adapter_dropout', self.dropout))
 
-        pretrained_model = getattr(config, 'pretrained_model', 'bert-base-uncased')
-        self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
+        # 1. Text Components (Entity/Relation Embeddings)
+        self.text_emb_dim = int(getattr(config, 'text_emb_dim'))
+        self.text_ent_embs = nn.Embedding(config.num_entities, self.text_emb_dim)
+        self.text_rel_embs = nn.Embedding(config.num_relations, self.text_emb_dim)
 
-        self.text_encoder = AutoModel.from_pretrained(pretrained_model)
-        self._maybe_enable_lora()
-        self.text_embedding_dim = self.text_encoder.config.hidden_size
-
-        self.structural_dim = int(getattr(config, 'structural_dim'))
-        self.entity_embeddings = nn.Embedding(config.num_entities, self.structural_dim)
-        self.relation_embeddings = nn.Embedding(config.num_relations, self.structural_dim)
-
-        self.text_compgcn_dim = int(
-            getattr(config, 'text_compgcn_dim', getattr(config, 'compgcn_dim', self.text_embedding_dim))
-        )
-        self.struct_compgcn_dim = int(
-            getattr(config, 'struct_compgcn_dim', getattr(config, 'compgcn_dim', self.structural_dim))
-        )
-        self.text_dynamics_dim = int(
-            getattr(config, 'text_dynamics_dim', getattr(config, 'dynamics_dim', self.text_compgcn_dim))
-        )
-        self.struct_dynamics_dim = int(
-            getattr(config, 'struct_dynamics_dim', getattr(config, 'dynamics_dim', self.struct_compgcn_dim))
+        self.text_adapter = MLPAdapter(
+            self.text_emb_dim,
+            int(getattr(config, 'text_adapter_dim')),
+            dropout=self.adapter_dropout,
         )
 
-        self.dropout_rate = float(getattr(config, 'dropout', 0.0))
-        self.recurrent_dropout = float(getattr(config, 'recurrent_dropout', 0.0))
-        self.input_dropout = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
+        # 2. Structural Components (Entity/Relation Embeddings)
+        self.struct_emb_dim = int(getattr(config, 'struct_emb_dim'))
+        self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
+        self.struct_rel_embs = nn.Embedding(config.num_relations, self.struct_emb_dim)
 
-        self.alpha_mlp = nn.Sequential(
-            nn.Linear(self.text_dynamics_dim + self.struct_dynamics_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid(),
+        self.struct_adapter = MLPAdapter(
+            self.struct_emb_dim, 
+            int(getattr(config, 'struct_adapter_dim')),
+            dropout=self.adapter_dropout,
         )
-        self._alpha_sum = 0.0
-        self._alpha_count = 0
 
-        self.text_spatial_projection = self._build_projection(self.text_embedding_dim, self.text_compgcn_dim)
-        self.struct_spatial_projection = self._build_projection(self.structural_dim, self.struct_compgcn_dim)
-        self.text_dynamics_projection = self._build_projection(self.text_embedding_dim, self.text_dynamics_dim)
-        self.struct_dynamics_projection = self._build_projection(self.structural_dim, self.struct_dynamics_dim)
-
-        compgcn_layers = int(getattr(config, 'compgcn_layers', 1))
-        self.text_compgcn_stack = nn.ModuleList([
-            CompGCNLayer(hidden_dim=self.text_compgcn_dim, comp_op=getattr(config, 'compgcn_op', 'sub'))
-            for _ in range(max(compgcn_layers, 1))
-        ])
-        self.struct_compgcn_stack = nn.ModuleList([
-            CompGCNLayer(hidden_dim=self.struct_compgcn_dim, comp_op=getattr(config, 'compgcn_op', 'sub'))
-            for _ in range(max(compgcn_layers, 1))
-        ])
-
-        dynamics_layers = int(getattr(config, 'dynamics_layers', getattr(config, 'num_layers', 1)))
-
-        self.text_dynamics_mixer = nn.Sequential(
-            nn.Linear(self.text_dynamics_dim * 2, self.text_dynamics_dim * 2),
-            nn.GELU(),
-            nn.Linear(self.text_dynamics_dim * 2, self.text_dynamics_dim)
+        # 3. Early Fusion and Shared Dynamics
+        self.fusion_dim = int(getattr(config, 'fusion_dim'))
+        self.entity_fusion = GatedFusion(
+            self.text_emb_dim,
+            self.struct_emb_dim,
+            self.fusion_dim,
+            dropout=self.dropout,
         )
-        self.text_lstm = nn.LSTM(
-            input_size=self.text_dynamics_dim,
-            hidden_size=self.text_dynamics_dim,
+        self.relation_fusion = GatedFusion(
+            self.text_emb_dim,
+            self.struct_emb_dim,
+            self.fusion_dim,
+            dropout=self.dropout,
+        )
+
+        self.fused_context_aggregator = ContextAggregator(hidden_dim=self.fusion_dim)
+        self.fused_h0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
+        self.fused_c0_projection = nn.Linear(self.fusion_dim, self.fusion_dim)
+
+        dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
+        self.fused_lstm = nn.LSTM(
+            input_size=self.fusion_dim,
+            hidden_size=self.fusion_dim,
             num_layers=dynamics_layers,
             batch_first=True,
+            dropout=self.dropout if dynamics_layers > 1 else 0.0,
         )
-        self.text_h0_projection = self._build_projection(self.text_compgcn_dim, self.text_dynamics_dim)
-        self.text_c0_projection = self._build_projection(self.text_compgcn_dim, self.text_dynamics_dim)
-
-        self.struct_dynamics_mixer = nn.Sequential(
-            nn.Linear(self.struct_dynamics_dim * 2, self.struct_dynamics_dim * 2),
-            nn.GELU(),
-            nn.Linear(self.struct_dynamics_dim * 2, self.struct_dynamics_dim)
+        self.target_projection = nn.Linear(
+            self.fusion_dim,
+            self.fusion_dim,
         )
-        self.struct_lstm = nn.LSTM(
-            input_size=self.struct_dynamics_dim,
-            hidden_size=self.struct_dynamics_dim,
-            num_layers=dynamics_layers,
-            batch_first=True,
+
+        self.decoder = ConvTransEDecoder(
+            embedding_dim=self.fusion_dim,
+            dropout=self.dropout,
+            channels=int(getattr(config, 'convtranse_channels', 50)),
+            kernel_size=int(getattr(config, 'convtranse_kernel_size', 3)),
         )
-        self.struct_h0_projection = self._build_projection(self.struct_compgcn_dim, self.struct_dynamics_dim)
-        self.struct_c0_projection = self._build_projection(self.struct_compgcn_dim, self.struct_dynamics_dim)
+        self._last_gate_stats = {}
 
-        self.recurrent_dropout_layer = nn.Dropout(self.recurrent_dropout) if self.recurrent_dropout > 0 else nn.Identity()
+    def reset_gate_stats(self):
+        self._last_gate_stats = {}
 
-    def _build_projection(self, in_dim, out_dim):
-        if in_dim == out_dim:
-            return nn.Identity()
-        return nn.Linear(in_dim, out_dim)
+    def _record_gate_stats(self, name, gate):
+        if gate.numel() == 0:
+            return
 
-    def _load_embedding_tensor(self, source, expected_rows, name):
+        self._last_gate_stats[name] = gate.detach().float().mean().item()
+
+    def pop_gate_stats(self):
+        stats = dict(self._last_gate_stats)
+        self.reset_gate_stats()
+        return stats
+        
+    def _prepare_context_batch(self, context_batch):
+        context_entity_ids = context_batch['id']
+        context_relation_ids = context_batch.get('rel_id')
+        context_batch_index = context_batch.get('batch_index')
+        if context_relation_ids is None or context_batch_index is None:
+            raise ValueError(
+                "context_batch requires 'id', 'rel_id', and 'batch_index'."
+            )
+        if (
+            context_entity_ids.dim() != 1
+            or context_relation_ids.dim() != 1
+            or context_batch_index.dim() != 1
+        ):
+            raise ValueError("Ragged context tensors must all be one-dimensional.")
+        if not (
+            context_entity_ids.numel()
+            == context_relation_ids.numel()
+            == context_batch_index.numel()
+        ):
+            raise ValueError("Ragged context tensors must have equal lengths.")
+        return context_entity_ids, context_relation_ids, context_batch_index
+
+    def _run_dynamics(self, world_state, head_emb, relation_emb, lstm, h0_proj, c0_proj):
+        """
+        Run recurrent dynamics over a sequence of steps.
+
+        world_state: (B, fusion_dim) used to initialise h0/c0
+        head_emb: (B, D) head embedding for this path
+        relation_emb: (B, D_rel) relation embedding for this path
+        """
+        h_0 = torch.tanh(h0_proj(world_state))
+        c_0 = torch.tanh(c0_proj(world_state))
+
+        # Prepare initial LSTM states
+        num_layers = lstm.num_layers
+        h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
+        c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
+
+        # Run LSTM over the sequence
+        _, (h_n, _) = lstm(torch.stack([head_emb, relation_emb], dim=1), (h_0_lstm, c_0_lstm))
+        query_vector = h_n[-1]
+        return query_vector
+
+    def _load_text_embedding_tensor(self, source, expected_rows, expected_dim, name):
         if isinstance(source, str):
             loaded = torch.load(source, map_location='cpu')
         elif torch.is_tensor(source):
@@ -166,260 +340,130 @@ class GWM(nn.Module):
             raise ValueError(
                 f"{name} cache row count mismatch. Expected {expected_rows}, got {loaded.size(0)}"
             )
-        return loaded
-
-    def load_precomputed_structural_cache(self, entity_source, relation_source, freeze=False):
-        entity_cache = self._load_embedding_tensor(
-            source=entity_source,
-            expected_rows=self.entity_embeddings.num_embeddings,
-            name='structural_entity',
-        )
-
-        relation_cache = self._load_embedding_tensor(
-            source=relation_source,
-            expected_rows=self.relation_embeddings.num_embeddings,
-            name='structural_relation',
-        )
-
-        if entity_cache.size(1) != self.structural_dim:
+        if loaded.size(1) != expected_dim:
             raise ValueError(
-                f"Structural embedding dim mismatch. Config expects {self.structural_dim}, got {entity_cache.size(1)}"
+                f"{name} cache dimension mismatch. Expected {expected_dim}, got {loaded.size(1)}"
+            )
+        return loaded      
+
+    def load_text_embeddings(self, entity_source, relation_source, freeze=True):
+        entity_cache = self._load_text_embedding_tensor(
+            source=entity_source,
+            expected_rows=self.text_ent_embs.num_embeddings,
+            expected_dim=self.text_emb_dim,
+            name='text_entity',
+        )
+        relation_cache = self._load_text_embedding_tensor(
+            source=relation_source,
+            expected_rows=self.text_rel_embs.num_embeddings,
+            expected_dim=self.text_emb_dim,
+            name='text_relation',
+        )
+
+        if entity_cache.size(1) != relation_cache.size(1):
+            raise ValueError(
+                "text_entity and text_relation embeddings must share the same embedding dimension. "
+                f"Got {entity_cache.size(1)} and {relation_cache.size(1)}"
             )
 
-        self.entity_embeddings.weight.data.copy_(entity_cache)
-        self.relation_embeddings.weight.data.copy_(relation_cache)
+        self.text_ent_embs.weight.data.copy_(entity_cache)
+        self.text_rel_embs.weight.data.copy_(relation_cache)
 
         if freeze:
-            self.entity_embeddings.weight.requires_grad = False
-            self.relation_embeddings.weight.requires_grad = False
+            self.text_ent_embs.weight.requires_grad = False
+            self.text_rel_embs.weight.requires_grad = False
 
-    def _maybe_enable_lora(self):
-        if not getattr(self.config, 'lora_enabled', False):
-            return
-        if LoraConfig is None or get_peft_model is None:
-            raise RuntimeError("peft is required for LoRA. Install with: pip install peft")
+    def encode_query(self, h_batch, r_batch, context_batch):
+        self.reset_gate_stats()
+        h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
+        r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
+        h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
+        r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
+        h_fused, h_gate = self.entity_fusion(h_text, h_struct)
+        r_fused, r_gate = self.relation_fusion(r_text, r_struct)
+        self._record_gate_stats('entity_gate', h_gate)
+        self._record_gate_stats('relation_gate', r_gate)
 
-        target_modules = getattr(self.config, 'lora_target_modules', ['query', 'value'])
-        if isinstance(target_modules, str):
-            target_modules = [m.strip() for m in target_modules.split(',') if m.strip()]
+        flat_context_entity_ids, flat_context_relation_ids, context_batch_index = self._prepare_context_batch(context_batch)
+        ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
+        ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
+        ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
+        ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
+        ctx_ent_fused, ctx_ent_gate = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
+        ctx_rel_fused, ctx_rel_gate = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
+        self._record_gate_stats('entity_gate', ctx_ent_gate)
+        self._record_gate_stats('relation_gate', ctx_rel_gate)
 
-        lora_config = LoraConfig(
-            r=int(getattr(self.config, 'lora_rank', 8)),
-            lora_alpha=int(getattr(self.config, 'lora_alpha', 16)),
-            lora_dropout=float(getattr(self.config, 'lora_dropout', 0.05)),
-            target_modules=target_modules,
-            bias='none',
-            task_type='FEATURE_EXTRACTION',
+        world_state = self.fused_context_aggregator(
+            head_feat=h_fused,
+            nbr_entity_feat=ctx_ent_fused,
+            nbr_relation_feat=ctx_rel_fused,
+            nbr_batch_index=context_batch_index,
         )
-        self.text_encoder = get_peft_model(self.text_encoder, lora_config)
-
-    def _encode_text(self, input_ids, attention_mask):
-        outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        token_embeddings = outputs.last_hidden_state
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-        return sum_embeddings / sum_mask
-
-    def _encode_subgraph_with_compgcn(self, h_emb, ctx_entity_emb, ctx_relation_emb, ctx_batch_index, compgcn_stack):
-        h_state = h_emb
-        for layer in compgcn_stack:
-            h_state = layer(
-                head_feat=h_state,
-                nbr_entity_feat=ctx_entity_emb,
-                nbr_relation_feat=ctx_relation_emb,
-                nbr_batch_index=ctx_batch_index,
-            )
-        return h_state
-
-    def _run_dynamics(self, world_state, step_x, relation_emb, mixer, lstm, h0_proj, c0_proj):
-        h_0 = torch.tanh(h0_proj(world_state))
-        c_0 = c0_proj(world_state)
-
-        concat_input = torch.cat([step_x, relation_emb], dim=-1)
-        mixed_input = mixer(concat_input)
-        lstm_input = mixed_input.unsqueeze(1)
-
-        num_layers = lstm.num_layers
-        h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
-        c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
-
-        _, (h_n, _) = lstm(lstm_input, (h_0_lstm, c_0_lstm))
-        query_vector = h_n[-1]
-        query_vector = self.recurrent_dropout_layer(query_vector)
-
-        return torch.nn.functional.normalize(query_vector, p=2, dim=1)
-
-    def reset_alpha_stats(self):
-        self._alpha_sum = 0.0
-        self._alpha_count = 0
-
-    def _record_alpha(self, alpha):
-        self._alpha_sum += alpha.sum().item()
-        self._alpha_count += alpha.numel()
-
-    def get_alpha_mean(self, reset=False):
-        if self._alpha_count == 0:
-            return None
-        mean = self._alpha_sum / self._alpha_count
-        if reset:
-            self.reset_alpha_stats()
-        return mean
+        query = self._run_dynamics(
+            world_state,
+            h_fused,
+            r_fused,
+            self.fused_lstm,
+            self.fused_h0_projection,
+            self.fused_c0_projection,
+        )
+        return query, r_fused
 
     def forward(self, h_batch, r_batch, context_batch):
-        h_emb_text = self._encode_text(h_batch['input_ids'], h_batch['attention_mask'])
-        r_emb_text = self._encode_text(r_batch['input_ids'], r_batch['attention_mask'])
-
-        h_struct = self.entity_embeddings(h_batch['id'])
-        r_struct = self.relation_embeddings(r_batch['id'])
-
-        h_emb_text = self.input_dropout(h_emb_text)
-        r_emb_text = self.input_dropout(r_emb_text)
-        h_struct = self.input_dropout(h_struct)
-        r_struct = self.input_dropout(r_struct)
-
-        context_entity_ids = context_batch['id']
-        ctx_input_ids = context_batch['input_ids']
-        ctx_attention_mask = context_batch['attention_mask']
-        ctx_rel_input_ids = context_batch.get('rel_input_ids')
-        ctx_rel_attention_mask = context_batch.get('rel_attention_mask')
-        context_mask = context_batch.get('mask')
-
-        if context_entity_ids.dim() == 2:
-            batch_size, context_size = context_entity_ids.shape
-            seq_len = ctx_input_ids.size(-1)
-            ctx_input_ids = ctx_input_ids.reshape(batch_size, context_size, seq_len)
-            ctx_attention_mask = ctx_attention_mask.reshape(batch_size, context_size, seq_len)
-            if ctx_rel_input_ids is not None:
-                rel_seq_len = ctx_rel_input_ids.size(-1)
-                ctx_rel_input_ids = ctx_rel_input_ids.reshape(batch_size, context_size, rel_seq_len)
-                ctx_rel_attention_mask = ctx_rel_attention_mask.reshape(batch_size, context_size, rel_seq_len)
-            if context_mask is None:
-                context_mask = torch.ones_like(context_entity_ids, dtype=torch.bool)
-            else:
-                context_mask = context_mask.bool()
-
-            valid_idx = context_mask.nonzero(as_tuple=False)
-            if valid_idx.numel() == 0:
-                flat_ctx_input_ids = ctx_input_ids.new_zeros((0, ctx_input_ids.size(-1)))
-                flat_ctx_attn = ctx_attention_mask.new_zeros((0, ctx_attention_mask.size(-1)))
-                flat_context_entity_ids = context_entity_ids.new_zeros((0,))
-                flat_context_relation_ids = context_entity_ids.new_zeros((0,))
-                context_batch_index = context_entity_ids.new_zeros((0,))
-                flat_ctx_rel_input_ids = None
-                flat_ctx_rel_attn = None
-            else:
-                context_batch_index = valid_idx[:, 0]
-                flat_ctx_input_ids = ctx_input_ids[context_mask]
-                flat_ctx_attn = ctx_attention_mask[context_mask]
-                flat_context_entity_ids = context_entity_ids[context_mask]
-                flat_context_relation_ids = context_batch.get('rel_id', torch.zeros_like(context_entity_ids))[context_mask]
-                if ctx_rel_input_ids is not None:
-                    flat_ctx_rel_input_ids = ctx_rel_input_ids[context_mask]
-                    flat_ctx_rel_attn = ctx_rel_attention_mask[context_mask]
-                else:
-                    flat_ctx_rel_input_ids = None
-                    flat_ctx_rel_attn = None
-        else:
-            flat_ctx_input_ids = ctx_input_ids
-            flat_ctx_attn = ctx_attention_mask
-            flat_context_entity_ids = context_entity_ids
-            flat_context_relation_ids = context_batch.get('rel_id', torch.zeros_like(context_entity_ids))
-            context_batch_index = context_batch['batch_index']
-            flat_ctx_rel_input_ids = ctx_rel_input_ids
-            flat_ctx_rel_attn = ctx_rel_attention_mask
-
-        ctx_ent_text = self._encode_text(flat_ctx_input_ids, flat_ctx_attn)
-        ctx_ent_struct = self.entity_embeddings(flat_context_entity_ids)
-
-        if flat_ctx_rel_input_ids is None:
-            ctx_rel_text = torch.zeros(
-                ctx_ent_text.size(0),
-                self.text_embedding_dim,
-                device=ctx_ent_text.device,
-            )
-        else:
-            ctx_rel_text = self._encode_text(flat_ctx_rel_input_ids, flat_ctx_rel_attn)
-        ctx_rel_struct = self.relation_embeddings(flat_context_relation_ids)
-
-        h_spatial_text = self.text_spatial_projection(h_emb_text)
-        ctx_entity_spatial_text = self.text_spatial_projection(ctx_ent_text)
-        ctx_relation_spatial_text = self.text_spatial_projection(ctx_rel_text)
-
-        h_spatial_struct = self.struct_spatial_projection(h_struct)
-        ctx_entity_spatial_struct = self.struct_spatial_projection(ctx_ent_struct)
-        ctx_relation_spatial_struct = self.struct_spatial_projection(ctx_rel_struct)
-
-        world_state_text = self._encode_subgraph_with_compgcn(
-            h_spatial_text,
-            ctx_entity_spatial_text,
-            ctx_relation_spatial_text,
-            context_batch_index,
-            self.text_compgcn_stack,
-        )
-        world_state_text = self.input_dropout(world_state_text)
-
-        world_state_struct = self._encode_subgraph_with_compgcn(
-            h_spatial_struct,
-            ctx_entity_spatial_struct,
-            ctx_relation_spatial_struct,
-            context_batch_index,
-            self.struct_compgcn_stack,
-        )
-        world_state_struct = self.input_dropout(world_state_struct)
-
-        step_x_text = self.text_dynamics_projection(h_emb_text)
-        relation_emb_text = self.text_dynamics_projection(r_emb_text)
-        query_text = self._run_dynamics(
-            world_state_text,
-            step_x_text,
-            relation_emb_text,
-            self.text_dynamics_mixer,
-            self.text_lstm,
-            self.text_h0_projection,
-            self.text_c0_projection,
-        )
-
-        step_x_struct = self.struct_dynamics_projection(h_struct)
-        relation_emb_struct = self.struct_dynamics_projection(r_struct)
-        query_struct = self._run_dynamics(
-            world_state_struct,
-            step_x_struct,
-            relation_emb_struct,
-            self.struct_dynamics_mixer,
-            self.struct_lstm,
-            self.struct_h0_projection,
-            self.struct_c0_projection,
-        )
-
-        return query_text, query_struct
+        query, _ = self.encode_query(h_batch, r_batch, context_batch)
+        return query
 
     def encode_target(self, t_batch):
-        t_emb_text = self._encode_text(t_batch['input_ids'], t_batch['attention_mask'])
-        t_struct = self.entity_embeddings(t_batch['id'])
+        t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
+        t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
+        t_fused, t_gate = self.entity_fusion(t_text, t_struct)
+        self._record_gate_stats('entity_gate', t_gate)
+        return F.normalize(
+            self.target_projection(t_fused),
+            p=2,
+            dim=1,
+        )
 
-        t_text_proj = self.text_dynamics_projection(t_emb_text)
-        t_struct_proj = self.struct_dynamics_projection(t_struct)
+    def compute_loss(self, scores, target_ids):
+        """Full-entity cross-entropy with one target tail per triple."""
+        return full_entity_cross_entropy(scores, target_ids)
 
-        t_text_norm = torch.nn.functional.normalize(t_text_proj, p=2, dim=1)
-        t_struct_norm = torch.nn.functional.normalize(t_struct_proj, p=2, dim=1)
-        return t_text_norm, t_struct_norm
+    def score_candidates(
+        self,
+        query_vectors,
+        relation_vectors,
+        candidate_vectors,
+    ):
+        return self.decoder(
+            query_vectors,
+            relation_vectors,
+            candidate_vectors,
+        )
 
-    def compute_loss(self, query_vectors, target_vectors):
-        query_text, query_struct = query_vectors
-        target_text, target_struct = target_vectors
+    def score_all_entities(
+        self,
+        h_batch,
+        r_batch,
+        context_batch,
+        candidate_vectors=None,
+    ):
+        query_vectors, relation_vectors = self.encode_query(
+            h_batch,
+            r_batch,
+            context_batch,
+        )
+        if candidate_vectors is None:
+            entity_ids = torch.arange(
+                int(self.config.num_entities),
+                device=query_vectors.device,
+                dtype=torch.long,
+            )
+            candidate_vectors = self.encode_target({'id': entity_ids})
 
-        scores_text = torch.mm(query_text, target_text.t())
-        scores_struct = torch.mm(query_struct, target_struct.t())
-
-        temp = getattr(self.config, 'temperature', 0.07)
-        scores_text /= temp
-        scores_struct /= temp
-
-        head_combined = torch.cat([query_text, query_struct], dim=-1)
-        alpha = self.alpha_mlp(head_combined)
-        scores = alpha * scores_text + (1.0 - alpha) * scores_struct
-        self._record_alpha(alpha)
-
-        labels = torch.arange(scores.size(0), device=scores.device)
-        return nn.CrossEntropyLoss()(scores, labels), scores
+        scores = self.score_candidates(
+            query_vectors,
+            relation_vectors,
+            candidate_vectors,
+        )
+        return scores

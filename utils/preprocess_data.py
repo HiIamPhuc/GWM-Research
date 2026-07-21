@@ -3,6 +3,8 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+import re
+from transformers import AutoModel, AutoTokenizer
 
 def load_triples(file_path):
     """Load triples from a text file."""
@@ -12,6 +14,117 @@ def load_triples(file_path):
             h, r, t = line.strip().split('\t')
             triples.append((h, r, t))
     return triples
+
+def load_counted_id_map(file_path):
+    """Load files with first-line count followed by token<TAB>id rows."""
+    token_to_id = {}
+    id_to_token = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        first = f.readline().strip()
+        expected_count = int(first) if first else 0
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) != 2:
+                continue
+            token, raw_id = parts
+            idx = int(raw_id)
+            token_to_id[token] = idx
+            id_to_token[idx] = token
+
+    if expected_count != len(token_to_id):
+        raise ValueError(
+            f"{file_path} declares {expected_count} rows but "
+            f"{len(token_to_id)} rows were loaded."
+        )
+    return token_to_id, id_to_token
+
+def load_nell995_triples(file_path, id_to_entity, id_to_relation):
+    """
+    Load NELL-995 split files.
+
+    Format: first line is count; each triple line is `head_id tail_id relation_id`.
+    """
+    triples = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        first = f.readline().strip()
+        expected_count = int(first) if first else 0
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != 3:
+                continue
+            h_id, t_id, r_id = map(int, parts)
+            triples.append((
+                id_to_entity[h_id],
+                id_to_relation[r_id],
+                id_to_entity[t_id],
+            ))
+
+    if expected_count != len(triples):
+        raise ValueError(
+            f"{file_path} declares {expected_count} triples but "
+            f"{len(triples)} triples were loaded."
+        )
+    return triples
+
+def load_nell995_dataset(data_dir, add_inverse=True):
+    data_path = Path(data_dir)
+    entity2id, id_to_entity = load_counted_id_map(data_path / 'entity2id.txt')
+    relation2id, id_to_relation = load_counted_id_map(data_path / 'relation2id.txt')
+
+    if add_inverse:
+        num_original_relations = len(relation2id)
+        for relation, rid in list(relation2id.items()):
+            relation2id[relation + '_inv'] = rid + num_original_relations
+
+    train_triples = load_nell995_triples(data_path / 'train.txt', id_to_entity, id_to_relation)
+    valid_triples = load_nell995_triples(data_path / 'valid.txt', id_to_entity, id_to_relation)
+    test_triples = load_nell995_triples(data_path / 'test.txt', id_to_entity, id_to_relation)
+    return train_triples, valid_triples, test_triples, entity2id, relation2id
+
+def load_ordered_tokens(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return [line.strip() for line in f if line.strip()]
+
+def load_umls_triples(file_path):
+    triples = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) != 3:
+                continue
+            triples.append(tuple(parts))
+    return triples
+
+def load_umls_dataset(data_dir, add_inverse=True):
+    data_path = Path(data_dir)
+    entities = load_ordered_tokens(data_path / 'entities.txt')
+    relations = load_ordered_tokens(data_path / 'relations.txt')
+
+    entity2id = {entity: idx for idx, entity in enumerate(entities)}
+    relation2id = {relation: idx for idx, relation in enumerate(relations)}
+    if add_inverse:
+        num_original_relations = len(relation2id)
+        for relation, rid in list(relation2id.items()):
+            relation2id[relation + '_inv'] = rid + num_original_relations
+
+    train_triples = load_umls_triples(data_path / 'train.tsv')
+    valid_triples = load_umls_triples(data_path / 'valid.tsv')
+    test_triples = load_umls_triples(data_path / 'test.tsv')
+
+    known_entities = set(entity2id)
+    known_relations = set(relations)
+    for split_name, triples in (
+        ('train', train_triples),
+        ('valid', valid_triples),
+        ('test', test_triples),
+    ):
+        for h, r, t in triples:
+            if h not in known_entities or t not in known_entities:
+                raise ValueError(f"Unknown entity in UMLS {split_name} triple: {(h, r, t)}")
+            if r not in known_relations:
+                raise ValueError(f"Unknown relation in UMLS {split_name} triple: {(h, r, t)}")
+
+    return train_triples, valid_triples, test_triples, entity2id, relation2id
 
 def create_vocabularies(train_triples, valid_triples, test_triples, add_inverse=True):
     """Create entity and relation mappings."""
@@ -136,7 +249,153 @@ def process_text_wn18rr(data_dir, entity2id, relation2id):
             
     return entity_text, relation_text
 
-def process_dataset(data_dir, output_dir, dataset_name, embedding_model='all-MiniLM-L6-v2', add_inverse=True):
+def process_text_nell995(data_dir, entity2id, relation2id):
+    """Create readable text from NELL concept identifiers."""
+    entity_text = {}
+    relation_text = {}
+
+    def clean_entity(entity):
+        text = entity
+        if text.startswith('concept_'):
+            text = text[len('concept_'):]
+        text = text.replace('_', ' ')
+        return text.strip()
+
+    def clean_relation(relation):
+        text = relation
+        if text.endswith('_inv'):
+            base = clean_relation(text[:-4])
+            return 'inverse of ' + base
+        if text.startswith('concept:'):
+            text = text[len('concept:'):]
+        text = text.replace('_', ' ')
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    for entity, eid in entity2id.items():
+        entity_text[str(eid)] = clean_entity(entity)
+
+    for relation, rid in relation2id.items():
+        relation_text[str(rid)] = clean_relation(relation)
+
+    return entity_text, relation_text
+
+def process_text_umls(data_dir, entity2id, relation2id):
+    data_path = Path(data_dir)
+    entity_text = {}
+    relation_text = {}
+
+    def load_text_map(filename):
+        path = data_path / filename
+        text_map = {}
+        if not path.exists():
+            return text_map
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                parts = line.rstrip('\n').split('\t', 1)
+                if len(parts) == 2:
+                    text_map[parts[0]] = parts[1].strip()
+        return text_map
+
+    # Prefer longer descriptions when present; otherwise use concise labels.
+    e_map = load_text_map('entity2textlong.txt')
+    if not e_map:
+        e_map = load_text_map('entity2text.txt')
+    r_map = load_text_map('relation2text.txt')
+
+    for entity, eid in entity2id.items():
+        entity_text[str(eid)] = e_map.get(entity, entity.replace('_', ' '))
+
+    for relation, rid in relation2id.items():
+        if relation.endswith('_inv'):
+            base_relation = relation[:-4]
+            base_text = r_map.get(base_relation, base_relation.replace('_', ' '))
+            relation_text[str(rid)] = 'inverse of ' + base_text
+        else:
+            relation_text[str(rid)] = r_map.get(relation, relation.replace('_', ' '))
+
+    return entity_text, relation_text
+
+def triples_to_ids(triples, entity2id, relation2id, add_inverse=False):
+    ids = []
+    for h, r, t in triples:
+        h_id, r_id, t_id = entity2id[h], relation2id[r], entity2id[t]
+        ids.append((h_id, r_id, t_id))
+        if add_inverse:
+            r_inv_id = relation2id[r + '_inv']
+            ids.append((t_id, r_inv_id, h_id))
+    return torch.tensor(ids, dtype=torch.long)
+
+def precompute_text_embeddings(
+    entity_text_dict,
+    relation_text_dict,
+    num_entities,
+    num_relations,
+    pretrained_model='bert-base-uncased',
+    batch_size=128,
+    max_entity_length=256,
+    max_relation_length=64,
+    device=None,
+):
+    """
+    Encode entity/relation text once and return dense embedding tensors.
+    """
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device)
+
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
+    text_encoder = AutoModel.from_pretrained(pretrained_model).to(device)
+    text_encoder.eval()
+
+    def encode_ordered_texts(text_dict, size, max_length, desc):
+        texts = [text_dict.get(str(i), f"Token {i}") for i in range(size)]
+        all_emb = []
+        with torch.no_grad():
+            for start in tqdm(range(0, size, batch_size), desc=desc, leave=False):
+                chunk = texts[start:start + batch_size]
+                encoded = tokenizer(
+                    chunk,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors='pt',
+                )
+                encoded = {k: v.to(device) for k, v in encoded.items()}
+                outputs = text_encoder(**encoded)
+                all_emb.append(outputs.last_hidden_state[:, 0, :].detach().cpu())
+        return torch.cat(all_emb, dim=0).contiguous()
+
+    entity_embeddings = encode_ordered_texts(
+        entity_text_dict,
+        num_entities,
+        max_entity_length,
+        desc='Encoding entity text',
+    )
+    relation_embeddings = encode_ordered_texts(
+        relation_text_dict,
+        num_relations,
+        max_relation_length,
+        desc='Encoding relation text',
+    )
+
+    del text_encoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return entity_embeddings, relation_embeddings
+
+def process_dataset(
+    data_dir,
+    output_dir,
+    dataset_name,
+    add_inverse=True,
+    pretrained_model='bert-base-uncased',
+    text_batch_size=128,
+    max_entity_length=256,
+    max_relation_length=64,
+    text_device=None,
+):
     """
     Process raw dataset into training files.
     1. Reads train/valid/test.txt
@@ -151,34 +410,38 @@ def process_dataset(data_dir, output_dir, dataset_name, embedding_model='all-Min
     
     print(f"Processing data from {data_path} for {dataset_name}...")
     
-    # 1. Load Triples
-    train_triples = load_triples(data_path / 'train.txt')
-    valid_triples = load_triples(data_path / 'valid.txt')
-    test_triples = load_triples(data_path / 'test.txt')
-    
-    # 2. Vocabularies
-    entity2id, relation2id = create_vocabularies(train_triples, valid_triples, test_triples, add_inverse)
+    # 1. Load triples and vocabularies
+    dataset_key = dataset_name.lower()
+    if 'nell' in dataset_key:
+        train_triples, valid_triples, test_triples, entity2id, relation2id = load_nell995_dataset(
+            data_path,
+            add_inverse=add_inverse,
+        )
+    elif 'umls' in dataset_key:
+        train_triples, valid_triples, test_triples, entity2id, relation2id = load_umls_dataset(
+            data_path,
+            add_inverse=add_inverse,
+        )
+    else:
+        train_triples = load_triples(data_path / 'train.txt')
+        valid_triples = load_triples(data_path / 'valid.txt')
+        test_triples = load_triples(data_path / 'test.txt')
+        entity2id, relation2id = create_vocabularies(
+            train_triples,
+            valid_triples,
+            test_triples,
+            add_inverse,
+        )
     
     # Save Vocabs
     with open(out_path / 'entity2id.json', 'w') as f:
         json.dump(entity2id, f, indent=2)
     with open(out_path / 'relation2id.json', 'w') as f:
         json.dump(relation2id, f, indent=2)
-        
-    # 3. Convert Triples to IDs
-    def triples_to_ids(triples, add_inv=False):
-        ids = []
-        for h, r, t in triples:
-            h_id, r_id, t_id = entity2id[h], relation2id[r], entity2id[t]
-            ids.append((h_id, r_id, t_id))
-            if add_inv:
-                r_inv_id = relation2id[r + '_inv']
-                ids.append((t_id, r_inv_id, h_id))
-        return torch.tensor(ids, dtype=torch.long)
 
-    train_tensor = triples_to_ids(train_triples, add_inv=add_inverse)
-    valid_tensor = triples_to_ids(valid_triples, add_inv=False)
-    test_tensor = triples_to_ids(test_triples, add_inv=False)
+    train_tensor = triples_to_ids(train_triples, entity2id, relation2id, add_inverse=add_inverse)
+    valid_tensor = triples_to_ids(valid_triples, entity2id, relation2id, add_inverse=False)
+    test_tensor = triples_to_ids(test_triples, entity2id, relation2id, add_inverse=False)
     
     torch.save(train_tensor, out_path / 'train_triples.pt')
     torch.save(valid_tensor, out_path / 'valid_triples.pt')
@@ -186,11 +449,15 @@ def process_dataset(data_dir, output_dir, dataset_name, embedding_model='all-Min
     
     # 4. Process Text Descriptions
     print(f"Generating descriptions for {dataset_name}...")
-    if 'fb15k' in dataset_name.lower():
+    if 'fb15k' in dataset_key:
         # Requires mid2description.txt
         entity_text_dict, relation_text_dict = process_text_fb15k237(data_dir, entity2id, relation2id)
-    elif 'wn18' in dataset_name.lower():
+    elif 'wn18' in dataset_key:
         entity_text_dict, relation_text_dict = process_text_wn18rr(data_dir, entity2id, relation2id)
+    elif 'nell' in dataset_key:
+        entity_text_dict, relation_text_dict = process_text_nell995(data_dir, entity2id, relation2id)
+    elif 'umls' in dataset_key:
+        entity_text_dict, relation_text_dict = process_text_umls(data_dir, entity2id, relation2id)
     else:
         raise ValueError(f"Error: Unknown dataset {dataset_name}. Please provide text descriptions for this dataset.")
 
@@ -199,10 +466,39 @@ def process_dataset(data_dir, output_dir, dataset_name, embedding_model='all-Min
     with open(out_path / 'relation_text.json', 'w') as f:
         json.dump(relation_text_dict, f, indent=2)
 
+    print("Encoding and caching text embeddings...")
+    entity_text_embeddings, relation_text_embeddings = precompute_text_embeddings(
+        entity_text_dict=entity_text_dict,
+        relation_text_dict=relation_text_dict,
+        num_entities=len(entity2id),
+        num_relations=len(relation2id),
+        pretrained_model=pretrained_model,
+        batch_size=text_batch_size,
+        max_entity_length=max_entity_length,
+        max_relation_length=max_relation_length,
+        device=text_device,
+    )
+
+    torch.save(
+        {
+            'embeddings': entity_text_embeddings,
+            'model_name': pretrained_model,
+            'embedding_dim': int(entity_text_embeddings.size(1)),
+        },
+        out_path / 'entity_text_embeddings.pt'
+    )
+    torch.save(
+        {
+            'embeddings': relation_text_embeddings,
+            'model_name': pretrained_model,
+            'embedding_dim': int(relation_text_embeddings.size(1)),
+        },
+        out_path / 'relation_text_embeddings.pt'
+    )
+
     # 5. Ground Truth for Filtered Eval
-    # Save split-aware maps to ensure fair ranking protocols:
-    # - validation: filter with train only
-    # - test: filter with train + valid
+    # Standard filtered KGC ranking removes every other known true answer,
+    # including facts from train, validation, and test.
     def build_ground_truth(*triple_tensors):
         gt = {}
         for tensor in triple_tensors:
@@ -213,19 +509,12 @@ def process_dataset(data_dir, output_dir, dataset_name, embedding_model='all-Min
                 gt[key].add(t)
         return {k: sorted(list(v)) for k, v in gt.items()}
 
-    ground_truth_train = build_ground_truth(train_tensor)
-    ground_truth_train_valid = build_ground_truth(train_tensor, valid_tensor)
     ground_truth_all = build_ground_truth(train_tensor, valid_tensor, test_tensor)
 
-    # Backward-compatible legacy file
+    # Keep the existing filenames for compatibility. All of them now contain
+    # the complete known-fact map required by filtered validation/test ranking.
     with open(out_path / 'ground_truth.json', 'w') as f:
         json.dump(ground_truth_all, f)
-
-    # Split-aware files used by train/evaluate ranking
-    with open(out_path / 'ground_truth_train.json', 'w') as f:
-        json.dump(ground_truth_train, f)
-    with open(out_path / 'ground_truth_train_valid.json', 'w') as f:
-        json.dump(ground_truth_train_valid, f)
         
     print("Data processing complete.")
 
@@ -235,6 +524,20 @@ if __name__ == '__main__':
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--dataset', type=str, required=True, help='Name of the dataset (e.g., fb15k-237, wn18rr)')
+    parser.add_argument('--pretrained_model', type=str, default='bert-base-uncased')
+    parser.add_argument('--text_batch_size', type=int, default=128)
+    parser.add_argument('--max_entity_length', type=int, default=256)
+    parser.add_argument('--max_relation_length', type=int, default=64)
+    parser.add_argument('--text_device', type=str, default=None, help='cpu or cuda; defaults to auto')
     args = parser.parse_args()
     
-    process_dataset(args.data_dir, args.output_dir, args.dataset)
+    process_dataset(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        dataset_name=args.dataset,
+        pretrained_model=args.pretrained_model,
+        text_batch_size=args.text_batch_size,
+        max_entity_length=args.max_entity_length,
+        max_relation_length=args.max_relation_length,
+        text_device=args.text_device,
+    )

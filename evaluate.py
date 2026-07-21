@@ -9,12 +9,15 @@ import sys
 # Paths
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from model.model import GWM
 from model.dataset import GWMDataset, CollateFN
+from studies.ablation_models import build_model
 from utils.eval import (
+    build_bidirectional_hr_map_for_filtering,
     build_entity_loader,
+    compute_bidirectional_filtered_ranking_metrics,
     compute_filtered_ranking_metrics,
     encode_all_entities_as_targets,
+    load_inverse_relation_ids,
     load_hr_map_for_filtering,
 )
 
@@ -46,8 +49,9 @@ def evaluate(args):
         config.num_entities = len(json.load(f))
     with open(os.path.join(config.data_dir, 'relation2id.json')) as f:
         config.num_relations = len(json.load(f))
+    config.inverse_relation_ids = load_inverse_relation_ids(config.data_dir)
 
-    model = GWM(config).to(device)
+    model = build_model(config).to(device)
     
     # Load Checkpoint
     checkpoint_path = os.path.join(config.output_dir, 'best_checkpoint.pt')
@@ -55,29 +59,34 @@ def evaluate(args):
         print(f"Checkpoint not found at {checkpoint_path}, trying latest...")
         checkpoint_path = os.path.join(config.output_dir, 'latest_checkpoint.pt')
     
-    if os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint: {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    else:
-        print("No checkpoint found. Evaluating initialized model (random).")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"No trained checkpoint found at {checkpoint_path}."
+        )
+
+    print(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
+        raise ValueError(
+            "Unsupported legacy checkpoint. Expected a full training "
+            "checkpoint containing 'model_state_dict'."
+        )
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
 
     model.eval()
 
     # 2. Encode All Candidates (Target Embeddings)
     print("Encoding all entities as targets...")
     entity_loader = build_entity_loader(
-        model=model,
         data_dir=config.data_dir,
         batch_size=candidate_batch_size,
         num_workers=4,
-        max_length=512,
     )
 
     all_entity_embeddings = encode_all_entities_as_targets(
         model=model,
         entity_loader=entity_loader,
-        device=device,
-        desc="Encoding Entities",
+        device=device
     )
     print(f"Encoded {all_entity_embeddings[0].size(0)} entities.")
 
@@ -89,7 +98,7 @@ def evaluate(args):
         split = 'valid'
 
     test_dataset = GWMDataset(config.data_dir, split=split)
-    collate_fn = CollateFN(model.tokenizer)
+    collate_fn = CollateFN()
     
     test_loader = DataLoader(
         test_dataset, 
@@ -101,39 +110,64 @@ def evaluate(args):
 
     # Filtering Setup
     if split == 'test':
-        # Standard test protocol: filter with train+valid
-        hr_map = load_hr_map_for_filtering(
+        hr_map = build_bidirectional_hr_map_for_filtering(
             config.data_dir,
-            preferred_ground_truth_file='ground_truth_train_valid.json',
-            fallback_splits=['train', 'valid']
+            splits=['train', 'valid', 'test'],
         )
     else:
-        # Validation protocol: filter with train only
         hr_map = load_hr_map_for_filtering(
             config.data_dir,
-            preferred_ground_truth_file='ground_truth_train.json',
+            preferred_ground_truth_file=None,
             fallback_splits=['train']
         )
 
-    metrics = compute_filtered_ranking_metrics(
-        model=model,
-        data_loader=test_loader,
-        all_entity_embeddings=all_entity_embeddings,
-        hr_map=hr_map,
-        device=device,
-        desc="Evaluating",
-    )
+    predictions_path = os.path.join(config.output_dir, f'predictions_{split}.jsonl')
+
+    if split == 'test':
+        metrics = compute_bidirectional_filtered_ranking_metrics(
+            model=model,
+            data_loader=test_loader,
+            all_entity_embeddings=all_entity_embeddings,
+            hr_map=hr_map,
+            device=device,
+            desc="Evaluating",
+            save_predictions_path=predictions_path,
+        )
+    else:
+        metrics = compute_filtered_ranking_metrics(
+            model=model,
+            data_loader=test_loader,
+            all_entity_embeddings=all_entity_embeddings,
+            hr_map=hr_map,
+            device=device,
+            desc="Evaluating",
+            save_predictions_path=predictions_path,
+        )
 
     final_mrr = metrics['MRR']
     final_h1 = metrics['Hits@1']
     final_h3 = metrics['Hits@3']
     final_h10 = metrics['Hits@10']
 
-    print(f"\n--- Evaluation Results ({split}) ---")
+    if split == 'test':
+        print(f"\n--- Bidirectional Evaluation Results ({split}) ---")
+    else:
+        print(f"\n--- Tail-Only Evaluation Results ({split}) ---")
     print(f"MRR       : {final_mrr:.4f}")
     print(f"Hits@1    : {final_h1:.4f}")
     print(f"Hits@3    : {final_h3:.4f}")
     print(f"Hits@10   : {final_h10:.4f}")
+    if split == 'test':
+        print(
+            f"Forward  : MRR {metrics['forward']['MRR']:.4f} | "
+            f"Hits@10 {metrics['forward']['Hits@10']:.4f} | "
+            f"count {metrics['forward']['count']}"
+        )
+        print(
+            f"Backward : MRR {metrics['backward']['MRR']:.4f} | "
+            f"Hits@10 {metrics['backward']['Hits@10']:.4f} | "
+            f"count {metrics['backward']['count']}"
+        )
     print("-------------------------------")
     
     # Save results
@@ -141,8 +175,36 @@ def evaluate(args):
         'mrr': final_mrr,
         'hits1': final_h1,
         'hits3': final_h3,
-        'hits10': final_h10
+        'hits10': final_h10,
+        'evaluation_mode': 'bidirectional_test' if split == 'test' else 'tail_only',
     }
+    if split == 'test':
+        results.update({
+            'forward': {
+            'mrr': metrics['forward']['MRR'],
+            'mr': metrics['forward']['MR'],
+            'hits1': metrics['forward']['Hits@1'],
+            'hits3': metrics['forward']['Hits@3'],
+            'hits10': metrics['forward']['Hits@10'],
+            'count': metrics['forward']['count'],
+            },
+            'backward': {
+            'mrr': metrics['backward']['MRR'],
+            'mr': metrics['backward']['MR'],
+            'hits1': metrics['backward']['Hits@1'],
+            'hits3': metrics['backward']['Hits@3'],
+            'hits10': metrics['backward']['Hits@10'],
+            'count': metrics['backward']['count'],
+            },
+            'micro': {
+            'mrr': metrics['micro']['MRR'],
+            'mr': metrics['micro']['MR'],
+            'hits1': metrics['micro']['Hits@1'],
+            'hits3': metrics['micro']['Hits@3'],
+            'hits10': metrics['micro']['Hits@10'],
+            'count': metrics['micro']['count'],
+            },
+        })
     with open(os.path.join(config.output_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)
 

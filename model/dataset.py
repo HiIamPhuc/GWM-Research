@@ -3,143 +3,168 @@ from torch.utils.data import Dataset
 import json
 import os
 
+
 class GWMDataset(Dataset):
     def __init__(self, data_dir, split='train'):
         """
         Dataset for GWM.
-        Loads triples, text maps, and context IDs.
+        Loads triples and relation-aware context edge tensors.
         """
         self.data_dir = data_dir
         self.split = split
+
+        with open(os.path.join(data_dir, 'entity2id.json'), 'r', encoding='utf-8') as f:
+            self.num_entities = len(json.load(f))
+        with open(os.path.join(data_dir, 'relation2id.json'), 'r', encoding='utf-8') as f:
+            self.num_relations = len(json.load(f))
         
         # Load triples
         triples_path = os.path.join(data_dir, f'{split}_triples.pt')
         if not os.path.exists(triples_path):
-             # Fallback for WN18RR dev vs valid naming if needed, but preprocess handles it
-             if split == 'valid' and not os.path.exists(triples_path):
-                 triples_path = os.path.join(data_dir, 'dev_triples.pt')
+            if split == 'valid':
+                triples_path = os.path.join(data_dir, 'dev_triples.pt')
+        if not os.path.exists(triples_path):
+            raise FileNotFoundError(f"Triple tensor not found: {triples_path}")
                  
-        self.triples = torch.load(triples_path)
-        
-        # Load text maps
-        with open(os.path.join(data_dir, 'entity_text.json'), 'r') as f:
-            self.entity_text = json.load(f)
-            
-        with open(os.path.join(data_dir, 'relation_text.json'), 'r') as f:
-            self.relation_text = json.load(f)
-            
-        # Load context IDs (Precomputed neighbors)
-        context_path = os.path.join(data_dir, 'context_ids.pt')
-        if os.path.exists(context_path):
-            self.context_ids = torch.load(context_path)
-        else:
-            print(f"Warning: {context_path} not found. Context will be zeros.")
-            # Create dummy context if missing
-            self.context_ids = None
+        self.triples = torch.load(triples_path, map_location='cpu').long()
+        if self.triples.dim() != 2 or self.triples.size(1) != 3:
+            raise ValueError(
+                f"Expected triples with shape (N, 3), got {tuple(self.triples.shape)}"
+            )
 
-        context_rel_path = os.path.join(data_dir, 'context_rel_ids.pt')
-        if os.path.exists(context_rel_path):
-            self.context_rel_ids = torch.load(context_rel_path)
+        self.num_input_triples = int(self.triples.size(0))
+        
+        # Load compact relation-aware context artifact.
+        context_pack_path = os.path.join(data_dir, 'context_neighbors.pt')
+
+        self.context_entity_ids = None
+        self.context_relation_ids = None
+        self.context_mask = None
+        self.context_pad_value = -1
+
+        if os.path.exists(context_pack_path):
+            context_pack = torch.load(context_pack_path, map_location='cpu')
+            self.context_entity_ids = context_pack['entity_ids'].long()
+            self.context_relation_ids = context_pack['relation_ids'].long()
+            self.context_mask = context_pack['mask'].bool()
+            self.context_pad_value = int(context_pack.get('pad_value', -1))
+            expected_shape = self.context_entity_ids.shape
+            if (
+                self.context_entity_ids.dim() != 2
+                or self.context_relation_ids.shape != expected_shape
+                or self.context_mask.shape != expected_shape
+            ):
+                raise ValueError(
+                    "Context entity IDs, relation IDs, and mask must share "
+                    "the same rank-2 shape."
+                )
+            if self.context_entity_ids.size(0) != self.num_entities:
+                raise ValueError(
+                    "Context artifact row count must equal the entity vocabulary size."
+                )
+            valid_entities = self.context_entity_ids[self.context_mask]
+            valid_relations = self.context_relation_ids[self.context_mask]
+            if valid_entities.numel() and (
+                valid_entities.min() < 0
+                or valid_entities.max() >= self.num_entities
+            ):
+                raise ValueError("Context artifact contains invalid entity IDs.")
+            if valid_relations.numel() and (
+                valid_relations.min() < 0
+                or valid_relations.max() >= self.num_relations
+            ):
+                raise ValueError("Context artifact contains invalid relation IDs.")
         else:
-            self.context_rel_ids = None
+            raise FileNotFoundError(
+                "Error: context files not found "
+                "(expected context_neighbors.pt)."
+            )
 
     def __len__(self):
         return len(self.triples)
         
     def __getitem__(self, idx):
         h, r, t = self.triples[idx]
-        
-        # Convert IDs to text
-        # Keys in json are strings
-        h_str, r_str, t_str = str(h.item()), str(r.item()), str(t.item())
-        
-        h_text = self.entity_text.get(h_str, f"Entity {h_str}")
-        r_text = self.relation_text.get(r_str, f"Relation {r_str}")
-        t_text = self.entity_text.get(t_str, f"Entity {t_str}")
-        
-        # Retrieve context
-        if self.context_ids is not None:
-            ctx_ids = self.context_ids[h]
-        else:
-            ctx_ids = torch.zeros(10, dtype=torch.long) # Dummy
+        h_idx = int(h.item())
 
-        if self.context_rel_ids is not None:
-            ctx_rel_ids = self.context_rel_ids[h]
-        else:
-            ctx_rel_ids = torch.zeros_like(ctx_ids)
-            
-        # Context Texts
-        ctx_texts = []
-        for cid in ctx_ids:
-            c_str = str(cid.item())
-            ctx_texts.append(self.entity_text.get(c_str, f"Entity {c_str}"))
+        # Retrieve context row for this head.
+        if self.context_entity_ids is not None:
+            ctx_entity_ids = self.context_entity_ids[h_idx]
+            ctx_relation_ids = self.context_relation_ids[h_idx]
+            ctx_mask = self.context_mask[h_idx].clone()
 
-        ctx_rel_texts = []
-        for rid in ctx_rel_ids:
-            r_str = str(rid.item())
-            ctx_rel_texts.append(self.relation_text.get(r_str, f"Relation {r_str}"))
-            
+            target_edge = (
+                ctx_entity_ids.eq(int(t.item()))
+                & ctx_relation_ids.eq(int(r.item()))
+            )
+            ctx_mask &= ~target_edge
+        else:
+            # Dummy fallback with zero neighbors.
+            ctx_entity_ids = torch.zeros(0, dtype=torch.long)
+            ctx_relation_ids = torch.zeros(0, dtype=torch.long)
+            ctx_mask = torch.zeros(0, dtype=torch.bool)
+
         return {
-            'h_id': h,
-            'r_id': r,
-            't_id': t,
-            'h_text': h_text,
-            'r_text': r_text,
-            't_text': t_text,
-            'context_ids': ctx_ids,
-            'context_texts': ctx_texts,
-            'context_rel_ids': ctx_rel_ids,
-            'context_rel_texts': ctx_rel_texts,
+            'h_id': h.long(),
+            'r_id': r.long(),
+            't_id': t.long(),
+            'context_entity_ids': ctx_entity_ids.long(),
+            'context_relation_ids': ctx_relation_ids.long(),
+            'context_mask': ctx_mask.bool(),
         }
 
 class CollateFN:
     """
-    Collator to handle dynamic padding of text.
+    ID-only collator; text embeddings are loaded from precomputed caches.
     """
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-        
     def __call__(self, batch):
-        h_texts = [b['h_text'] for b in batch]
-        r_texts = [b['r_text'] for b in batch]
-        t_texts = [b['t_text'] for b in batch]
-        
-        # Context Texts: List of Lists -> Flatten
-        context_texts_flat = []
-        context_rel_texts_flat = []
-        
-        # We need to know K (context size) to un-flatten later or reshaping
-        # Assuming fixed K per batch
-        
-        for b in batch:
-            context_texts_flat.extend(b['context_texts']) # [B*K]
-            context_rel_texts_flat.extend(b['context_rel_texts'])
-        
-        # Tokenize (Max length constraints for efficiency)
-        h_enc = self.tokenizer(h_texts, padding=True, truncation=True, return_tensors='pt', max_length=512)
-        r_enc = self.tokenizer(r_texts, padding=True, truncation=True, return_tensors='pt', max_length=512)
-        t_enc = self.tokenizer(t_texts, padding=True, truncation=True, return_tensors='pt', max_length=512)
-        
-        # Tokenize Context (Use shorter length for context to save memory, e.g. 16/24 tokens)
-        ctx_enc = self.tokenizer(context_texts_flat, padding=True, truncation=True, return_tensors='pt', max_length=24)
-        ctx_rel_enc = self.tokenizer(context_rel_texts_flat, padding=True, truncation=True, return_tensors='pt', max_length=24)
-        
         h_ids = torch.stack([b['h_id'] for b in batch])
         r_ids = torch.stack([b['r_id'] for b in batch])
         t_ids = torch.stack([b['t_id'] for b in batch])
-        context_ids = torch.stack([b['context_ids'] for b in batch])
-        context_rel_ids = torch.stack([b['context_rel_ids'] for b in batch])
+
+        # Build ragged context representation: flattened edges + edge->sample index.
+        context_entity_chunks = []
+        context_relation_chunks = []
+        context_batch_chunks = []
+        for sample_idx, item in enumerate(batch):
+            ent_ids = item['context_entity_ids']
+            rel_ids = item['context_relation_ids']
+            mask = item['context_mask'].bool()
+
+            if ent_ids.dim() != 1 or rel_ids.dim() != 1 or mask.dim() != 1:
+                raise ValueError("Each context row must be one-dimensional.")
+            if not (ent_ids.numel() == rel_ids.numel() == mask.numel()):
+                raise ValueError("Context entity, relation, and mask lengths differ.")
+
+            valid_ent = ent_ids[mask]
+            valid_rel = rel_ids[mask]
+
+            # Extra guard for sentinel padding values.
+            valid_pair_mask = (valid_ent >= 0) & (valid_rel >= 0)
+            valid_ent = valid_ent[valid_pair_mask]
+            valid_rel = valid_rel[valid_pair_mask]
+
+            if valid_ent.numel() > 0:
+                context_entity_chunks.append(valid_ent.long())
+                context_relation_chunks.append(valid_rel.long())
+                context_batch_chunks.append(torch.full((valid_ent.numel(),), sample_idx, dtype=torch.long))
+
+        if context_entity_chunks:
+            context_entity_ids = torch.cat(context_entity_chunks, dim=0)
+            context_relation_ids = torch.cat(context_relation_chunks, dim=0)
+            context_batch_index = torch.cat(context_batch_chunks, dim=0)
+        else:
+            context_entity_ids = torch.zeros(0, dtype=torch.long)
+            context_relation_ids = torch.zeros(0, dtype=torch.long)
+            context_batch_index = torch.zeros(0, dtype=torch.long)
         
         return {
-            'h_batch': {'input_ids': h_enc['input_ids'], 'attention_mask': h_enc['attention_mask'], 'id': h_ids},
-            'r_batch': {'input_ids': r_enc['input_ids'], 'attention_mask': r_enc['attention_mask'], 'id': r_ids},
-            't_batch': {'input_ids': t_enc['input_ids'], 'attention_mask': t_enc['attention_mask'], 'id': t_ids},
+            'h_batch': {'id': h_ids},
+            'r_batch': {'id': r_ids},
+            't_batch': {'id': t_ids},
             'context_batch': {
-                'input_ids': ctx_enc['input_ids'],
-                'attention_mask': ctx_enc['attention_mask'],
-                'id': context_ids,
-                'rel_input_ids': ctx_rel_enc['input_ids'],
-                'rel_attention_mask': ctx_rel_enc['attention_mask'],
-                'rel_id': context_rel_ids,
-            }
+                'id': context_entity_ids,
+                'rel_id': context_relation_ids,
+                'batch_index': context_batch_index,
+            },
         }

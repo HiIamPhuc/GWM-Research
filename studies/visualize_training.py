@@ -1,8 +1,8 @@
 """Visualize GWM training logs.
 
 Current training logs contain aggregate validation metrics, training loss,
-and compact GatedFusion gate means. The plotting code remains tolerant of
-incomplete runs and older logs that may not contain gate statistics.
+and compact relation-gated context diagnostics. The plotting code remains
+tolerant of incomplete runs and older logs.
 """
 
 import argparse
@@ -66,31 +66,6 @@ def plot_lines(ax, entries, specs, title, ylabel, ylim=None):
         )
 
 
-def gate_label(key):
-    label = key
-    if label.startswith('train_'):
-        label = label[len('train_'):]
-    return label.replace('_gate', '').replace('_', ' ')
-
-
-def gate_specs(entries, styles):
-    preferred = [
-        'train_entity_gate',
-        'train_relation_gate'
-    ]
-    available = {
-        key
-        for entry in entries
-        for key in entry
-        if key.startswith('train_') and key.endswith('_gate')
-    }
-    keys = [key for key in preferred if key in available]
-    return [
-        (key, gate_label(key), styles[idx % len(styles)])
-        for idx, key in enumerate(keys)
-    ]
-
-
 def plot_training_curves(log_data, output_path=None, show=True, run_name=None):
     entries = epoch_entries(log_data)
     if not entries:
@@ -146,10 +121,14 @@ def plot_training_curves(log_data, output_path=None, show=True, run_name=None):
     plot_lines(
         ax5,
         entries,
-        gate_specs(entries, styles),
-        'GatedFusion Gate Means',
-        'Mean gate',
-        ylim=(0, 1),
+        [
+            ('context_strength', 'context strength', styles[0]),
+            ('context_gate_mean', 'gate mean', styles[1]),
+            ('context_gate_std', 'gate std', styles[2]),
+        ],
+        'Relation-Gated Context',
+        'Value',
+        ylim=(-1, 1),
     )
 
     if run_name:
@@ -212,18 +191,18 @@ def print_metrics_summary(log_data):
             if value is not None:
                 print(f"  {label:7s}: {value:.4f}")
 
-    gate_mean_keys = sorted({
-        key
-        for entry in entries
-        for key in entry
-        if key.startswith('train_') and key.endswith('_gate')
-    })
-    if gate_mean_keys:
-        print("\nFinal Gate Values:")
+    context_keys = (
+        'context_strength',
+        'context_gate_mean',
+        'context_gate_std',
+    )
+    if entries and any(key in entries[-1] for key in context_keys):
+        print("\nFinal Context Values:")
         final_entry = entries[-1]
-        for key in gate_mean_keys:
+        for key in context_keys:
             if key in final_entry:
-                print(f"  {gate_label(key):24s}: {final_entry[key]:.4f}")
+                label = key.replace('_', ' ')
+                print(f"  {label:24s}: {final_entry[key]:.4f}")
 
     final_events = [entry for entry in log_data if entry.get('event') == 'training_complete']
     if final_events:

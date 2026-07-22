@@ -100,7 +100,7 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'structural_mean_context_head_relation_lstm_dot',
+            'architecture': 'structural_relation_gated_context_head_lstm_dot',
             'training_objective': getattr(
                 model.config,
                 'training_objective',
@@ -140,7 +140,7 @@ def train(args):
     config.context_k_requested = train_dataset.context_k_requested
     config.context_k_effective = train_dataset.context_k_effective
     print(
-        "Using precomputed mean context "
+        "Using precomputed context for relation-gated head contextualization "
         f"(k_requested={config.context_k_requested}, "
         f"k_effective={config.context_k_effective})."
     )
@@ -306,9 +306,12 @@ def train(args):
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
+        context_stats = model.context_stats()
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
+            f"Context Strength: {context_stats['context_strength']:.4f} | "
+            f"Gate Mean: {context_stats['context_gate_mean']:.4f} | "
             f"Train Time: {epoch_train_seconds:.2f}s"
         )
         
@@ -362,6 +365,7 @@ def train(args):
                 'val_forward_mrr': directional_val_metrics['forward']['MRR'],
                 'val_backward_mrr': directional_val_metrics['backward']['MRR'],
             }
+            epoch_log.update(context_stats)
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                 json.dump(history, f, indent=2)
@@ -393,6 +397,7 @@ def train(args):
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
             }
+            epoch_log.update(context_stats)
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                   json.dump(history, f, indent=2)

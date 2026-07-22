@@ -29,7 +29,7 @@ def filtered_in_batch_contrastive_loss(scores, truth_mask=None):
 
 
 class GWM(nn.Module):
-    """Structural LSTM initialized by a mean-composed local graph state."""
+    """Structural LSTM with a relation-gated contextual head."""
 
     def __init__(self, config):
         super().__init__()
@@ -45,6 +45,9 @@ class GWM(nn.Module):
             int(config.num_relations),
             self.embedding_dim,
         )
+        self.context_gate_scale = nn.Parameter(torch.zeros(self.embedding_dim))
+        self.context_gate_bias = nn.Parameter(torch.zeros(self.embedding_dim))
+        self.context_strength = nn.Parameter(torch.tensor(0.0))
 
         dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
         self.lstm = nn.LSTM(
@@ -54,7 +57,7 @@ class GWM(nn.Module):
             batch_first=True,
         )
 
-    def _mean_context_state(self, context_batch, batch_size):
+    def _mean_context(self, context_batch, batch_size):
         context_entity_ids = context_batch['id']
         context_relation_ids = context_batch['rel_id']
         context_batch_index = context_batch['batch_index']
@@ -97,23 +100,39 @@ class GWM(nn.Module):
         )
         return state / counts.clamp_min(1.0)
 
+    def _contextualize_head(self, head, relation, context):
+        gate = torch.sigmoid(
+            self.context_gate_scale * relation + self.context_gate_bias
+        )
+        strength = torch.tanh(self.context_strength)
+        return head + strength * gate * context
+
+    @torch.no_grad()
+    def context_stats(self):
+        relation_gates = torch.sigmoid(
+            self.context_gate_scale * self.struct_rel_embs.weight
+            + self.context_gate_bias
+        )
+        return {
+            'context_strength': torch.tanh(self.context_strength).item(),
+            'context_gate_mean': relation_gates.mean().item(),
+            'context_gate_std': relation_gates.std(unbiased=False).item(),
+        }
+
     def encode_query(self, h_batch, r_batch, context_batch):
         head = self.struct_ent_embs(h_batch['id'])
         relation = self.struct_rel_embs(r_batch['id'])
-        world_state = self._mean_context_state(
+        context = self._mean_context(
             context_batch,
             batch_size=head.size(0),
         )
-        initial_state = world_state.unsqueeze(0).expand(
-            self.lstm.num_layers,
-            -1,
-            -1,
-        ).contiguous()
-        sequence = torch.stack([head, relation], dim=1)
-        _, (hidden, _) = self.lstm(
-            sequence,
-            (initial_state, initial_state.clone()),
+        contextual_head = self._contextualize_head(
+            head,
+            relation,
+            context,
         )
+        sequence = torch.stack([contextual_head, relation], dim=1)
+        _, (hidden, _) = self.lstm(sequence)
         return F.normalize(hidden[-1], p=2, dim=-1)
 
     def forward(self, h_batch, r_batch, context_batch):

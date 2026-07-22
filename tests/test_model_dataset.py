@@ -22,7 +22,10 @@ def make_config():
         num_entities=4,
         num_relations=4,
         struct_emb_dim=4,
-        dynamics_layers=1,
+        transformer_layers=1,
+        transformer_heads=2,
+        transformer_ffn_multiplier=2,
+        transformer_dropout=0.0,
         temperature=0.07,
     )
 
@@ -36,32 +39,35 @@ def make_context_batch():
 
 
 class ModelTests(unittest.TestCase):
-    def test_relation_gate_adds_parameters_but_no_heavy_module(self):
+    def test_context_free_transformer_has_expected_modules(self):
         model = GWM(make_config())
         child_modules = set(dict(model.named_children()))
 
         self.assertEqual(
             child_modules,
-            {'struct_ent_embs', 'struct_rel_embs', 'lstm'},
+            {
+                'struct_ent_embs',
+                'struct_rel_embs',
+                'transformer',
+                'transition_projection',
+                'output_norm',
+            },
         )
         self.assertFalse(hasattr(model, 'text_ent_embs'))
         self.assertFalse(hasattr(model, 'adapter'))
         self.assertFalse(hasattr(model, 'fusion'))
-        self.assertFalse(hasattr(model, 'world_state_encoder'))
-        self.assertFalse(hasattr(model, 'output_projection'))
-        self.assertEqual(model.context_gate_scale.numel(), 4)
-        self.assertEqual(model.context_gate_bias.numel(), 4)
-        self.assertEqual(model.context_strength.numel(), 1)
+        self.assertFalse(hasattr(model, 'lstm'))
+        self.assertEqual(tuple(model.token_roles.shape), (2, 4))
 
-    def test_zero_strength_starts_from_basic_head_relation_sequence(self):
+    def test_transformer_receives_role_encoded_tokens_and_causal_mask(self):
         model = GWM(make_config())
+        model.eval()
         captured = {}
 
         def capture_input(module, inputs):
-            captured['sequence'] = inputs[0].detach().clone()
-            captured['input_count'] = len(inputs)
+            captured['tokens'] = inputs[0].detach().clone()
 
-        handle = model.lstm.register_forward_pre_hook(capture_input)
+        handle = model.transformer.register_forward_pre_hook(capture_input)
         h_ids = torch.tensor([0, 1])
         r_ids = torch.tensor([2, 3])
         model({'id': h_ids}, {'id': r_ids}, make_context_batch())
@@ -70,89 +76,29 @@ class ModelTests(unittest.TestCase):
         expected = torch.stack(
             [model.struct_ent_embs(h_ids), model.struct_rel_embs(r_ids)],
             dim=1,
+        ) + model.token_roles.unsqueeze(0)
+        self.assertTrue(torch.equal(captured['tokens'], expected))
+        self.assertEqual(
+            model.transition_mask.tolist(),
+            [[False, True], [False, False]],
         )
-        self.assertTrue(torch.equal(captured['sequence'], expected))
-        self.assertEqual(captured['input_count'], 1)
 
-    def test_relation_gate_modifies_contextual_head_not_lstm_state(self):
+    def test_query_is_independent_of_context(self):
         model = GWM(make_config())
-        with torch.no_grad():
-            model.struct_ent_embs.weight.zero_()
-            model.struct_rel_embs.weight.fill_(1.0)
-            model.struct_ent_embs.weight[1] = torch.tensor([1.0, 2.0, 3.0, 4.0])
-            model.struct_ent_embs.weight[2] = torch.tensor([3.0, 4.0, 5.0, 6.0])
-            model.context_strength.fill_(torch.atanh(torch.tensor(0.5)))
-
-        context_batch = {
-            'id': torch.tensor([1, 2]),
-            'rel_id': torch.tensor([0, 0]),
-            'batch_index': torch.tensor([0, 0]),
-        }
-        captured = {}
-
-        def capture_sequence(module, inputs):
-            captured['sequence'] = inputs[0].detach().clone()
-            captured['input_count'] = len(inputs)
-
-        handle = model.lstm.register_forward_pre_hook(capture_sequence)
-        model(
-            {'id': torch.tensor([0, 3])},
-            {'id': torch.tensor([2, 3])},
-            context_batch,
+        model.eval()
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([2, 3])}
+        first = model(h_batch, r_batch, make_context_batch())
+        second = model(
+            h_batch,
+            r_batch,
+            {
+                'id': torch.tensor([], dtype=torch.long),
+                'rel_id': torch.tensor([], dtype=torch.long),
+                'batch_index': torch.tensor([], dtype=torch.long),
+            },
         )
-        handle.remove()
-
-        expected_contextual_heads = torch.tensor(
-            [[0.5, 0.75, 1.0, 1.25], [0.0, 0.0, 0.0, 0.0]]
-        )
-        self.assertTrue(
-            torch.allclose(captured['sequence'][:, 0], expected_contextual_heads)
-        )
-        self.assertTrue(
-            torch.equal(captured['sequence'][:, 1], torch.ones(2, 4))
-        )
-        self.assertEqual(captured['input_count'], 1)
-
-        stats = model.context_stats()
-        self.assertAlmostEqual(stats['context_strength'], 0.5, places=6)
-        self.assertAlmostEqual(stats['context_gate_mean'], 0.5, places=6)
-        self.assertAlmostEqual(stats['context_gate_std'], 0.0, places=6)
-
-    def test_query_relation_changes_the_contextual_head(self):
-        model = GWM(make_config())
-        with torch.no_grad():
-            model.struct_ent_embs.weight.zero_()
-            model.struct_ent_embs.weight[1].fill_(1.0)
-            model.struct_rel_embs.weight.zero_()
-            model.struct_rel_embs.weight[0].fill_(1.0)
-            model.struct_rel_embs.weight[3].fill_(2.0)
-            model.context_gate_scale.fill_(1.0)
-            model.context_strength.fill_(torch.atanh(torch.tensor(0.5)))
-
-        context_batch = {
-            'id': torch.tensor([1, 1]),
-            'rel_id': torch.tensor([0, 0]),
-            'batch_index': torch.tensor([0, 1]),
-        }
-        captured = {}
-
-        def capture_sequence(module, inputs):
-            captured['sequence'] = inputs[0].detach().clone()
-
-        handle = model.lstm.register_forward_pre_hook(capture_sequence)
-        model(
-            {'id': torch.tensor([0, 0])},
-            {'id': torch.tensor([2, 3])},
-            context_batch,
-        )
-        handle.remove()
-
-        self.assertFalse(
-            torch.allclose(
-                captured['sequence'][0, 0],
-                captured['sequence'][1, 0],
-            )
-        )
+        self.assertTrue(torch.equal(first, second))
 
     def test_query_target_loss_backpropagates(self):
         model = GWM(make_config())
@@ -173,10 +119,11 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(model.struct_ent_embs.weight.grad)
         self.assertIsNotNone(model.struct_rel_embs.weight.grad)
-        self.assertIsNotNone(model.lstm.weight_ih_l0.grad)
-        self.assertIsNotNone(model.context_strength.grad)
-        self.assertIsNotNone(model.context_gate_scale.grad)
-        self.assertIsNotNone(model.context_gate_bias.grad)
+        self.assertIsNotNone(
+            model.transformer.layers[0].self_attn.in_proj_weight.grad
+        )
+        self.assertIsNotNone(model.transition_projection.weight.grad)
+        self.assertIsNotNone(model.token_roles.grad)
 
     def test_targets_are_normalized_entity_embeddings(self):
         model = GWM(make_config())

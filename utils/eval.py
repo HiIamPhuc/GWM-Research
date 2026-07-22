@@ -327,9 +327,6 @@ def compute_filtered_ranking_metrics(
         for batch in tqdm(data_loader, desc=desc):
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
-            context_batch = {
-                k: v.to(device) for k, v in batch['context_batch'].items()
-            }
 
             t_ids = batch['t_batch']['id'].to(device)
             h_ids_tensor = batch['h_batch']['id']
@@ -340,7 +337,6 @@ def compute_filtered_ranking_metrics(
             scores = model.score_all_entities(
                 h_batch,
                 r_batch,
-                context_batch,
                 candidate_vectors=all_entity_embeddings,
             )
 

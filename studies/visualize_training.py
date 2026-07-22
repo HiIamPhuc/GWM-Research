@@ -1,8 +1,8 @@
 """Visualize GWM training logs.
 
-Current training logs contain aggregate validation metrics, training loss,
-and compact relation-gated context diagnostics. The plotting code remains
-tolerant of incomplete runs and older logs.
+Current training logs contain aggregate and directional validation metrics plus
+training loss. The plotting code remains tolerant of incomplete runs and older
+logs.
 """
 
 import argparse
@@ -122,13 +122,12 @@ def plot_training_curves(log_data, output_path=None, show=True, run_name=None):
         ax5,
         entries,
         [
-            ('context_strength', 'context strength', styles[0]),
-            ('context_gate_mean', 'gate mean', styles[1]),
-            ('context_gate_std', 'gate std', styles[2]),
+            ('val_forward_mrr', 'forward MRR', styles[0]),
+            ('val_backward_mrr', 'backward MRR', styles[1]),
         ],
-        'Relation-Gated Context',
-        'Value',
-        ylim=(-1, 1),
+        'Directional Validation MRR',
+        'MRR',
+        ylim=(0, 1),
     )
 
     if run_name:
@@ -190,19 +189,6 @@ def print_metrics_summary(log_data):
             value = final_validation.get(key)
             if value is not None:
                 print(f"  {label:7s}: {value:.4f}")
-
-    context_keys = (
-        'context_strength',
-        'context_gate_mean',
-        'context_gate_std',
-    )
-    if entries and any(key in entries[-1] for key in context_keys):
-        print("\nFinal Context Values:")
-        final_entry = entries[-1]
-        for key in context_keys:
-            if key in final_entry:
-                label = key.replace('_', ' ')
-                print(f"  {label:24s}: {final_entry[key]:.4f}")
 
     final_events = [entry for entry in log_data if entry.get('event') == 'training_complete']
     if final_events:

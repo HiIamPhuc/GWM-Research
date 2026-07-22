@@ -137,13 +137,6 @@ def train(args):
     train_dataset = GWMDataset(config.data_dir, split='train')
     train_truth_index = TrainTruthIndex(train_dataset.triples)
     print(f"Loaded {len(train_dataset)} training triples.")
-    config.context_k_requested = train_dataset.context_k_requested
-    config.context_k_effective = train_dataset.context_k_effective
-    print(
-        "Using precomputed context for relation-gated head contextualization "
-        f"(k_requested={config.context_k_requested}, "
-        f"k_effective={config.context_k_effective})."
-    )
     
     # Infer input dimensions from dataset
     # e.g., number of entities/relations for embedding layers
@@ -276,13 +269,10 @@ def train(args):
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
             t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
-            context_batch = {
-                k: v.to(device) for k, v in batch['context_batch'].items()
-            }
 
             optimizer.zero_grad()
 
-            query_vectors = model(h_batch, r_batch, context_batch)
+            query_vectors = model(h_batch, r_batch)
             target_vectors = model.encode_target(t_batch)
             loss, _ = model.compute_loss(
                 query_vectors,
@@ -306,12 +296,9 @@ def train(args):
         epoch_train_seconds = time.perf_counter() - epoch_start_time
             
         avg_train_loss = total_loss / len(train_loader)
-        context_stats = model.context_stats()
 
         print(
             f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-            f"Context Strength: {context_stats['context_strength']:.4f} | "
-            f"Gate Mean: {context_stats['context_gate_mean']:.4f} | "
             f"Train Time: {epoch_train_seconds:.2f}s"
         )
         
@@ -365,7 +352,6 @@ def train(args):
                 'val_forward_mrr': directional_val_metrics['forward']['MRR'],
                 'val_backward_mrr': directional_val_metrics['backward']['MRR'],
             }
-            epoch_log.update(context_stats)
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                 json.dump(history, f, indent=2)
@@ -397,7 +383,6 @@ def train(args):
                 'epoch': epoch + 1,
                 'train_loss': avg_train_loss,
             }
-            epoch_log.update(context_stats)
             history.append(epoch_log)
             with open(log_path, 'w') as f:
                   json.dump(history, f, indent=2)

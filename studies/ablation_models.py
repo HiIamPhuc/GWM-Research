@@ -1,7 +1,7 @@
 """Model factory retained for study scripts.
 
 The current experiment has one architecture only: trainable structural
-embeddings with relation-gated context followed by a two-step LSTM.
+embeddings followed by a causal two-token Transformer transition.
 """
 
 from model.model import GWM

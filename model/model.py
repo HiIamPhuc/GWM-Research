@@ -29,7 +29,7 @@ def filtered_in_batch_contrastive_loss(scores, truth_mask=None):
 
 
 class GWM(nn.Module):
-    """Structural LSTM with a relation-gated contextual head."""
+    """Context-free structural model with a two-token Transformer transition."""
 
     def __init__(self, config):
         super().__init__()
@@ -45,97 +45,53 @@ class GWM(nn.Module):
             int(config.num_relations),
             self.embedding_dim,
         )
-        self.context_gate_scale = nn.Parameter(torch.zeros(self.embedding_dim))
-        self.context_gate_bias = nn.Parameter(torch.zeros(self.embedding_dim))
-        self.context_strength = nn.Parameter(torch.tensor(0.0))
+        transformer_heads = int(getattr(config, 'transformer_heads', 4))
+        if self.embedding_dim % transformer_heads != 0:
+            raise ValueError(
+                "struct_emb_dim must be divisible by transformer_heads. "
+                f"Got {self.embedding_dim} and {transformer_heads}."
+            )
 
-        dynamics_layers = int(getattr(config, 'dynamics_layers', 1))
-        self.lstm = nn.LSTM(
-            input_size=self.embedding_dim,
-            hidden_size=self.embedding_dim,
-            num_layers=dynamics_layers,
+        transformer_layers = int(getattr(config, 'transformer_layers', 1))
+        ffn_multiplier = int(getattr(config, 'transformer_ffn_multiplier', 2))
+        transformer_dropout = float(getattr(config, 'transformer_dropout', 0.1))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.embedding_dim,
+            nhead=transformer_heads,
+            dim_feedforward=ffn_multiplier * self.embedding_dim,
+            dropout=transformer_dropout,
+            activation='gelu',
             batch_first=True,
+            norm_first=True,
         )
-
-    def _mean_context(self, context_batch, batch_size):
-        context_entity_ids = context_batch['id']
-        context_relation_ids = context_batch['rel_id']
-        context_batch_index = context_batch['batch_index']
-
-        if not (
-            context_entity_ids.dim()
-            == context_relation_ids.dim()
-            == context_batch_index.dim()
-            == 1
-        ):
-            raise ValueError("Ragged context tensors must be one-dimensional.")
-        if not (
-            context_entity_ids.numel()
-            == context_relation_ids.numel()
-            == context_batch_index.numel()
-        ):
-            raise ValueError("Ragged context tensors must have equal lengths.")
-        if context_batch_index.numel() and (
-            context_batch_index.min() < 0
-            or context_batch_index.max() >= batch_size
-        ):
-            raise ValueError("Context batch index is outside the current batch.")
-
-        state = self.struct_ent_embs.weight.new_zeros(
-            batch_size,
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=transformer_layers,
+        )
+        self.token_roles = nn.Parameter(torch.empty(2, self.embedding_dim))
+        self.transition_projection = nn.Linear(
+            self.embedding_dim,
             self.embedding_dim,
         )
-        counts = self.struct_ent_embs.weight.new_zeros(batch_size, 1)
-        if context_entity_ids.numel() == 0:
-            return state
-
-        context_entities = self.struct_ent_embs(context_entity_ids)
-        context_relations = self.struct_rel_embs(context_relation_ids)
-        composed_facts = context_entities * context_relations
-        state.index_add_(0, context_batch_index, composed_facts)
-        counts.index_add_(
-            0,
-            context_batch_index,
-            counts.new_ones(context_batch_index.numel(), 1),
+        self.output_norm = nn.LayerNorm(self.embedding_dim)
+        self.register_buffer(
+            'transition_mask',
+            torch.tensor([[False, True], [False, False]]),
+            persistent=False,
         )
-        return state / counts.clamp_min(1.0)
+        nn.init.normal_(self.token_roles, mean=0.0, std=0.02)
 
-    def _contextualize_head(self, head, relation, context):
-        gate = torch.sigmoid(
-            self.context_gate_scale * relation + self.context_gate_bias
-        )
-        strength = torch.tanh(self.context_strength)
-        return head + strength * gate * context
-
-    @torch.no_grad()
-    def context_stats(self):
-        relation_gates = torch.sigmoid(
-            self.context_gate_scale * self.struct_rel_embs.weight
-            + self.context_gate_bias
-        )
-        return {
-            'context_strength': torch.tanh(self.context_strength).item(),
-            'context_gate_mean': relation_gates.mean().item(),
-            'context_gate_std': relation_gates.std(unbiased=False).item(),
-        }
-
-    def encode_query(self, h_batch, r_batch, context_batch):
+    def encode_query(self, h_batch, r_batch, context_batch=None):
         head = self.struct_ent_embs(h_batch['id'])
         relation = self.struct_rel_embs(r_batch['id'])
-        context = self._mean_context(
-            context_batch,
-            batch_size=head.size(0),
-        )
-        contextual_head = self._contextualize_head(
-            head,
-            relation,
-            context,
-        )
-        sequence = torch.stack([contextual_head, relation], dim=1)
-        _, (hidden, _) = self.lstm(sequence)
-        return F.normalize(hidden[-1], p=2, dim=-1)
+        tokens = torch.stack([head, relation], dim=1)
+        tokens = tokens + self.token_roles.unsqueeze(0)
+        encoded = self.transformer(tokens, mask=self.transition_mask)
+        transition_delta = self.transition_projection(encoded[:, 1])
+        query = self.output_norm(head + transition_delta)
+        return F.normalize(query, p=2, dim=-1)
 
-    def forward(self, h_batch, r_batch, context_batch):
+    def forward(self, h_batch, r_batch, context_batch=None):
         return self.encode_query(h_batch, r_batch, context_batch)
 
     def encode_target(self, t_batch):
@@ -154,7 +110,7 @@ class GWM(nn.Module):
         self,
         h_batch,
         r_batch,
-        context_batch,
+        context_batch=None,
         candidate_vectors=None,
     ):
         query_vectors = self.encode_query(h_batch, r_batch, context_batch)

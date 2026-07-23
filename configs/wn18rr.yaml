@@ -1,4 +1,4 @@
-# Context-free structural two-token Transformer
+# Context-free structural Transformer with shared inverse relations
 struct_emb_dim: 512
 transformer_layers: 1
 transformer_heads: 4
@@ -20,10 +20,10 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 data_dir: data-processed/wn18rr
-output_dir: output/wn18rr-two-token-transformer
+output_dir: output/wn18rr-shared-inverse-transformer
 add_inverse: true
 seed: 42
 
 save_eval_predictions: false
 eval_topk: 10
-eval_predictions_dir: output/wn18rr-two-token-transformer/predictions
+eval_predictions_dir: output/wn18rr-shared-inverse-transformer/predictions

@@ -5,6 +5,7 @@ from tqdm import tqdm
 import numpy as np
 import re
 from transformers import AutoModel, AutoTokenizer
+from relation_mapping import save_relation_direction_mapping
 
 def load_triples(file_path):
     """Load triples from a text file."""
@@ -438,6 +439,11 @@ def process_dataset(
         json.dump(entity2id, f, indent=2)
     with open(out_path / 'relation2id.json', 'w') as f:
         json.dump(relation2id, f, indent=2)
+    save_relation_direction_mapping(
+        out_path,
+        relation2id,
+        require_inverse=add_inverse,
+    )
 
     train_tensor = triples_to_ids(train_triples, entity2id, relation2id, add_inverse=add_inverse)
     valid_tensor = triples_to_ids(valid_triples, entity2id, relation2id, add_inverse=False)

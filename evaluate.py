@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.dataset import GWMDataset, CollateFN
 from model.model import GWM
+from utils.relation_mapping import attach_relation_direction_mapping
 from utils.eval import (
     build_bidirectional_hr_map_for_filtering,
     build_entity_loader,
@@ -48,6 +49,7 @@ def evaluate(args):
         config.num_entities = len(json.load(f))
     with open(os.path.join(config.data_dir, 'relation2id.json')) as f:
         config.num_relations = len(json.load(f))
+    attach_relation_direction_mapping(config, config.data_dir)
 
     model = GWM(config).to(device)
     

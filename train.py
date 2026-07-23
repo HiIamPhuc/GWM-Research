@@ -16,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import GWM
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
+from utils.relation_mapping import attach_relation_direction_mapping
 from utils.eval import (
     build_bidirectional_hr_map_for_filtering,
     build_entity_loader,
@@ -100,7 +101,7 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'structural_relation_gated_context_head_lstm_dot',
+            'architecture': 'structural_shared_inverse_two_token_transformer_dot',
             'training_objective': getattr(
                 model.config,
                 'training_objective',
@@ -148,6 +149,10 @@ def train(args):
         
     config.num_entities = num_ent
     config.num_relations = num_rel
+    relation_mapping = attach_relation_direction_mapping(
+        config,
+        config.data_dir,
+    )
     
     # Init Model
     print("Initializing model...")
@@ -169,7 +174,11 @@ def train(args):
         worker_init_fn=make_worker_init_fn(seed),
     )
 
-    print("Using trainable structural entity and relation embeddings.")
+    print(
+        "Using trainable structural entity embeddings and "
+        f"{relation_mapping['num_base_relations']} shared base relation "
+        "embeddings with learned direction parameterization."
+    )
     
     # Save effective config (including inferred dimensions, CLI overrides, and model params).
     save_training_config(config, config.output_dir, args=args, model=model)

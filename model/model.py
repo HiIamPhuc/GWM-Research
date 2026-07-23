@@ -29,7 +29,7 @@ def filtered_in_batch_contrastive_loss(scores, truth_mask=None):
 
 
 class GWM(nn.Module):
-    """Context-free structural model with a two-token Transformer transition."""
+    """Structural two-token Transformer with shared inverse relations."""
 
     def __init__(self, config):
         super().__init__()
@@ -41,10 +41,49 @@ class GWM(nn.Module):
             int(config.num_entities),
             self.embedding_dim,
         )
-        self.struct_rel_embs = nn.Embedding(
-            int(config.num_relations),
+        self.base_rel_embs = nn.Embedding(
+            int(config.num_base_relations),
             self.embedding_dim,
         )
+        self.direction_embs = nn.Embedding(2, self.embedding_dim)
+        self.inverse_adapter = nn.Linear(
+            self.embedding_dim,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.relation_norm = nn.LayerNorm(self.embedding_dim)
+
+        relation_base_ids = torch.as_tensor(
+            config.relation_base_ids,
+            dtype=torch.long,
+        )
+        relation_directions = torch.as_tensor(
+            config.relation_directions,
+            dtype=torch.long,
+        )
+        num_relations = int(config.num_relations)
+        if relation_base_ids.shape != (num_relations,):
+            raise ValueError(
+                "relation_base_ids must contain one entry per expanded "
+                f"relation. Expected {num_relations}, got "
+                f"{relation_base_ids.numel()}."
+            )
+        if relation_directions.shape != (num_relations,):
+            raise ValueError(
+                "relation_directions must contain one entry per expanded "
+                f"relation. Expected {num_relations}, got "
+                f"{relation_directions.numel()}."
+            )
+        if (
+            relation_base_ids.min().item() < 0
+            or relation_base_ids.max().item() >= int(config.num_base_relations)
+        ):
+            raise ValueError("relation_base_ids contains an invalid base relation ID.")
+        if not torch.all((relation_directions == 0) | (relation_directions == 1)):
+            raise ValueError("relation_directions must contain only 0 and 1.")
+
+        self.register_buffer('relation_base_ids', relation_base_ids)
+        self.register_buffer('relation_directions', relation_directions)
         transformer_heads = int(getattr(config, 'transformer_heads', 4))
         if self.embedding_dim % transformer_heads != 0:
             raise ValueError(
@@ -80,10 +119,21 @@ class GWM(nn.Module):
             persistent=False,
         )
         nn.init.normal_(self.token_roles, mean=0.0, std=0.02)
+        nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.inverse_adapter.weight)
+
+    def encode_relation(self, relation_ids):
+        base_ids = self.relation_base_ids[relation_ids]
+        directions = self.relation_directions[relation_ids]
+        base = self.base_rel_embs(base_ids)
+        relation = base + self.direction_embs(directions)
+        inverse_mask = directions.unsqueeze(-1).to(dtype=base.dtype)
+        relation = relation + inverse_mask * self.inverse_adapter(base)
+        return self.relation_norm(relation)
 
     def encode_query(self, h_batch, r_batch, context_batch=None):
         head = self.struct_ent_embs(h_batch['id'])
-        relation = self.struct_rel_embs(r_batch['id'])
+        relation = self.encode_relation(r_batch['id'])
         tokens = torch.stack([head, relation], dim=1)
         tokens = tokens + self.token_roles.unsqueeze(0)
         encoded = self.transformer(tokens, mask=self.transition_mask)

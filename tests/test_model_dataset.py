@@ -15,12 +15,16 @@ from utils.eval import (
     build_bidirectional_hr_map_for_filtering,
     load_inverse_relation_ids,
 )
+from utils.relation_mapping import build_relation_direction_mapping
 
 
 def make_config():
     return SimpleNamespace(
         num_entities=4,
         num_relations=4,
+        num_base_relations=2,
+        relation_base_ids=[0, 0, 1, 1],
+        relation_directions=[0, 1, 0, 1],
         struct_emb_dim=4,
         transformer_layers=1,
         transformer_heads=2,
@@ -47,7 +51,10 @@ class ModelTests(unittest.TestCase):
             child_modules,
             {
                 'struct_ent_embs',
-                'struct_rel_embs',
+                'base_rel_embs',
+                'direction_embs',
+                'inverse_adapter',
+                'relation_norm',
                 'transformer',
                 'transition_projection',
                 'output_norm',
@@ -74,7 +81,7 @@ class ModelTests(unittest.TestCase):
         handle.remove()
 
         expected = torch.stack(
-            [model.struct_ent_embs(h_ids), model.struct_rel_embs(r_ids)],
+            [model.struct_ent_embs(h_ids), model.encode_relation(r_ids)],
             dim=1,
         ) + model.token_roles.unsqueeze(0)
         self.assertTrue(torch.equal(captured['tokens'], expected))
@@ -118,12 +125,38 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(scores.shape, (2, 2))
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(model.struct_ent_embs.weight.grad)
-        self.assertIsNotNone(model.struct_rel_embs.weight.grad)
+        self.assertIsNotNone(model.base_rel_embs.weight.grad)
+        self.assertIsNotNone(model.direction_embs.weight.grad)
+        self.assertIsNotNone(model.inverse_adapter.weight.grad)
         self.assertIsNotNone(
             model.transformer.layers[0].self_attn.in_proj_weight.grad
         )
         self.assertIsNotNone(model.transition_projection.weight.grad)
         self.assertIsNotNone(model.token_roles.grad)
+
+    def test_forward_and_inverse_relations_share_the_same_base_row(self):
+        model = GWM(make_config())
+        self.assertEqual(model.relation_base_ids[[0, 1]].tolist(), [0, 0])
+        self.assertEqual(model.relation_directions[[0, 1]].tolist(), [0, 1])
+
+        relation_vectors = model.encode_relation(torch.tensor([0, 1]))
+        self.assertFalse(torch.allclose(relation_vectors[0], relation_vectors[1]))
+
+        relation_vectors.sum().backward()
+        self.assertGreater(model.base_rel_embs.weight.grad[0].abs().sum().item(), 0.0)
+        self.assertEqual(model.base_rel_embs.weight.grad[1].abs().sum().item(), 0.0)
+
+    def test_relation_mapping_does_not_assume_contiguous_relation_pairs(self):
+        mapping = build_relation_direction_mapping({
+            'r_a_inv': 0,
+            'r_b_inv': 1,
+            'r_a': 2,
+            'r_b': 3,
+        })
+
+        self.assertEqual(mapping['num_base_relations'], 2)
+        self.assertEqual(mapping['full_to_base'], [0, 1, 0, 1])
+        self.assertEqual(mapping['directions'], [1, 1, 0, 0])
 
     def test_targets_are_normalized_entity_embeddings(self):
         model = GWM(make_config())

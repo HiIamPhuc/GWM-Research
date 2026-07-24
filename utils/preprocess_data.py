@@ -6,11 +6,6 @@ import numpy as np
 import re
 from transformers import AutoModel, AutoTokenizer
 
-if __package__:
-    from .relation_mapping import save_relation_direction_mapping
-else:
-    from relation_mapping import save_relation_direction_mapping
-
 def load_triples(file_path):
     """Load triples from a text file."""
     triples = []
@@ -25,22 +20,13 @@ def load_counted_id_map(file_path):
     token_to_id = {}
     id_to_token = {}
     with open(file_path, 'r', encoding='utf-8') as f:
-        first = f.readline().strip()
-        expected_count = int(first) if first else 0
+        f.readline()
         for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) != 2:
-                continue
-            token, raw_id = parts
+            token, raw_id = line.strip().split('\t')
             idx = int(raw_id)
             token_to_id[token] = idx
             id_to_token[idx] = token
 
-    if expected_count != len(token_to_id):
-        raise ValueError(
-            f"{file_path} declares {expected_count} rows but "
-            f"{len(token_to_id)} rows were loaded."
-        )
     return token_to_id, id_to_token
 
 def load_nell995_triples(file_path, id_to_entity, id_to_relation):
@@ -51,24 +37,15 @@ def load_nell995_triples(file_path, id_to_entity, id_to_relation):
     """
     triples = []
     with open(file_path, 'r', encoding='utf-8') as f:
-        first = f.readline().strip()
-        expected_count = int(first) if first else 0
+        f.readline()
         for line in f:
-            parts = line.strip().split()
-            if len(parts) != 3:
-                continue
-            h_id, t_id, r_id = map(int, parts)
+            h_id, t_id, r_id = map(int, line.strip().split())
             triples.append((
                 id_to_entity[h_id],
                 id_to_relation[r_id],
                 id_to_entity[t_id],
             ))
 
-    if expected_count != len(triples):
-        raise ValueError(
-            f"{file_path} declares {expected_count} triples but "
-            f"{len(triples)} triples were loaded."
-        )
     return triples
 
 def load_nell995_dataset(data_dir, add_inverse=True):
@@ -94,10 +71,7 @@ def load_umls_triples(file_path):
     triples = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) != 3:
-                continue
-            triples.append(tuple(parts))
+            triples.append(tuple(line.strip().split('\t')))
     return triples
 
 def load_umls_dataset(data_dir, add_inverse=True):
@@ -115,19 +89,6 @@ def load_umls_dataset(data_dir, add_inverse=True):
     train_triples = load_umls_triples(data_path / 'train.tsv')
     valid_triples = load_umls_triples(data_path / 'valid.tsv')
     test_triples = load_umls_triples(data_path / 'test.tsv')
-
-    known_entities = set(entity2id)
-    known_relations = set(relations)
-    for split_name, triples in (
-        ('train', train_triples),
-        ('valid', valid_triples),
-        ('test', test_triples),
-    ):
-        for h, r, t in triples:
-            if h not in known_entities or t not in known_entities:
-                raise ValueError(f"Unknown entity in UMLS {split_name} triple: {(h, r, t)}")
-            if r not in known_relations:
-                raise ValueError(f"Unknown relation in UMLS {split_name} triple: {(h, r, t)}")
 
     return train_triples, valid_triples, test_triples, entity2id, relation2id
 
@@ -443,12 +404,6 @@ def process_dataset(
         json.dump(entity2id, f, indent=2)
     with open(out_path / 'relation2id.json', 'w') as f:
         json.dump(relation2id, f, indent=2)
-    save_relation_direction_mapping(
-        out_path,
-        relation2id,
-        require_inverse=add_inverse,
-    )
-
     train_tensor = triples_to_ids(train_triples, entity2id, relation2id, add_inverse=add_inverse)
     valid_tensor = triples_to_ids(valid_triples, entity2id, relation2id, add_inverse=False)
     test_tensor = triples_to_ids(test_triples, entity2id, relation2id, add_inverse=False)

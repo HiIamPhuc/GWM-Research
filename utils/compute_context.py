@@ -10,60 +10,18 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.seed import seed_everything
 
 class ContextProcessor:
-    def __init__(self, data_dir, device='cuda'):
+    def __init__(self, data_dir):
         self.data_dir = data_dir
-        self.device = device
-        self.entity2id = json.load(open(os.path.join(data_dir, 'entity2id.json')))
-        self.relation2id = json.load(open(os.path.join(data_dir, 'relation2id.json')))
-        
-    def _load_precomputed_embeddings(self):
-        """Load precomputed text embeddings from cache files."""
-        print("Loading precomputed text embeddings...")
-        
-        entity_emb_path = os.path.join(self.data_dir, 'entity_text_embeddings.pt')
-        if not os.path.exists(entity_emb_path):
-            raise FileNotFoundError(
-                f"entity_text_embeddings.pt not found in {self.data_dir}. "
-                "Run preprocess_data.py with text embedding precomputation first."
-            )
-        
-        # Load embedding cache (may be a dict or tensor)
-        entity_cache = torch.load(entity_emb_path, map_location='cpu')
-        if isinstance(entity_cache, dict):
-            if 'embeddings' in entity_cache:
-                embeddings = entity_cache['embeddings']
-            elif 'tensor' in entity_cache:
-                embeddings = entity_cache['tensor']
-            else:
-                raise ValueError(
-                    "entity_text_embeddings.pt dict must contain 'embeddings' or 'tensor' key."
-                )
-        else:
-            embeddings = entity_cache
-        
-        embeddings = embeddings.float().to(self.device)
-        return embeddings
-        
-    def _compute_embeddings(self, batch_size=32):
-        """Load precomputed embeddings for all entities."""
-        embeddings = self._load_precomputed_embeddings()
-        return embeddings
+        with open(os.path.join(data_dir, 'entity2id.json'), 'r', encoding='utf-8',) as f:
+            self.entity2id = json.load(f)
 
     def _load_adjacency(self):
         triples_path = os.path.join(self.data_dir, 'train_triples.pt')
-        if not os.path.exists(triples_path):
-            raise FileNotFoundError(
-                f"train_triples.pt not found in {self.data_dir}. "
-                "Run preprocess_data.py first."
-            )
-            
         triples = torch.load(triples_path)
         adj = {}
         
         for h, r, t in triples.tolist():
-            if h not in adj:
-                adj[h] = []
-            adj[h].append((r, t))
+            adj.setdefault(h, []).append((r, t))
             
         # Deduplicate relation-tail edges with deterministic ordering.
         for h in adj:
@@ -120,12 +78,7 @@ class ContextProcessor:
         # Store fixed-width tensors with a sentinel mask value.
         context_entity_ids = torch.full((num_entities, max_k), pad_value, dtype=torch.long)
         context_relation_ids = torch.full((num_entities, max_k), pad_value, dtype=torch.long)
-        context_direction_ids = torch.zeros((num_entities, max_k), dtype=torch.long)
         context_mask = torch.zeros((num_entities, max_k), dtype=torch.bool)
-        relation_direction_lookup = torch.zeros(len(self.relation2id), dtype=torch.long)
-        for relation, relation_id in self.relation2id.items():
-            if relation.endswith('_inv'):
-                relation_direction_lookup[int(relation_id)] = 1
 
         for i in tqdm(range(num_entities), desc="Relation-diverse context"):
             neighbors = adj.get(i, [])  # list[(r, t)]
@@ -153,9 +106,6 @@ class ContextProcessor:
             if count > 0:
                 context_entity_ids[i, :count] = selected_ent_ids[:count]
                 context_relation_ids[i, :count] = selected_rel_ids[:count]
-                context_direction_ids[i, :count] = relation_direction_lookup[
-                    selected_rel_ids[:count]
-                ]
                 context_mask[i, :count] = True
 
         # Save one compact artifact.
@@ -164,21 +114,13 @@ class ContextProcessor:
             {
                 'entity_ids': context_entity_ids,
                 'relation_ids': context_relation_ids,
-                'direction_ids': context_direction_ids,
                 'mask': context_mask,
-                'pad_value': pad_value,
-                'k_requested': limit,
-                'k_effective': max_k,
-                'algorithm': 'relation_diverse',
             },
             output_file,
         )
 
         print(f"Context neighbors saved to {output_file}")
-        print(
-            f"  pad_value={pad_value}, k_effective={max_k}, "
-            "algorithm=relation_diverse"
-        )
+        print(f"  context width={max_k}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -190,12 +132,6 @@ if __name__ == '__main__':
         help='Max number of context neighbors per entity. Use k<=0 to keep all real neighbors (variable count).',
     )
     parser.add_argument(
-        '--device',
-        type=str,
-        default='cuda',
-        help='Device to use (cuda or cpu)'
-    )
-    parser.add_argument(
         '--seed',
         type=int,
         default=42,
@@ -205,5 +141,5 @@ if __name__ == '__main__':
 
     seed_everything(args.seed)
     
-    processor = ContextProcessor(args.data_dir, device=args.device)
+    processor = ContextProcessor(args.data_dir)
     processor.compute_context_nodes(k=args.k)

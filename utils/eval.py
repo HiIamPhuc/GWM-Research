@@ -26,8 +26,6 @@ class TensorTripleDataset(Dataset):
         self.base_dataset = base_dataset
         self.data_dir = base_dataset.data_dir
         self.split = base_dataset.split
-        self.num_entities = base_dataset.num_entities
-        self.num_relations = base_dataset.num_relations
         self.triples = torch.as_tensor(triples, dtype=torch.long)
 
     def __len__(self):
@@ -44,36 +42,10 @@ def load_triples_for_filtering(data_dir, splits=None):
     all_triples = set()
     for split in splits:
         path = os.path.join(data_dir, f'{split}_triples.pt')
-        if os.path.exists(path):
-            triples = torch.load(path)
-            for h, r, t in triples:
-                all_triples.add((h.item(), r.item(), t.item()))
+        triples = torch.load(path)
+        for h, r, t in triples:
+            all_triples.add((h.item(), r.item(), t.item()))
     return all_triples
-
-
-def load_hr_map_for_filtering(data_dir, preferred_ground_truth_file=None, fallback_splits=None):
-    if fallback_splits is None:
-        fallback_splits = ['train']
-
-    if preferred_ground_truth_file is not None:
-        gt_path = os.path.join(data_dir, preferred_ground_truth_file)
-        if os.path.exists(gt_path):
-            with open(gt_path, 'r') as f:
-                gt_json = json.load(f)
-
-            hr_map = {}
-            for key, tails in gt_json.items():
-                h, r = map(int, key.split(','))
-                hr_map[(h, r)] = set(int(t) for t in tails)
-            return hr_map
-
-    all_triples = load_triples_for_filtering(data_dir, splits=fallback_splits)
-    hr_map = {}
-    for h, r, t in all_triples:
-        if (h, r) not in hr_map:
-            hr_map[(h, r)] = set()
-        hr_map[(h, r)].add(t)
-    return hr_map
 
 
 def load_inverse_relation_id_map(data_dir):
@@ -81,23 +53,11 @@ def load_inverse_relation_id_map(data_dir):
         relation2id = json.load(f)
 
     inverse_relation_ids = {}
-    missing = []
     for relation, relation_id in relation2id.items():
         inverse_relation = (
             relation[:-4] if relation.endswith('_inv') else relation + '_inv'
         )
-        if inverse_relation not in relation2id:
-            missing.append(relation)
-            continue
         inverse_relation_ids[int(relation_id)] = int(relation2id[inverse_relation])
-
-    if missing:
-        preview = ', '.join(missing[:10])
-        raise ValueError(
-            "Strict bidirectional evaluation requires every relation to have "
-            f"an inverse relation ID. Missing inverse entries for: {preview}"
-        )
-
     return inverse_relation_ids
 
 
@@ -111,10 +71,6 @@ def load_inverse_relation_ids(data_dir):
         for relation, relation_id in relation2id.items()
         if relation.endswith('_inv')
     )
-    if not inverse_relation_ids:
-        raise ValueError(
-            "Directional scoring requires relation names ending in `_inv`."
-        )
     return inverse_relation_ids
 
 
@@ -293,9 +249,6 @@ def _add_ranks_to_state(state, ranks):
 
 def _finalize_metric_state(state):
     total = state['count']
-    if total == 0:
-        raise ValueError("Cannot compute ranking metrics from zero queries.")
-
     return {
         'MRR': state['mrr'] / total,
         'MR': state['mr'] / total,

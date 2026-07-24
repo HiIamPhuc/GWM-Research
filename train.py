@@ -1,99 +1,43 @@
-import os
+import argparse
+import json
 import math
+import os
+import sys
 import time
+from types import SimpleNamespace
+
 import torch
+import yaml
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import argparse
-import yaml
-import json
-from torch.optim.lr_scheduler import LambdaLR
 
-# Need to set PYTHONPATH or import relatively if structure is respected
-import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import GWM
-from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
-from utils.relation_mapping import attach_relation_direction_mapping
+from utils.early_stopping import EarlyStopping
 from utils.eval import (
     build_bidirectional_hr_map_for_filtering,
     build_entity_loader,
     compute_bidirectional_filtered_ranking_metrics,
     encode_all_entities_as_targets,
 )
-from utils.early_stopping import EarlyStopping
-
-def _to_serializable(value):
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_to_serializable(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _to_serializable(v) for k, v in value.items()}
-    return str(value)
-
-
-def _get_model_parameter_info(model):
-    total_params = 0
-    trainable_params = 0
-    param_details = []
-
-    for name, param in model.named_parameters():
-        numel = int(param.numel())
-        total_params += numel
-        if param.requires_grad:
-            trainable_params += numel
-
-        param_details.append({
-            'name': name,
-            'shape': list(param.shape),
-            'numel': numel,
-            'requires_grad': bool(param.requires_grad),
-            'dtype': str(param.dtype).replace('torch.', ''),
-        })
-
-    return {
-        'total': total_params,
-        'trainable': trainable_params,
-        'frozen': total_params - trainable_params,
-        'parameters': param_details,
-    }
-
-
-def save_training_config(config, output_dir, args=None, model=None):
-    """Persist the effective training config used for this run."""
-    config_dict = {k: _to_serializable(v) for k, v in vars(config).items()}
-    if args is not None:
-        config_dict['cli_args'] = {k: _to_serializable(v) for k, v in vars(args).items()}
-    if model is not None:
-        config_dict['model_parameters'] = _get_model_parameter_info(model)
-
-    config_path = os.path.join(output_dir, 'training_config.json')
-    with open(config_path, 'w', encoding='utf-8') as f:
-        json.dump(config_dict, f, indent=2)
+from utils.relation_mapping import attach_relation_direction_mapping
+from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
 
 
 def get_config(args):
     with open(args.config, 'r') as f:
-        config_dict = yaml.safe_load(f)
-
-    # Override with args
+        values = yaml.safe_load(f)
     if args.data_dir:
-        config_dict['data_dir'] = args.data_dir
+        values['data_dir'] = args.data_dir
     if args.output_dir:
-        config_dict['output_dir'] = args.output_dir
+        values['output_dir'] = args.output_dir
+    return SimpleNamespace(**values)
 
-    # Convert to SimpleNamespace (object with attributes)
-    class Config:
-        def __init__(self, dictionary):
-            for k, v in dictionary.items():
-                setattr(self, k, v)
-    
-    return Config(config_dict)
 
-def _sync_device(device):
+def sync_device(device):
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
 
@@ -102,11 +46,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_st
     torch.save(
         {
             'architecture': 'structural_graph_memory_transformer_decoder_dot',
-            'training_objective': getattr(
-                model.config,
-                'training_objective',
-                'single_positive_filtered_in_batch',
-            ),
+            'training_objective': 'single_positive_filtered_in_batch',
             'epoch': epoch,
             'best_mrr': best_mrr,
             'model_state_dict': model.state_dict(),
@@ -121,311 +61,185 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_st
         path,
     )
 
-def train(args):
-    # Load Config
-    config = get_config(args)
-    if not os.path.exists(config.output_dir):
-        os.makedirs(config.output_dir)
 
-    seed = int(getattr(config, 'seed', 42))
-    seed_everything(seed)
+def build_scheduler(optimizer, config, steps_per_epoch):
+    total_steps = config.num_epochs * steps_per_epoch
+    warmup_steps = int(total_steps * config.warmup_ratio)
+    min_lr_ratio = config.min_lr / config.learning_rate
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Load Dataset
-    print(f"Loading data from {config.data_dir}...")
-    train_dataset = GWMDataset(config.data_dir, split='train')
-    configured_context_k = int(getattr(
-        config,
-        'context_k',
-        train_dataset.context_k_requested,
-    ))
-    if configured_context_k != train_dataset.context_k_requested:
-        raise ValueError(
-            "Configured context_k does not match context_neighbors.pt. "
-            f"Expected {configured_context_k}, artifact contains "
-            f"{train_dataset.context_k_requested}. Re-run "
-            "utils/compute_context.py with the configured --k value."
-        )
-    configured_context_algorithm = str(getattr(
-        config,
-        'context_sampling',
-        'relation_diverse',
-    ))
-    if configured_context_algorithm != train_dataset.context_algorithm:
-        raise ValueError(
-            "Configured context_sampling does not match context_neighbors.pt. "
-            f"Expected {configured_context_algorithm!r}, artifact contains "
-            f"{train_dataset.context_algorithm!r}. Re-run "
-            "utils/compute_context.py to generate relation-diverse memory."
-        )
-    config.context_k_requested = train_dataset.context_k_requested
-    config.context_k_effective = train_dataset.context_k_effective
-    config.context_sampling = train_dataset.context_algorithm
-    train_truth_index = TrainTruthIndex(train_dataset.triples)
-    print(f"Loaded {len(train_dataset)} training triples.")
-    
-    # Infer input dimensions from dataset
-    # e.g., number of entities/relations for embedding layers
-    # Load vocabulary sizes
-    with open(os.path.join(config.data_dir, 'entity2id.json')) as f:
-        num_ent = len(json.load(f))
-    with open(os.path.join(config.data_dir, 'relation2id.json')) as f:
-        num_rel = len(json.load(f))
-        
-    config.num_entities = num_ent
-    config.num_relations = num_rel
-    relation_mapping = attach_relation_direction_mapping(
-        config,
-        config.data_dir,
-    )
-    
-    # Init Model
-    print("Initializing model...")
-    model = GWM(config).to(device)
-    config.training_objective = 'single_positive_filtered_in_batch'
-
-    # Collater
-    collate_fn = CollateFN()
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config.batch_size, 
-        shuffle=True, 
-        collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=(device.type == 'cuda'),
-        drop_last=True,
-        generator=make_torch_generator(seed),
-        worker_init_fn=make_worker_init_fn(seed),
-    )
-
-    print(
-        "Using trainable structural entity embeddings and "
-        f"{relation_mapping['num_base_relations']} shared base relation "
-        "embeddings with learned direction parameterization."
-    )
-    
-    # Save effective config (including inferred dimensions, CLI overrides, and model params).
-    save_training_config(config, config.output_dir, args=args, model=model)
-
-    base_lr = float(config.learning_rate)
-    weight_decay = float(getattr(config, 'weight_decay', 0.0))
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=base_lr,
-        weight_decay=weight_decay,
-    )
-
-    total_steps = max(1, config.num_epochs * len(train_loader))
-    warmup_ratio = float(getattr(config, 'warmup_ratio', 0.0))
-    warmup_steps = min(int(total_steps * warmup_ratio), total_steps)
-    min_lr = float(getattr(config, 'min_lr', 0.0))
-    min_lr_ratio = 0.0 if base_lr <= 0 else max(min_lr / base_lr, 0.0)
-
-    def lr_lambda(step_index):
-        if total_steps <= 1:
-            return 1.0
-        if warmup_steps > 0 and step_index < warmup_steps:
-            return float(step_index + 1) / float(max(1, warmup_steps))
-
-        decay_steps = max(1, total_steps - warmup_steps)
-        progress = min(max((step_index - warmup_steps) / decay_steps, 0.0), 1.0)
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return (step + 1) / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
-    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-    grad_clip_norm = float(getattr(config, 'grad_clip_norm', 1.0))
-    
-    # Validation Loader
-    if os.path.exists(os.path.join(config.data_dir, 'valid_triples.pt')):
-        print("Loading validation data...")
-        valid_dataset = GWMDataset(config.data_dir, split='valid')
-        valid_loader = DataLoader(
-            valid_dataset, 
-            batch_size=config.batch_size, 
-            shuffle=False, 
-            collate_fn=collate_fn,
-            num_workers=2,
-            pin_memory=(device.type == 'cuda'),
-            drop_last=False,
-            worker_init_fn=make_worker_init_fn(seed),
-        )
-    else:
-        valid_loader = None
+    return LambdaLR(optimizer, lr_lambda)
 
-    # Build filtered-ranking structures for validation. Bidirectional
-    # validation constructs inverse queries in memory; preprocessing remains
-    # unchanged.
-    hr_map = None
-    all_entity_embeddings = None
-    entity_loader = None
-    if valid_loader is not None:
-        hr_map = build_bidirectional_hr_map_for_filtering(
-            config.data_dir,
-            splits=['train', 'valid'],
-        )
 
-        candidate_batch_size = int(getattr(config, 'candidate_batch_size', min(int(config.batch_size), 256)))
-        entity_loader = build_entity_loader(
-            data_dir=config.data_dir,
-            batch_size=candidate_batch_size,
-            num_workers=2,
-        )
-    
-    print("Starting training...")
-    train_start_time = time.perf_counter()
-    best_mrr = float('-inf')
-    
-    early_stopping = EarlyStopping(
-        patience=getattr(config, 'early_stopping_patience', getattr(config, 'early_stopping', 10)),
-        mode='max'  # Maximize MRR
+def train(args):
+    config = get_config(args)
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    seed_everything(config.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    print(f"Loading data from {config.data_dir}...")
+    train_dataset = GWMDataset(config.data_dir, split='train')
+    valid_dataset = GWMDataset(config.data_dir, split='valid')
+    config.context_k = train_dataset.context_entity_ids.size(1)
+    with open(os.path.join(config.data_dir, 'entity2id.json')) as f:
+        config.num_entities = len(json.load(f))
+    with open(os.path.join(config.data_dir, 'relation2id.json')) as f:
+        config.num_relations = len(json.load(f))
+    relation_mapping = attach_relation_direction_mapping(config, config.data_dir)
+
+    print("Initializing model...")
+    model = GWM(config).to(device)
+    collate_fn = CollateFN()
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=device.type == 'cuda',
+        drop_last=True,
+        generator=make_torch_generator(config.seed),
+        worker_init_fn=make_worker_init_fn(config.seed),
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=device.type == 'cuda',
+        worker_init_fn=make_worker_init_fn(config.seed),
+    )
+    truth_index = TrainTruthIndex(train_dataset.triples)
+    hr_map = build_bidirectional_hr_map_for_filtering(config.data_dir, splits=['train', 'valid'])
+    entity_loader = build_entity_loader(
+        config.data_dir,
+        batch_size=config.candidate_batch_size,
+        num_workers=2,
     )
 
-    # Simple JSON Logger
+    print(
+        f"Loaded {len(train_dataset)} triples and "
+        f"{relation_mapping['num_base_relations']} shared relations."
+    )
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    training_config = vars(config).copy()
+    training_config['model_parameters'] = parameter_count
+    training_config['cli_args'] = vars(args)
+    with open(os.path.join(config.output_dir, 'training_config.json'), 'w', encoding='utf-8') as f:
+        json.dump(training_config, f, indent=2)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = build_scheduler(optimizer, config, len(train_loader))
+    early_stopping = EarlyStopping(patience=config.early_stopping_patience, mode='max')
+
     log_path = os.path.join(config.output_dir, 'training_log.json')
     history = []
-    
+    best_mrr = float('-inf')
+    train_start = time.perf_counter()
+    print("Starting training...")
+
     for epoch in range(config.num_epochs):
-        epoch_start_time = time.perf_counter()
-        _sync_device(device)
+        sync_device(device)
+        epoch_start = time.perf_counter()
         model.train()
-        total_loss = 0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
-        for batch in pbar:
-            truth_mask = train_truth_index.build_in_batch_truth_mask(
-                head_ids=batch['h_batch']['id'],
-                relation_ids=batch['r_batch']['id'],
-                candidate_tail_ids=batch['t_batch']['id'],
+        total_loss = 0.0
+
+        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
+        for batch in progress:
+            truth_mask = truth_index.build_in_batch_truth_mask(
+                batch['h_batch']['id'],
+                batch['r_batch']['id'],
+                batch['t_batch']['id'],
                 device=device,
             )
-            
-            # Move batch to device (handle nested dicts)
-            h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
-            r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
-            t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
-            context_batch = {
-                k: v.to(device) for k, v in batch['context_batch'].items()
-            }
+            h_batch = {key: value.to(device) for key, value in batch['h_batch'].items()}
+            r_batch = {key: value.to(device) for key, value in batch['r_batch'].items()}
+            t_batch = {key: value.to(device) for key, value in batch['t_batch'].items()}
+            context_batch = {key: value.to(device) for key, value in batch['context_batch'].items()}
 
             optimizer.zero_grad()
-
-            query_vectors = model(h_batch, r_batch, context_batch)
-            target_vectors = model.encode_target(t_batch)
-            loss, _ = model.compute_loss(
-                query_vectors,
-                target_vectors,
-                truth_mask=truth_mask,
-            )
-            if not torch.isfinite(loss):
-                print("Warning: non-finite loss detected; skipping batch to avoid corrupting model weights.")
-                optimizer.zero_grad(set_to_none=True)
-                continue
-
+            query = model(h_batch, r_batch, context_batch)
+            target = model.encode_target(t_batch)
+            loss, _ = model.compute_loss(query, target, truth_mask)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
             optimizer.step()
             scheduler.step()
 
             total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            progress.set_postfix(loss=loss.item())
 
-        _sync_device(device)
-        epoch_train_seconds = time.perf_counter() - epoch_start_time
-            
-        avg_train_loss = total_loss / len(train_loader)
-
+        sync_device(device)
+        train_seconds = time.perf_counter() - epoch_start
+        train_loss = total_loss / len(train_loader)
         print(
-            f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f} | "
-            f"Train Time: {epoch_train_seconds:.2f}s"
+            f"Epoch {epoch + 1} Train Loss: {train_loss:.4f} | "
+            f"Train Time: {train_seconds:.2f}s"
         )
-        
-        # Validation
-        eval_every = getattr(config, 'eval_every', 1)
-        if valid_loader and (epoch + 1) % eval_every == 0:
-            model.eval()
 
-            all_entity_embeddings = encode_all_entities_as_targets(
-                model=model,
-                entity_loader=entity_loader,
-                device=device,
-            )
+        model.eval()
+        candidates = encode_all_entities_as_targets(model, entity_loader, device)
+        metrics = compute_bidirectional_filtered_ranking_metrics(
+            model=model,
+            data_loader=valid_loader,
+            all_entity_embeddings=candidates,
+            hr_map=hr_map,
+            device=device,
+            desc="Validation",
+        )
+        micro = metrics['micro']
+        print(
+            f"Epoch {epoch + 1} Val | MRR: {micro['MRR']:.4f} | "
+            f"MR: {micro['MR']:.2f} | Hits@1: {micro['Hits@1']:.4f} | "
+            f"Hits@3: {micro['Hits@3']:.4f} | "
+            f"Hits@10: {micro['Hits@10']:.4f}"
+        )
+        print(
+            "Val Directions | "
+            f"Forward MRR: {metrics['forward']['MRR']:.4f} | "
+            f"Backward MRR: {metrics['backward']['MRR']:.4f}"
+        )
 
-            directional_val_metrics = compute_bidirectional_filtered_ranking_metrics(
-                model=model,
-                data_loader=valid_loader,
-                all_entity_embeddings=all_entity_embeddings,
-                hr_map=hr_map,
-                device=device,
-                desc="Validation",
-            )
-            val_metrics = directional_val_metrics['micro']
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'val_mrr': micro['MRR'],
+            'val_mr': micro['MR'],
+            'val_hits1': micro['Hits@1'],
+            'val_hits3': micro['Hits@3'],
+            'val_hits10': micro['Hits@10'],
+            'val_forward_mrr': metrics['forward']['MRR'],
+            'val_backward_mrr': metrics['backward']['MRR'],
+        })
+        with open(log_path, 'w') as f:
+            json.dump(history, f, indent=2)
 
-            val_mrr = val_metrics['MRR']
-            val_h1 = val_metrics['Hits@1']
-            val_h3 = val_metrics['Hits@3']
-            val_h10 = val_metrics['Hits@10']
-            val_mr = val_metrics['MR']
-            
-            print(
-                f"Epoch {epoch+1} Val | "
-                f"MRR: {val_mrr:.4f} | MR: {val_mr:.2f} | "
-                f"Hits@1: {val_h1:.4f} | Hits@3: {val_h3:.4f} | Hits@10: {val_h10:.4f}"
+        is_best = micro['MRR'] > best_mrr
+        best_mrr = max(best_mrr, micro['MRR'])
+        should_stop = early_stopping(micro['MRR'])
+        if is_best:
+            save_checkpoint(
+                os.path.join(config.output_dir, 'best_checkpoint.pt'),
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                best_mrr,
+                early_stopping,
             )
-            print(
-                f"Val Directions | "
-                f"Forward MRR: {directional_val_metrics['forward']['MRR']:.4f} | "
-                f"Backward MRR: {directional_val_metrics['backward']['MRR']:.4f}"
-            )
-            
-            # Log metrics
-            epoch_log = {
-                'epoch': epoch + 1,
-                'train_loss': avg_train_loss,
-                'val_mrr': val_mrr, 
-                'val_mr': val_mr,
-                'val_hits1': val_h1,
-                'val_hits3': val_h3,
-                'val_hits10': val_h10,
-                'val_forward_mrr': directional_val_metrics['forward']['MRR'],
-                'val_backward_mrr': directional_val_metrics['backward']['MRR'],
-            }
-            history.append(epoch_log)
-            with open(log_path, 'w') as f:
-                json.dump(history, f, indent=2)
-            
-            is_best = val_mrr > best_mrr
-            if is_best:
-                best_mrr = val_mrr
-            
-            # Check early stopping
-            should_stop = early_stopping(val_mrr)
-            if is_best:
-                save_checkpoint(
-                    os.path.join(config.output_dir, 'best_checkpoint.pt'),
-                    model,
-                    optimizer,
-                    scheduler,
-                    epoch,
-                    best_mrr,
-                    early_stopping,
-                )
-            if should_stop:
-                print(f"\n✓ Early stopping triggered at epoch {epoch + 1}")
-                print(f"  Best MRR: {early_stopping.best_value:.4f}")
-                print(f"  No improvement for {early_stopping.patience} epochs")
-        else:
-            should_stop = False
-             # Log train only
-            epoch_log = {
-                'epoch': epoch + 1,
-                'train_loss': avg_train_loss,
-            }
-            history.append(epoch_log)
-            with open(log_path, 'w') as f:
-                  json.dump(history, f, indent=2)
-        
         save_checkpoint(
             os.path.join(config.output_dir, 'latest_checkpoint.pt'),
             model,
@@ -436,24 +250,22 @@ def train(args):
             early_stopping,
         )
         if should_stop:
+            print(f"Early stopping at epoch {epoch + 1}.")
             break
 
-    _sync_device(device)
-    total_train_seconds = time.perf_counter() - train_start_time
-    print(f"Total training time: {total_train_seconds:.2f}s")
+    sync_device(device)
     history.append({
         'event': 'training_complete',
-        'total_train_seconds': total_train_seconds,
+        'total_train_seconds': time.perf_counter() - train_start,
         'epochs_completed': len(history),
     })
     with open(log_path, 'w') as f:
         json.dump(history, f, indent=2)
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True, help='Path to yaml config')
-    parser.add_argument('--data_dir', type=str, help='Override data directory')
-    parser.add_argument('--output_dir', type=str, help='Override output directory')
-    
-    args = parser.parse_args()
-    train(args)
+    parser.add_argument('--config', required=True)
+    parser.add_argument('--data_dir')
+    parser.add_argument('--output_dir')
+    train(parser.parse_args())

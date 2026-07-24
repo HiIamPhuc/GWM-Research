@@ -32,7 +32,6 @@ def make_config():
         transformer_heads=2,
         transformer_ffn_multiplier=2,
         transformer_dropout=0.0,
-        context_dropout=0.0,
         temperature=0.07,
     )
 
@@ -60,21 +59,19 @@ class ModelTests(unittest.TestCase):
                 'relation_norm',
                 'context_encoder',
                 'transition_decoder',
-                'context_entity_projection',
-                'context_relation_projection',
                 'context_fact_norm',
-                'context_token_dropout',
-                'transition_projection',
-                'output_norm',
             },
         )
         self.assertFalse(hasattr(model, 'text_ent_embs'))
         self.assertFalse(hasattr(model, 'adapter'))
         self.assertFalse(hasattr(model, 'fusion'))
         self.assertFalse(hasattr(model, 'lstm'))
-        self.assertEqual(tuple(model.token_roles.shape), (2, 4))
+        self.assertFalse(hasattr(model, 'token_roles'))
+        self.assertFalse(hasattr(model, 'context_entity_projection'))
+        self.assertFalse(hasattr(model, 'context_relation_projection'))
+        self.assertFalse(hasattr(model, 'transition_projection'))
+        self.assertFalse(hasattr(model, 'output_norm'))
         self.assertEqual(tuple(model.context_state_token.shape), (1, 1, 4))
-        self.assertEqual(tuple(model.context_fact_role.shape), (1, 1, 4))
 
     def test_context_and_transition_use_separate_sequences(self):
         model = GWM(make_config())
@@ -103,7 +100,7 @@ class ModelTests(unittest.TestCase):
         expected_transition = torch.stack(
             [model.struct_ent_embs(h_ids), model.encode_relation(r_ids)],
             dim=1,
-        ) + model.token_roles.unsqueeze(0)
+        )
         self.assertTrue(torch.equal(
             captured['transition_tokens'],
             expected_transition,
@@ -160,12 +157,8 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(
             model.transition_decoder.layers[0].multihead_attn.in_proj_weight.grad
         )
-        self.assertIsNotNone(model.context_entity_projection.weight.grad)
-        self.assertIsNotNone(model.context_relation_projection.weight.grad)
-        self.assertIsNotNone(model.transition_projection.weight.grad)
-        self.assertIsNotNone(model.token_roles.grad)
+        self.assertIsNotNone(model.context_fact_norm.weight.grad)
         self.assertIsNotNone(model.context_state_token.grad)
-        self.assertIsNotNone(model.context_fact_role.grad)
 
     def test_forward_and_inverse_relations_share_the_same_base_row(self):
         model = GWM(make_config())
@@ -253,10 +246,6 @@ class DatasetTests(unittest.TestCase):
                 'mask': torch.tensor(
                     [[True, True], [True, False], [False, False]]
                 ),
-                'pad_value': -1,
-                'k_requested': 2,
-                'k_effective': 2,
-                'algorithm': 'relation_diverse',
             },
             root / 'context_neighbors.pt',
         )

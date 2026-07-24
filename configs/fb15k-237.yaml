@@ -7,9 +7,9 @@ context_encoder_layers: 1
 transition_decoder_layers: 2
 temperature: 0.1
 
-learning_rate: 1e-3
+learning_rate: 0.001
 weight_decay: 0.01
-min_lr: 1e-4
+min_lr: 0.0001
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
 num_epochs: 500

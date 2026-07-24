@@ -2,9 +2,7 @@ import json
 import torch
 from pathlib import Path
 from tqdm import tqdm
-import numpy as np
 import re
-from transformers import AutoModel, AutoTokenizer
 
 def load_triples(file_path):
     """Load triples from a text file."""
@@ -306,6 +304,8 @@ def precompute_text_embeddings(
     """
     Encode entity/relation text once and return dense embedding tensors.
     """
+    from transformers import AutoModel, AutoTokenizer
+
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
@@ -351,24 +351,95 @@ def precompute_text_embeddings(
 
     return entity_embeddings, relation_embeddings
 
-def process_dataset(
+
+def precompute_and_save_text_embeddings(
     data_dir,
     output_dir,
     dataset_name,
-    add_inverse=True,
+    entity2id,
+    relation2id,
     pretrained_model='bert-base-uncased',
     text_batch_size=128,
     max_entity_length=256,
     max_relation_length=64,
     text_device=None,
 ):
+    """Optional text preprocessing retained for future experiments."""
+    dataset_key = dataset_name.lower()
+    if 'fb15k' in dataset_key:
+        entity_text, relation_text = process_text_fb15k237(
+            data_dir,
+            entity2id,
+            relation2id,
+        )
+    elif 'wn18' in dataset_key:
+        entity_text, relation_text = process_text_wn18rr(
+            data_dir,
+            entity2id,
+            relation2id,
+        )
+    elif 'nell' in dataset_key:
+        entity_text, relation_text = process_text_nell995(
+            data_dir,
+            entity2id,
+            relation2id,
+        )
+    elif 'umls' in dataset_key:
+        entity_text, relation_text = process_text_umls(
+            data_dir,
+            entity2id,
+            relation2id,
+        )
+    else:
+        raise ValueError(f"Text preprocessing is unavailable for {dataset_name}.")
+
+    output_dir = Path(output_dir)
+    with open(output_dir / 'entity_text.json', 'w') as f:
+        json.dump(entity_text, f, indent=2)
+    with open(output_dir / 'relation_text.json', 'w') as f:
+        json.dump(relation_text, f, indent=2)
+
+    entity_embeddings, relation_embeddings = precompute_text_embeddings(
+        entity_text_dict=entity_text,
+        relation_text_dict=relation_text,
+        num_entities=len(entity2id),
+        num_relations=len(relation2id),
+        pretrained_model=pretrained_model,
+        batch_size=text_batch_size,
+        max_entity_length=max_entity_length,
+        max_relation_length=max_relation_length,
+        device=text_device,
+    )
+    torch.save(
+        {
+            'embeddings': entity_embeddings,
+            'model_name': pretrained_model,
+            'embedding_dim': entity_embeddings.size(1),
+        },
+        output_dir / 'entity_text_embeddings.pt',
+    )
+    torch.save(
+        {
+            'embeddings': relation_embeddings,
+            'model_name': pretrained_model,
+            'embedding_dim': relation_embeddings.size(1),
+        },
+        output_dir / 'relation_text_embeddings.pt',
+    )
+
+
+def process_dataset(
+    data_dir,
+    output_dir,
+    dataset_name,
+    add_inverse=True,
+):
     """
     Process raw dataset into training files.
     1. Reads train/valid/test.txt
     2. Generates entity2id, relation2id
     3. Saves triples as tensors
-    4. Saves entity/relation text descriptions
-    5. Saves ground_truth for evaluation
+    4. Saves ground_truth for evaluation
     """
     data_path = Path(data_dir)
     out_path = Path(output_dir)
@@ -411,57 +482,13 @@ def process_dataset(
     torch.save(train_tensor, out_path / 'train_triples.pt')
     torch.save(valid_tensor, out_path / 'valid_triples.pt')
     torch.save(test_tensor, out_path / 'test_triples.pt')
-    
-    # 4. Process Text Descriptions
-    print(f"Generating descriptions for {dataset_name}...")
-    if 'fb15k' in dataset_key:
-        # Requires mid2description.txt
-        entity_text_dict, relation_text_dict = process_text_fb15k237(data_dir, entity2id, relation2id)
-    elif 'wn18' in dataset_key:
-        entity_text_dict, relation_text_dict = process_text_wn18rr(data_dir, entity2id, relation2id)
-    elif 'nell' in dataset_key:
-        entity_text_dict, relation_text_dict = process_text_nell995(data_dir, entity2id, relation2id)
-    elif 'umls' in dataset_key:
-        entity_text_dict, relation_text_dict = process_text_umls(data_dir, entity2id, relation2id)
-    else:
-        raise ValueError(f"Error: Unknown dataset {dataset_name}. Please provide text descriptions for this dataset.")
 
-    with open(out_path / 'entity_text.json', 'w') as f:
-        json.dump(entity_text_dict, f, indent=2)
-    with open(out_path / 'relation_text.json', 'w') as f:
-        json.dump(relation_text_dict, f, indent=2)
+    # Text embeddings are disabled for the structural-only model.
+    # precompute_and_save_text_embeddings(
+    #     data_dir, out_path, dataset_name, entity2id, relation2id
+    # )
 
-    print("Encoding and caching text embeddings...")
-    entity_text_embeddings, relation_text_embeddings = precompute_text_embeddings(
-        entity_text_dict=entity_text_dict,
-        relation_text_dict=relation_text_dict,
-        num_entities=len(entity2id),
-        num_relations=len(relation2id),
-        pretrained_model=pretrained_model,
-        batch_size=text_batch_size,
-        max_entity_length=max_entity_length,
-        max_relation_length=max_relation_length,
-        device=text_device,
-    )
-
-    torch.save(
-        {
-            'embeddings': entity_text_embeddings,
-            'model_name': pretrained_model,
-            'embedding_dim': int(entity_text_embeddings.size(1)),
-        },
-        out_path / 'entity_text_embeddings.pt'
-    )
-    torch.save(
-        {
-            'embeddings': relation_text_embeddings,
-            'model_name': pretrained_model,
-            'embedding_dim': int(relation_text_embeddings.size(1)),
-        },
-        out_path / 'relation_text_embeddings.pt'
-    )
-
-    # 5. Ground Truth for Filtered Eval
+    # 4. Ground Truth for Filtered Eval
     # Standard filtered KGC ranking removes every other known true answer,
     # including facts from train, validation, and test.
     def build_ground_truth(*triple_tensors):
@@ -489,20 +516,10 @@ if __name__ == '__main__':
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--dataset', type=str, required=True, help='Name of the dataset (e.g., fb15k-237, wn18rr)')
-    parser.add_argument('--pretrained_model', type=str, default='bert-base-uncased')
-    parser.add_argument('--text_batch_size', type=int, default=128)
-    parser.add_argument('--max_entity_length', type=int, default=256)
-    parser.add_argument('--max_relation_length', type=int, default=64)
-    parser.add_argument('--text_device', type=str, default=None, help='cpu or cuda; defaults to auto')
     args = parser.parse_args()
     
     process_dataset(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         dataset_name=args.dataset,
-        pretrained_model=args.pretrained_model,
-        text_batch_size=args.text_batch_size,
-        max_entity_length=args.max_entity_length,
-        max_relation_length=args.max_relation_length,
-        text_device=args.text_device,
     )

@@ -71,8 +71,41 @@ class ContextProcessor:
             
         return adj
 
+    @staticmethod
+    def _select_relation_diverse_neighbors(neighbors, limit):
+        """Select relation coverage first, then fill remaining slots randomly."""
+        if limit <= 0 or len(neighbors) <= limit:
+            return list(neighbors)
+
+        by_relation = {}
+        for relation_id, entity_id in neighbors:
+            by_relation.setdefault(relation_id, []).append(
+                (relation_id, entity_id)
+            )
+
+        relation_ids = sorted(by_relation)
+        relation_order = torch.randperm(len(relation_ids)).tolist()
+        selected = []
+        for relation_index in relation_order[:limit]:
+            candidates = by_relation[relation_ids[relation_index]]
+            candidate_index = int(torch.randint(len(candidates), (1,)).item())
+            selected.append(candidates[candidate_index])
+
+        if len(selected) < limit:
+            selected_set = set(selected)
+            remaining = [
+                edge for edge in neighbors
+                if edge not in selected_set
+            ]
+            fill_count = min(limit - len(selected), len(remaining))
+            if fill_count:
+                fill_indices = torch.randperm(len(remaining))[:fill_count]
+                selected.extend(remaining[index] for index in fill_indices.tolist())
+
+        return selected
+
     def compute_context_nodes(self, k=10):
-        print("Computing context nodes using random neighbor sampling...")
+        print("Computing relation-diverse context memory...")
         num_entities = len(self.entity2id)
         pad_value = -1
         limit = int(k)
@@ -94,24 +127,27 @@ class ContextProcessor:
             if relation.endswith('_inv'):
                 relation_direction_lookup[int(relation_id)] = 1
 
-        for i in tqdm(range(num_entities), desc="Random context"):
+        for i in tqdm(range(num_entities), desc="Relation-diverse context"):
             neighbors = adj.get(i, [])  # list[(r, t)]
             if not neighbors:
                 continue
 
-            neighbor_rel_ids = torch.tensor([r for r, _ in neighbors], dtype=torch.long)
-            neighbor_ent_ids = torch.tensor([t for _, t in neighbors], dtype=torch.long)
-
             if use_all_neighbors:
-                selected_ent_ids = neighbor_ent_ids
-                selected_rel_ids = neighbor_rel_ids
-            elif len(neighbors) > limit:
-                sampled = torch.randperm(len(neighbors))[:limit]
-                selected_ent_ids = neighbor_ent_ids[sampled]
-                selected_rel_ids = neighbor_rel_ids[sampled]
+                selected = neighbors
             else:
-                selected_ent_ids = neighbor_ent_ids
-                selected_rel_ids = neighbor_rel_ids
+                selected = self._select_relation_diverse_neighbors(
+                    neighbors,
+                    limit,
+                )
+
+            selected_rel_ids = torch.tensor(
+                [relation_id for relation_id, _ in selected],
+                dtype=torch.long,
+            )
+            selected_ent_ids = torch.tensor(
+                [entity_id for _, entity_id in selected],
+                dtype=torch.long,
+            )
 
             count = min(selected_ent_ids.numel(), max_k)
             if count > 0:
@@ -132,13 +168,17 @@ class ContextProcessor:
                 'mask': context_mask,
                 'pad_value': pad_value,
                 'k_requested': limit,
-                'k_effective': max_k
+                'k_effective': max_k,
+                'algorithm': 'relation_diverse',
             },
             output_file,
         )
 
         print(f"Context neighbors saved to {output_file}")
-        print(f"  pad_value={pad_value}, k_effective={max_k}, algorithm=random")
+        print(
+            f"  pad_value={pad_value}, k_effective={max_k}, "
+            "algorithm=relation_diverse"
+        )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

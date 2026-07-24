@@ -93,6 +93,7 @@ class GWMDataset(Dataset):
         self.context_k_effective = int(
             context.get('k_effective', self.context_entity_ids.size(1))
         )
+        self.context_algorithm = str(context.get('algorithm', 'unknown'))
 
         expected_shape = self.context_entity_ids.shape
         if (
@@ -156,14 +157,10 @@ class GWMDataset(Dataset):
 
 
 class CollateFN:
-    """Collate triples and valid context edges into a ragged representation."""
+    """Collate triples and fixed-width context rows for Transformer memory."""
 
     def __call__(self, batch):
-        context_entity_chunks = []
-        context_relation_chunks = []
-        context_batch_chunks = []
-
-        for sample_index, item in enumerate(batch):
+        for item in batch:
             entity_ids = item['context_entity_ids']
             relation_ids = item['context_relation_ids']
             mask = item['context_mask'].bool()
@@ -176,40 +173,19 @@ class CollateFN:
             ):
                 raise ValueError("Context entity, relation, and mask lengths differ.")
 
-            valid_entities = entity_ids[mask]
-            valid_relations = relation_ids[mask]
-            valid = (valid_entities >= 0) & (valid_relations >= 0)
-            valid_entities = valid_entities[valid]
-            valid_relations = valid_relations[valid]
-            if valid_entities.numel() == 0:
-                continue
-
-            context_entity_chunks.append(valid_entities.long())
-            context_relation_chunks.append(valid_relations.long())
-            context_batch_chunks.append(
-                torch.full(
-                    (valid_entities.numel(),),
-                    sample_index,
-                    dtype=torch.long,
-                )
-            )
-
-        if context_entity_chunks:
-            context_entity_ids = torch.cat(context_entity_chunks)
-            context_relation_ids = torch.cat(context_relation_chunks)
-            context_batch_index = torch.cat(context_batch_chunks)
-        else:
-            context_entity_ids = torch.zeros(0, dtype=torch.long)
-            context_relation_ids = torch.zeros(0, dtype=torch.long)
-            context_batch_index = torch.zeros(0, dtype=torch.long)
-
         return {
             'h_batch': {'id': torch.stack([item['h_id'] for item in batch])},
             'r_batch': {'id': torch.stack([item['r_id'] for item in batch])},
             't_batch': {'id': torch.stack([item['t_id'] for item in batch])},
             'context_batch': {
-                'id': context_entity_ids,
-                'rel_id': context_relation_ids,
-                'batch_index': context_batch_index,
+                'id': torch.stack([
+                    item['context_entity_ids'].long() for item in batch
+                ]),
+                'rel_id': torch.stack([
+                    item['context_relation_ids'].long() for item in batch
+                ]),
+                'mask': torch.stack([
+                    item['context_mask'].bool() for item in batch
+                ]),
             },
         }

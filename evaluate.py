@@ -98,6 +98,28 @@ def evaluate(args):
         split = 'valid'
 
     test_dataset = GWMDataset(config.data_dir, split=split)
+    configured_context_k = int(getattr(
+        config,
+        'context_k',
+        test_dataset.context_k_requested,
+    ))
+    if configured_context_k != test_dataset.context_k_requested:
+        raise ValueError(
+            "Configured context_k does not match context_neighbors.pt. "
+            f"Expected {configured_context_k}, artifact contains "
+            f"{test_dataset.context_k_requested}."
+        )
+    configured_context_algorithm = str(getattr(
+        config,
+        'context_sampling',
+        'relation_diverse',
+    ))
+    if configured_context_algorithm != test_dataset.context_algorithm:
+        raise ValueError(
+            "Configured context_sampling does not match context_neighbors.pt. "
+            f"Expected {configured_context_algorithm!r}, artifact contains "
+            f"{test_dataset.context_algorithm!r}."
+        )
     collate_fn = CollateFN()
     
     test_loader = DataLoader(

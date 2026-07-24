@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import GWM, filtered_in_batch_contrastive_loss
 from studies.ablation_models import build_model
+from utils.compute_context import ContextProcessor
 from utils.eval import (
     build_bidirectional_eval_dataset,
     build_bidirectional_hr_map_for_filtering,
@@ -26,24 +27,26 @@ def make_config():
         relation_base_ids=[0, 0, 1, 1],
         relation_directions=[0, 1, 0, 1],
         struct_emb_dim=4,
-        transformer_layers=1,
+        context_encoder_layers=1,
+        transition_decoder_layers=2,
         transformer_heads=2,
         transformer_ffn_multiplier=2,
         transformer_dropout=0.0,
+        context_dropout=0.0,
         temperature=0.07,
     )
 
 
 def make_context_batch():
     return {
-        'id': torch.tensor([1, 2, 0]),
-        'rel_id': torch.tensor([0, 1, 2]),
-        'batch_index': torch.tensor([0, 0, 1]),
+        'id': torch.tensor([[1, 2], [0, -1]]),
+        'rel_id': torch.tensor([[0, 1], [2, -1]]),
+        'mask': torch.tensor([[True, True], [True, False]]),
     }
 
 
 class ModelTests(unittest.TestCase):
-    def test_context_free_transformer_has_expected_modules(self):
+    def test_graph_memory_transformer_has_expected_modules(self):
         model = GWM(make_config())
         child_modules = set(dict(model.named_children()))
 
@@ -55,7 +58,12 @@ class ModelTests(unittest.TestCase):
                 'direction_embs',
                 'inverse_adapter',
                 'relation_norm',
-                'transformer',
+                'context_encoder',
+                'transition_decoder',
+                'context_entity_projection',
+                'context_relation_projection',
+                'context_fact_norm',
+                'context_token_dropout',
                 'transition_projection',
                 'output_norm',
             },
@@ -65,32 +73,49 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(hasattr(model, 'fusion'))
         self.assertFalse(hasattr(model, 'lstm'))
         self.assertEqual(tuple(model.token_roles.shape), (2, 4))
+        self.assertEqual(tuple(model.context_state_token.shape), (1, 1, 4))
+        self.assertEqual(tuple(model.context_fact_role.shape), (1, 1, 4))
 
-    def test_transformer_receives_role_encoded_tokens_and_causal_mask(self):
+    def test_context_and_transition_use_separate_sequences(self):
         model = GWM(make_config())
         model.eval()
         captured = {}
 
-        def capture_input(module, inputs):
-            captured['tokens'] = inputs[0].detach().clone()
+        def capture_context(module, inputs):
+            captured['context_tokens'] = inputs[0].detach().clone()
 
-        handle = model.transformer.register_forward_pre_hook(capture_input)
+        def capture_transition(module, inputs):
+            captured['transition_tokens'] = inputs[0].detach().clone()
+            captured['memory'] = inputs[1].detach().clone()
+
+        context_handle = model.context_encoder.register_forward_pre_hook(
+            capture_context
+        )
+        transition_handle = model.transition_decoder.layers[
+            0
+        ].register_forward_pre_hook(capture_transition)
         h_ids = torch.tensor([0, 1])
         r_ids = torch.tensor([2, 3])
         model({'id': h_ids}, {'id': r_ids}, make_context_batch())
-        handle.remove()
+        context_handle.remove()
+        transition_handle.remove()
 
-        expected = torch.stack(
+        expected_transition = torch.stack(
             [model.struct_ent_embs(h_ids), model.encode_relation(r_ids)],
             dim=1,
         ) + model.token_roles.unsqueeze(0)
-        self.assertTrue(torch.equal(captured['tokens'], expected))
+        self.assertTrue(torch.equal(
+            captured['transition_tokens'],
+            expected_transition,
+        ))
+        self.assertEqual(captured['context_tokens'].shape, (2, 3, 4))
+        self.assertEqual(captured['memory'].shape, (2, 3, 4))
         self.assertEqual(
             model.transition_mask.tolist(),
             [[False, True], [False, False]],
         )
 
-    def test_query_is_independent_of_context(self):
+    def test_query_depends_on_context(self):
         model = GWM(make_config())
         model.eval()
         h_batch = {'id': torch.tensor([0, 1])}
@@ -100,12 +125,13 @@ class ModelTests(unittest.TestCase):
             h_batch,
             r_batch,
             {
-                'id': torch.tensor([], dtype=torch.long),
-                'rel_id': torch.tensor([], dtype=torch.long),
-                'batch_index': torch.tensor([], dtype=torch.long),
+                'id': torch.full((2, 2), -1, dtype=torch.long),
+                'rel_id': torch.full((2, 2), -1, dtype=torch.long),
+                'mask': torch.zeros((2, 2), dtype=torch.bool),
             },
         )
-        self.assertTrue(torch.equal(first, second))
+        self.assertFalse(torch.allclose(first, second))
+        self.assertTrue(torch.isfinite(second).all())
 
     def test_query_target_loss_backpropagates(self):
         model = GWM(make_config())
@@ -129,10 +155,17 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.direction_embs.weight.grad)
         self.assertIsNotNone(model.inverse_adapter.weight.grad)
         self.assertIsNotNone(
-            model.transformer.layers[0].self_attn.in_proj_weight.grad
+            model.context_encoder.layers[0].self_attn.in_proj_weight.grad
         )
+        self.assertIsNotNone(
+            model.transition_decoder.layers[0].multihead_attn.in_proj_weight.grad
+        )
+        self.assertIsNotNone(model.context_entity_projection.weight.grad)
+        self.assertIsNotNone(model.context_relation_projection.weight.grad)
         self.assertIsNotNone(model.transition_projection.weight.grad)
         self.assertIsNotNone(model.token_roles.grad)
+        self.assertIsNotNone(model.context_state_token.grad)
+        self.assertIsNotNone(model.context_fact_role.grad)
 
     def test_forward_and_inverse_relations_share_the_same_base_row(self):
         model = GWM(make_config())
@@ -142,7 +175,8 @@ class ModelTests(unittest.TestCase):
         relation_vectors = model.encode_relation(torch.tensor([0, 1]))
         self.assertFalse(torch.allclose(relation_vectors[0], relation_vectors[1]))
 
-        relation_vectors.sum().backward()
+        weights = torch.arange(1, 5, dtype=relation_vectors.dtype)
+        (relation_vectors * weights).sum().backward()
         self.assertGreater(model.base_rel_embs.weight.grad[0].abs().sum().item(), 0.0)
         self.assertEqual(model.base_rel_embs.weight.grad[1].abs().sum().item(), 0.0)
 
@@ -177,6 +211,14 @@ class ModelTests(unittest.TestCase):
 
     def test_study_factory_returns_the_same_basic_model(self):
         self.assertIsInstance(build_model(make_config()), GWM)
+
+    def test_relation_diverse_context_selection_covers_relations_first(self):
+        selected = ContextProcessor._select_relation_diverse_neighbors(
+            [(0, 1), (0, 2), (1, 3), (2, 0)],
+            limit=3,
+        )
+        self.assertEqual(len(selected), 3)
+        self.assertEqual({relation for relation, _ in selected}, {0, 1, 2})
 
     def test_filtered_in_batch_loss_ignores_other_true_tails(self):
         scores = torch.tensor(
@@ -214,6 +256,7 @@ class DatasetTests(unittest.TestCase):
                 'pad_value': -1,
                 'k_requested': 2,
                 'k_effective': 2,
+                'algorithm': 'relation_diverse',
             },
             root / 'context_neighbors.pt',
         )
@@ -243,9 +286,15 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(batch['h_batch']['id'].tolist(), [0])
             self.assertEqual(batch['r_batch']['id'].tolist(), [0])
             self.assertEqual(batch['t_batch']['id'].tolist(), [1])
-            self.assertEqual(batch['context_batch']['id'].tolist(), [2])
-            self.assertEqual(batch['context_batch']['rel_id'].tolist(), [0])
-            self.assertEqual(batch['context_batch']['batch_index'].tolist(), [0])
+            self.assertEqual(batch['context_batch']['id'].tolist(), [[1, 2]])
+            self.assertEqual(
+                batch['context_batch']['rel_id'].tolist(),
+                [[0, 0]],
+            )
+            self.assertEqual(
+                batch['context_batch']['mask'].tolist(),
+                [[False, True]],
+            )
 
     def test_dataset_requires_precomputed_context(self):
         with tempfile.TemporaryDirectory() as root:

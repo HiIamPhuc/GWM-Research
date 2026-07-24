@@ -101,7 +101,7 @@ def _sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'structural_shared_inverse_two_token_transformer_dot',
+            'architecture': 'structural_graph_memory_transformer_decoder_dot',
             'training_objective': getattr(
                 model.config,
                 'training_objective',
@@ -136,6 +136,33 @@ def train(args):
     # Load Dataset
     print(f"Loading data from {config.data_dir}...")
     train_dataset = GWMDataset(config.data_dir, split='train')
+    configured_context_k = int(getattr(
+        config,
+        'context_k',
+        train_dataset.context_k_requested,
+    ))
+    if configured_context_k != train_dataset.context_k_requested:
+        raise ValueError(
+            "Configured context_k does not match context_neighbors.pt. "
+            f"Expected {configured_context_k}, artifact contains "
+            f"{train_dataset.context_k_requested}. Re-run "
+            "utils/compute_context.py with the configured --k value."
+        )
+    configured_context_algorithm = str(getattr(
+        config,
+        'context_sampling',
+        'relation_diverse',
+    ))
+    if configured_context_algorithm != train_dataset.context_algorithm:
+        raise ValueError(
+            "Configured context_sampling does not match context_neighbors.pt. "
+            f"Expected {configured_context_algorithm!r}, artifact contains "
+            f"{train_dataset.context_algorithm!r}. Re-run "
+            "utils/compute_context.py to generate relation-diverse memory."
+        )
+    config.context_k_requested = train_dataset.context_k_requested
+    config.context_k_effective = train_dataset.context_k_effective
+    config.context_sampling = train_dataset.context_algorithm
     train_truth_index = TrainTruthIndex(train_dataset.triples)
     print(f"Loaded {len(train_dataset)} training triples.")
     
@@ -278,10 +305,13 @@ def train(args):
             h_batch = {k: v.to(device) for k, v in batch['h_batch'].items()}
             r_batch = {k: v.to(device) for k, v in batch['r_batch'].items()}
             t_batch = {k: v.to(device) for k, v in batch['t_batch'].items()}
+            context_batch = {
+                k: v.to(device) for k, v in batch['context_batch'].items()
+            }
 
             optimizer.zero_grad()
 
-            query_vectors = model(h_batch, r_batch)
+            query_vectors = model(h_batch, r_batch, context_batch)
             target_vectors = model.encode_target(t_batch)
             loss, _ = model.compute_loss(
                 query_vectors,

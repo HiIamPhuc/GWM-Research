@@ -5,7 +5,11 @@ from tqdm import tqdm
 import numpy as np
 import re
 from transformers import AutoModel, AutoTokenizer
-from relation_mapping import save_relation_direction_mapping
+
+if __package__:
+    from .relation_mapping import save_relation_direction_mapping
+else:
+    from relation_mapping import save_relation_direction_mapping
 
 def load_triples(file_path):
     """Load triples from a text file."""

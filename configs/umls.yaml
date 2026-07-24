@@ -1,9 +1,13 @@
-# Context-free structural two-token Transformer
+# Context-memory Transformer with shared inverse relations
 struct_emb_dim: 128
-transformer_layers: 1
 transformer_heads: 4
 transformer_ffn_multiplier: 2
 transformer_dropout: 0.1
+context_k: 8
+context_sampling: relation_diverse
+context_encoder_layers: 1
+transition_decoder_layers: 2
+context_dropout: 0.1
 temperature: 0.07
 
 learning_rate: 5e-5
@@ -20,10 +24,10 @@ eval_batch_size: 512
 candidate_batch_size: 512
 
 data_dir: data-processed/umls
-output_dir: output/umls-two-token-transformer
+output_dir: output/umls-context-memory-transformer
 add_inverse: true
 seed: 42
 
 save_eval_predictions: true
 eval_topk: 10
-eval_predictions_dir: output/umls-two-token-transformer/predictions
+eval_predictions_dir: output/umls-context-memory-transformer/predictions

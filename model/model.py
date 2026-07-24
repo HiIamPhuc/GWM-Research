@@ -29,7 +29,7 @@ def filtered_in_batch_contrastive_loss(scores, truth_mask=None):
 
 
 class GWM(nn.Module):
-    """Structural two-token Transformer with shared inverse relations."""
+    """Graph-memory encoder with a relation-conditioned transition decoder."""
 
     def __init__(self, config):
         super().__init__()
@@ -92,8 +92,17 @@ class GWM(nn.Module):
             )
 
         transformer_layers = int(getattr(config, 'transformer_layers', 1))
+        context_encoder_layers = int(
+            getattr(config, 'context_encoder_layers', transformer_layers)
+        )
+        transition_decoder_layers = int(
+            getattr(config, 'transition_decoder_layers', 2)
+        )
         ffn_multiplier = int(getattr(config, 'transformer_ffn_multiplier', 2))
         transformer_dropout = float(getattr(config, 'transformer_dropout', 0.1))
+        context_dropout = float(
+            getattr(config, 'context_dropout', transformer_dropout)
+        )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embedding_dim,
             nhead=transformer_heads,
@@ -103,9 +112,42 @@ class GWM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(
+        self.context_encoder = nn.TransformerEncoder(
             encoder_layer,
-            num_layers=transformer_layers,
+            num_layers=context_encoder_layers,
+            norm=nn.LayerNorm(self.embedding_dim),
+        )
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.embedding_dim,
+            nhead=transformer_heads,
+            dim_feedforward=ffn_multiplier * self.embedding_dim,
+            dropout=transformer_dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transition_decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=transition_decoder_layers,
+            norm=nn.LayerNorm(self.embedding_dim),
+        )
+        self.context_entity_projection = nn.Linear(
+            self.embedding_dim,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.context_relation_projection = nn.Linear(
+            self.embedding_dim,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
+        self.context_token_dropout = nn.Dropout(context_dropout)
+        self.context_state_token = nn.Parameter(
+            torch.empty(1, 1, self.embedding_dim)
+        )
+        self.context_fact_role = nn.Parameter(
+            torch.empty(1, 1, self.embedding_dim)
         )
         self.token_roles = nn.Parameter(torch.empty(2, self.embedding_dim))
         self.transition_projection = nn.Linear(
@@ -119,6 +161,8 @@ class GWM(nn.Module):
             persistent=False,
         )
         nn.init.normal_(self.token_roles, mean=0.0, std=0.02)
+        nn.init.normal_(self.context_state_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.context_fact_role, mean=0.0, std=0.02)
         nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.inverse_adapter.weight)
 
@@ -131,14 +175,82 @@ class GWM(nn.Module):
         relation = relation + inverse_mask * self.inverse_adapter(base)
         return self.relation_norm(relation)
 
+    def encode_context(self, context_batch):
+        if context_batch is None:
+            raise ValueError("context_batch is required by the graph-memory model.")
+
+        required = {'id', 'rel_id', 'mask'}
+        missing = required.difference(context_batch)
+        if missing:
+            raise ValueError(
+                "context_batch is missing required fields: "
+                + ', '.join(sorted(missing))
+            )
+
+        entity_ids = context_batch['id']
+        relation_ids = context_batch['rel_id']
+        context_mask = context_batch['mask'].bool()
+        if (
+            entity_ids.dim() != 2
+            or relation_ids.shape != entity_ids.shape
+            or context_mask.shape != entity_ids.shape
+        ):
+            raise ValueError(
+                "Context IDs, relation IDs, and mask must share shape (B, K)."
+            )
+
+        safe_entity_ids = entity_ids.masked_fill(~context_mask, 0)
+        safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
+        context_entities = self.struct_ent_embs(safe_entity_ids)
+        context_relations = self.encode_relation(safe_relation_ids)
+        fact_tokens = self.context_fact_norm(
+            self.context_entity_projection(context_entities)
+            + self.context_relation_projection(context_relations)
+        )
+        fact_tokens = self.context_token_dropout(
+            fact_tokens + self.context_fact_role
+        )
+        fact_tokens = fact_tokens.masked_fill(
+            ~context_mask.unsqueeze(-1),
+            0.0,
+        )
+
+        batch_size = entity_ids.size(0)
+        state_token = self.context_state_token.expand(batch_size, -1, -1)
+        memory_tokens = torch.cat([state_token, fact_tokens], dim=1)
+        memory_padding_mask = torch.cat(
+            [
+                torch.zeros(
+                    batch_size,
+                    1,
+                    dtype=torch.bool,
+                    device=context_mask.device,
+                ),
+                ~context_mask,
+            ],
+            dim=1,
+        )
+        memory = self.context_encoder(
+            memory_tokens,
+            src_key_padding_mask=memory_padding_mask,
+        )
+        return memory, memory_padding_mask
+
     def encode_query(self, h_batch, r_batch, context_batch=None):
         head = self.struct_ent_embs(h_batch['id'])
         relation = self.encode_relation(r_batch['id'])
-        tokens = torch.stack([head, relation], dim=1)
-        tokens = tokens + self.token_roles.unsqueeze(0)
-        encoded = self.transformer(tokens, mask=self.transition_mask)
-        transition_delta = self.transition_projection(encoded[:, 1])
-        query = self.output_norm(head + transition_delta)
+        memory, memory_padding_mask = self.encode_context(context_batch)
+        transition_tokens = torch.stack([head, relation], dim=1)
+        transition_tokens = transition_tokens + self.token_roles.unsqueeze(0)
+        decoded = self.transition_decoder(
+            tgt=transition_tokens,
+            memory=memory,
+            tgt_mask=self.transition_mask,
+            memory_key_padding_mask=memory_padding_mask,
+        )
+        contextualized_head = decoded[:, 0]
+        transition_delta = self.transition_projection(decoded[:, 1])
+        query = self.output_norm(contextualized_head + transition_delta)
         return F.normalize(query, p=2, dim=-1)
 
     def forward(self, h_batch, r_batch, context_batch=None):

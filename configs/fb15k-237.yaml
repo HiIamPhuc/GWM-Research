@@ -1,15 +1,19 @@
-# Context-free structural Transformer with shared inverse relations
+# Context-memory Transformer with shared inverse relations
 struct_emb_dim: 512
-transformer_layers: 1
 transformer_heads: 8
 transformer_ffn_multiplier: 4
 transformer_dropout: 0.05
+context_k: 8
+context_sampling: relation_diverse
+context_encoder_layers: 1
+transition_decoder_layers: 2
+context_dropout: 0.1
 temperature: 0.1
 
-learning_rate: 5e-3
+learning_rate: 1e-3
 weight_decay: 0.01
-min_lr: 1e-3
-warmup_ratio: 0.05
+min_lr: 1e-4
+warmup_ratio: 0.1
 grad_clip_norm: 1.0
 num_epochs: 500
 early_stopping_patience: 10
@@ -20,10 +24,10 @@ eval_batch_size: 2048
 candidate_batch_size: 2048
 
 data_dir: data-processed/fb15k-237
-output_dir: output/fb15k-237-shared-inverse-transformer
+output_dir: output/fb15k-237-context-memory-transformer
 add_inverse: true
 seed: 42
 
 save_eval_predictions: false
 eval_topk: 10
-eval_predictions_dir: output/fb15k-237-shared-inverse-transformer/predictions
+eval_predictions_dir: output/fb15k-237-context-memory-transformer/predictions

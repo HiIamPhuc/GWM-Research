@@ -1,7 +1,7 @@
 """Model factory retained for study scripts.
 
-The current experiment has one architecture only: trainable structural
-embeddings followed by a causal two-token Transformer transition.
+The current experiment has one architecture only: a structural context-memory
+encoder followed by a causal state-action Transformer decoder.
 """
 
 from model.model import GWM

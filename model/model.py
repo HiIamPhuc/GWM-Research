@@ -90,6 +90,11 @@ class GWM(nn.Module):
             num_layers=config.transition_decoder_layers,
             norm=nn.LayerNorm(self.embedding_dim),
         )
+        self.next_state_projection = nn.Linear(
+            self.embedding_dim,
+            self.embedding_dim,
+            bias=False,
+        )
         self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
         self.context_state_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
@@ -102,6 +107,7 @@ class GWM(nn.Module):
         nn.init.normal_(self.context_state_token, mean=0.0, std=0.02)
         nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.inverse_adapter.weight)
+        nn.init.eye_(self.next_state_projection.weight)
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -161,10 +167,8 @@ class GWM(nn.Module):
             tgt_mask=self.transition_mask,
             memory_key_padding_mask=memory_padding_mask,
         )
-        contextualized_head = decoded[:, 0]
-        transition = decoded[:, 1]
-        query = contextualized_head + transition
-        return F.normalize(query, p=2, dim=-1)
+        next_state = self.next_state_projection(decoded[:, 1])
+        return F.normalize(next_state, p=2, dim=-1)
 
     def forward(self, h_batch, r_batch, context_batch):
         return self.encode_query(h_batch, r_batch, context_batch)

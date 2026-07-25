@@ -59,6 +59,7 @@ class ModelTests(unittest.TestCase):
                 'relation_norm',
                 'context_encoder',
                 'transition_decoder',
+                'next_state_projection',
                 'context_fact_norm',
             },
         )
@@ -72,6 +73,10 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(hasattr(model, 'transition_projection'))
         self.assertFalse(hasattr(model, 'output_norm'))
         self.assertEqual(tuple(model.context_state_token.shape), (1, 1, 4))
+        self.assertTrue(torch.equal(
+            model.next_state_projection.weight,
+            torch.eye(4),
+        ))
 
     def test_context_and_transition_use_separate_sequences(self):
         model = GWM(make_config())
@@ -157,6 +162,7 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(
             model.transition_decoder.layers[0].multihead_attn.in_proj_weight.grad
         )
+        self.assertIsNotNone(model.next_state_projection.weight.grad)
         self.assertIsNotNone(model.context_fact_norm.weight.grad)
         self.assertIsNotNone(model.context_state_token.grad)
 

@@ -1,9 +1,12 @@
-# Context-memory Transformer with shared inverse relations
+# Head-centered world-state Transformer with shared inverse relations
 struct_emb_dim: 512
-transformer_heads: 8
-transformer_ffn_multiplier: 4
-transformer_dropout: 0.05
+context_encoder_heads: 4
+context_encoder_ffn_multiplier: 2
+context_encoder_dropout: 0.05
 context_encoder_layers: 1
+transition_decoder_heads: 8
+transition_decoder_ffn_multiplier: 4
+transition_decoder_dropout: 0.05
 transition_decoder_layers: 2
 temperature: 0.1
 

@@ -60,11 +60,11 @@ class GWM(nn.Module):
         self.register_buffer('relation_directions', relation_directions)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embedding_dim,
-            nhead=config.transformer_heads,
+            nhead=config.context_encoder_heads,
             dim_feedforward=(
-                config.transformer_ffn_multiplier * self.embedding_dim
+                config.context_encoder_ffn_multiplier * self.embedding_dim
             ),
-            dropout=config.transformer_dropout,
+            dropout=config.context_encoder_dropout,
             activation='gelu',
             batch_first=True,
             norm_first=True,
@@ -76,11 +76,11 @@ class GWM(nn.Module):
         )
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.embedding_dim,
-            nhead=config.transformer_heads,
+            nhead=config.transition_decoder_heads,
             dim_feedforward=(
-                config.transformer_ffn_multiplier * self.embedding_dim
+                config.transition_decoder_ffn_multiplier * self.embedding_dim
             ),
-            dropout=config.transformer_dropout,
+            dropout=config.transition_decoder_dropout,
             activation='gelu',
             batch_first=True,
             norm_first=True,

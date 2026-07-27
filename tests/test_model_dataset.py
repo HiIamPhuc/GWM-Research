@@ -29,9 +29,12 @@ def make_config():
         struct_emb_dim=4,
         context_encoder_layers=1,
         transition_decoder_layers=2,
-        transformer_heads=2,
-        transformer_ffn_multiplier=2,
-        transformer_dropout=0.0,
+        context_encoder_heads=1,
+        context_encoder_ffn_multiplier=2,
+        context_encoder_dropout=0.0,
+        transition_decoder_heads=2,
+        transition_decoder_ffn_multiplier=3,
+        transition_decoder_dropout=0.0,
         temperature=0.07,
     )
 
@@ -75,6 +78,22 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(hasattr(model, 'context_state_token'))
         self.assertEqual(tuple(model.token_roles.weight.shape), (3, 4))
         self.assertEqual(tuple(model.next_state_token.shape), (1, 1, 4))
+        self.assertEqual(
+            model.context_encoder.layers[0].self_attn.num_heads,
+            1,
+        )
+        self.assertEqual(
+            model.transition_decoder.layers[0].self_attn.num_heads,
+            2,
+        )
+        self.assertEqual(
+            model.context_encoder.layers[0].linear1.out_features,
+            8,
+        )
+        self.assertEqual(
+            model.transition_decoder.layers[0].linear1.out_features,
+            12,
+        )
         self.assertTrue(torch.equal(
             model.next_state_projection.weight,
             torch.eye(4),

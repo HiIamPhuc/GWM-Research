@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
+from model.dataset import CollateFN, GWMDataset
 from model.model import GWM
 from utils.early_stopping import EarlyStopping
 from utils.eval import (
@@ -25,6 +25,10 @@ from utils.eval import (
 )
 from utils.relation_mapping import attach_relation_direction_mapping
 from utils.seed import make_torch_generator, make_worker_init_fn, seed_everything
+
+
+ARCHITECTURE = 'head_centered_world_state_transformer_next_state_dot'
+TRAINING_OBJECTIVE = 'triple_level_full_entity_cross_entropy'
 
 
 def get_config(args):
@@ -45,8 +49,8 @@ def sync_device(device):
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mrr, early_stopping):
     torch.save(
         {
-            'architecture': 'structural_graph_memory_transformer_decoder_dot',
-            'training_objective': 'single_positive_filtered_in_batch',
+            'architecture': ARCHITECTURE,
+            'training_objective': TRAINING_OBJECTIVE,
             'epoch': epoch,
             'best_mrr': best_mrr,
             'model_state_dict': model.state_dict(),
@@ -118,7 +122,6 @@ def train(args):
         pin_memory=device.type == 'cuda',
         worker_init_fn=make_worker_init_fn(config.seed),
     )
-    truth_index = TrainTruthIndex(train_dataset.triples)
     hr_map = build_bidirectional_hr_map_for_filtering(config.data_dir, splits=['train', 'valid'])
     entity_loader = build_entity_loader(
         config.data_dir,
@@ -133,6 +136,8 @@ def train(args):
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     training_config = vars(config).copy()
     training_config['model_parameters'] = parameter_count
+    training_config['architecture'] = ARCHITECTURE
+    training_config['training_objective'] = TRAINING_OBJECTIVE
     training_config['cli_args'] = vars(args)
     with open(os.path.join(config.output_dir, 'training_config.json'), 'w', encoding='utf-8') as f:
         json.dump(training_config, f, indent=2)
@@ -159,21 +164,14 @@ def train(args):
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
         for batch in progress:
-            truth_mask = truth_index.build_in_batch_truth_mask(
-                batch['h_batch']['id'],
-                batch['r_batch']['id'],
-                batch['t_batch']['id'],
-                device=device,
-            )
             h_batch = {key: value.to(device) for key, value in batch['h_batch'].items()}
             r_batch = {key: value.to(device) for key, value in batch['r_batch'].items()}
-            t_batch = {key: value.to(device) for key, value in batch['t_batch'].items()}
+            target_ids = batch['t_batch']['id'].to(device)
             context_batch = {key: value.to(device) for key, value in batch['context_batch'].items()}
 
             optimizer.zero_grad()
             query = model(h_batch, r_batch, context_batch)
-            target = model.encode_target(t_batch)
-            loss, _ = model.compute_loss(query, target, truth_mask)
+            loss = model.compute_loss(query, target_ids)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
             optimizer.step()

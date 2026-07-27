@@ -4,43 +4,6 @@ import torch
 from torch.utils.data import Dataset
 
 
-class TrainTruthIndex:
-    """Build query-aware in-batch truth masks from training triples only."""
-
-    def __init__(self, train_triples):
-        self.query_tails = {}
-        for h, r, t in train_triples.tolist():
-            self.query_tails.setdefault((h, r), set()).add(t)
-
-    def build_in_batch_truth_mask(
-        self,
-        head_ids,
-        relation_ids,
-        candidate_tail_ids,
-        device=None,
-    ):
-        head_ids = head_ids.reshape(-1).cpu()
-        relation_ids = relation_ids.reshape(-1).cpu()
-        candidate_tail_ids = candidate_tail_ids.reshape(-1).cpu()
-
-        batch_size = head_ids.numel()
-        candidate_columns = {}
-        for column, tail_id in enumerate(candidate_tail_ids.tolist()):
-            candidate_columns.setdefault(tail_id, []).append(column)
-
-        truth_mask = torch.zeros(batch_size, batch_size, dtype=torch.bool)
-        for row, (head_id, relation_id) in enumerate(
-            zip(head_ids.tolist(), relation_ids.tolist())
-        ):
-            for tail_id in self.query_tails.get((head_id, relation_id), ()):
-                columns = candidate_columns.get(tail_id)
-                if columns:
-                    truth_mask[row, columns] = True
-
-        truth_mask.fill_diagonal_(True)
-        return truth_mask.to(device) if device is not None else truth_mask
-
-
 class GWMDataset(Dataset):
     """Knowledge graph triples with fixed relation-aware head context."""
 

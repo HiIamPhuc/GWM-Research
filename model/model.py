@@ -3,26 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def filtered_in_batch_contrastive_loss(scores, truth_mask=None):
-    """Single-positive InfoNCE that ignores other known in-batch truths."""
-
-    batch_size = scores.size(0)
-    if truth_mask is None:
-        truth_mask = torch.eye(
-            batch_size,
-            dtype=torch.bool,
-            device=scores.device,
-        )
-    else:
-        truth_mask = truth_mask.to(device=scores.device, dtype=torch.bool)
-
-    diagonal = torch.eye(batch_size, dtype=torch.bool, device=scores.device)
-    denominator_mask = (~truth_mask) | diagonal
-    filtered_scores = scores.masked_fill(~denominator_mask, float('-inf'))
-    labels = torch.arange(batch_size, device=scores.device)
-    return F.cross_entropy(filtered_scores, labels, reduction='none')
-
-
 class GWM(nn.Module):
     """Head-centered world-state encoder with a transition decoder."""
 
@@ -199,13 +179,15 @@ class GWM(nn.Module):
         target = self.struct_ent_embs(t_batch['id'])
         return F.normalize(target, p=2, dim=-1)
 
-    def compute_loss(self, query_vectors, target_vectors, truth_mask=None):
-        scores = torch.mm(query_vectors, target_vectors.t()) / self.temperature
-        loss = filtered_in_batch_contrastive_loss(
-            scores,
-            truth_mask=truth_mask,
-        ).mean()
-        return loss, scores
+    def compute_loss(self, query_vectors, target_ids):
+        candidate_vectors = F.normalize(
+            self.struct_ent_embs.weight,
+            p=2,
+            dim=-1,
+        )
+        scores = torch.mm(query_vectors, candidate_vectors.t())
+        scores = scores / self.temperature
+        return F.cross_entropy(scores, target_ids)
 
     def score_all_entities(
         self,

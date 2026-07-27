@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
-from model.model import GWM, filtered_in_batch_contrastive_loss
+from model.dataset import CollateFN, GWMDataset
+from model.model import GWM
 from studies.ablation_models import build_model
 from utils.compute_context import ContextProcessor
 from utils.eval import (
@@ -178,15 +178,13 @@ class ModelTests(unittest.TestCase):
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
         )
-        targets = model.encode_target({'id': torch.tensor([2, 3])})
-        loss, scores = model.compute_loss(
+        target_ids = torch.tensor([2, 3])
+        loss = model.compute_loss(
             query,
-            targets,
-            truth_mask=torch.eye(2, dtype=torch.bool),
+            target_ids,
         )
         loss.backward()
 
-        self.assertEqual(scores.shape, (2, 2))
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(model.struct_ent_embs.weight.grad)
         self.assertIsNotNone(model.base_rel_embs.weight.grad)
@@ -256,20 +254,27 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual({relation for relation, _ in selected}, {0, 1, 2})
 
-    def test_filtered_in_batch_loss_ignores_other_true_tails(self):
-        scores = torch.tensor(
-            [[2.0, 3.0, 1.0], [0.5, 2.0, 1.0], [0.0, 1.0, 2.0]],
-            requires_grad=True,
+    def test_full_entity_loss_matches_cross_entropy_over_all_entities(self):
+        model = GWM(make_config())
+        query = F.normalize(
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            p=2,
+            dim=-1,
         )
-        truth_mask = torch.eye(3, dtype=torch.bool)
-        truth_mask[0, 1] = True
+        target_ids = torch.tensor([2])
 
-        losses = filtered_in_batch_contrastive_loss(scores, truth_mask)
-        losses.sum().backward()
+        actual = model.compute_loss(query, target_ids)
+        candidates = F.normalize(
+            model.struct_ent_embs.weight,
+            p=2,
+            dim=-1,
+        )
+        expected = F.cross_entropy(
+            torch.mm(query, candidates.t()) / model.temperature,
+            target_ids,
+        )
 
-        self.assertEqual(scores.grad[0, 1].item(), 0.0)
-        self.assertLess(scores.grad[0, 0].item(), 0.0)
-        self.assertGreater(scores.grad[0, 2].item(), 0.0)
+        self.assertTrue(torch.allclose(actual, expected))
 
 
 class DatasetTests(unittest.TestCase):
@@ -334,20 +339,6 @@ class DatasetTests(unittest.TestCase):
             (Path(root) / 'context_neighbors.pt').unlink()
             with self.assertRaises(FileNotFoundError):
                 GWMDataset(root, split='train')
-
-    def test_train_truth_index_marks_all_known_in_batch_tails(self):
-        index = TrainTruthIndex(
-            torch.tensor([[0, 0, 1], [0, 0, 2], [1, 0, 2]])
-        )
-        mask = index.build_in_batch_truth_mask(
-            head_ids=torch.tensor([0, 0, 1]),
-            relation_ids=torch.tensor([0, 0, 0]),
-            candidate_tail_ids=torch.tensor([1, 2, 2]),
-        )
-        self.assertEqual(
-            mask.tolist(),
-            [[True, True, True], [True, True, True], [False, True, True]],
-        )
 
     def test_bidirectional_eval_dataset_builds_inverse_queries_on_the_fly(self):
         with tempfile.TemporaryDirectory() as root:

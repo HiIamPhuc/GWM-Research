@@ -61,18 +61,20 @@ class ModelTests(unittest.TestCase):
                 'transition_decoder',
                 'next_state_projection',
                 'context_fact_norm',
+                'token_roles',
             },
         )
         self.assertFalse(hasattr(model, 'text_ent_embs'))
         self.assertFalse(hasattr(model, 'adapter'))
         self.assertFalse(hasattr(model, 'fusion'))
         self.assertFalse(hasattr(model, 'lstm'))
-        self.assertFalse(hasattr(model, 'token_roles'))
         self.assertFalse(hasattr(model, 'context_entity_projection'))
         self.assertFalse(hasattr(model, 'context_relation_projection'))
         self.assertFalse(hasattr(model, 'transition_projection'))
         self.assertFalse(hasattr(model, 'output_norm'))
-        self.assertEqual(tuple(model.context_state_token.shape), (1, 1, 4))
+        self.assertFalse(hasattr(model, 'context_state_token'))
+        self.assertEqual(tuple(model.token_roles.weight.shape), (3, 4))
+        self.assertEqual(tuple(model.next_state_token.shape), (1, 1, 4))
         self.assertTrue(torch.equal(
             model.next_state_projection.weight,
             torch.eye(4),
@@ -102,13 +104,28 @@ class ModelTests(unittest.TestCase):
         context_handle.remove()
         transition_handle.remove()
 
-        expected_transition = torch.stack(
-            [model.struct_ent_embs(h_ids), model.encode_relation(r_ids)],
+        expected_context_head = (
+            model.struct_ent_embs(h_ids)
+            + model.token_roles.weight[0]
+        )
+        expected_relation = (
+            model.encode_relation(r_ids)
+            + model.token_roles.weight[2]
+        )
+        expected_transition = torch.cat(
+            [
+                expected_relation.unsqueeze(1),
+                model.next_state_token.expand(2, -1, -1),
+            ],
             dim=1,
         )
         self.assertTrue(torch.equal(
             captured['transition_tokens'],
             expected_transition,
+        ))
+        self.assertTrue(torch.equal(
+            captured['context_tokens'][:, 0],
+            expected_context_head,
         ))
         self.assertEqual(captured['context_tokens'].shape, (2, 3, 4))
         self.assertEqual(captured['memory'].shape, (2, 3, 4))
@@ -164,7 +181,8 @@ class ModelTests(unittest.TestCase):
         )
         self.assertIsNotNone(model.next_state_projection.weight.grad)
         self.assertIsNotNone(model.context_fact_norm.weight.grad)
-        self.assertIsNotNone(model.context_state_token.grad)
+        self.assertIsNotNone(model.token_roles.weight.grad)
+        self.assertIsNotNone(model.next_state_token.grad)
 
     def test_forward_and_inverse_relations_share_the_same_base_row(self):
         model = GWM(make_config())

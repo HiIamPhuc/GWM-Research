@@ -24,7 +24,7 @@ def filtered_in_batch_contrastive_loss(scores, truth_mask=None):
 
 
 class GWM(nn.Module):
-    """Graph-memory encoder with a relation-conditioned transition decoder."""
+    """Head-centered world-state encoder with a transition decoder."""
 
     def __init__(self, config):
         super().__init__()
@@ -96,7 +96,8 @@ class GWM(nn.Module):
             bias=False,
         )
         self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
-        self.context_state_token = nn.Parameter(
+        self.token_roles = nn.Embedding(3, self.embedding_dim)
+        self.next_state_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
         )
         self.register_buffer(
@@ -104,7 +105,8 @@ class GWM(nn.Module):
             torch.tensor([[False, True], [False, False]]),
             persistent=False,
         )
-        nn.init.normal_(self.context_state_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.token_roles.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.next_state_token, mean=0.0, std=0.02)
         nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
@@ -118,11 +120,15 @@ class GWM(nn.Module):
         relation = relation + inverse_mask * self.inverse_adapter(base)
         return self.relation_norm(relation)
 
-    def encode_context(self, context_batch):
+    def encode_world_state(self, h_batch, context_batch):
         entity_ids = context_batch['id']
         relation_ids = context_batch['rel_id']
         context_mask = context_batch['mask'].bool()
 
+        head_token = (
+            self.struct_ent_embs(h_batch['id'])
+            + self.token_roles.weight[0]
+        )
         safe_entity_ids = entity_ids.masked_fill(~context_mask, 0)
         safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
         context_entities = self.struct_ent_embs(safe_entity_ids)
@@ -130,14 +136,17 @@ class GWM(nn.Module):
         fact_tokens = self.context_fact_norm(
             context_entities + context_relations
         )
+        fact_tokens = fact_tokens + self.token_roles.weight[1]
         fact_tokens = fact_tokens.masked_fill(
             ~context_mask.unsqueeze(-1),
             0.0,
         )
 
         batch_size = entity_ids.size(0)
-        state_token = self.context_state_token.expand(batch_size, -1, -1)
-        memory_tokens = torch.cat([state_token, fact_tokens], dim=1)
+        memory_tokens = torch.cat(
+            [head_token.unsqueeze(1), fact_tokens],
+            dim=1,
+        )
         memory_padding_mask = torch.cat(
             [
                 torch.zeros(
@@ -157,10 +166,23 @@ class GWM(nn.Module):
         return memory, memory_padding_mask
 
     def encode_query(self, h_batch, r_batch, context_batch):
-        head = self.struct_ent_embs(h_batch['id'])
-        relation = self.encode_relation(r_batch['id'])
-        memory, memory_padding_mask = self.encode_context(context_batch)
-        transition_tokens = torch.stack([head, relation], dim=1)
+        relation = (
+            self.encode_relation(r_batch['id'])
+            + self.token_roles.weight[2]
+        )
+        memory, memory_padding_mask = self.encode_world_state(
+            h_batch,
+            context_batch,
+        )
+        next_state_token = self.next_state_token.expand(
+            relation.size(0),
+            -1,
+            -1,
+        )
+        transition_tokens = torch.cat(
+            [relation.unsqueeze(1), next_state_token],
+            dim=1,
+        )
         decoded = self.transition_decoder(
             tgt=transition_tokens,
             memory=memory,

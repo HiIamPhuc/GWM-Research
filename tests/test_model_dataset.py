@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from model.dataset import CollateFN, GWMDataset
+from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import GWM
 from studies.ablation_models import build_model
 from utils.compute_context import ContextProcessor
@@ -182,6 +182,10 @@ class ModelTests(unittest.TestCase):
         loss = model.compute_loss(
             query,
             target_ids,
+            (
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+            ),
         )
         loss.backward()
 
@@ -254,7 +258,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual({relation for relation, _ in selected}, {0, 1, 2})
 
-    def test_full_entity_loss_matches_cross_entropy_over_all_entities(self):
+    def test_filtered_full_entity_loss_masks_alternate_training_truths(self):
         model = GWM(make_config())
         query = F.normalize(
             torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
@@ -262,19 +266,44 @@ class ModelTests(unittest.TestCase):
             dim=-1,
         )
         target_ids = torch.tensor([2])
+        filtered_positive_indices = (
+            torch.tensor([0]),
+            torch.tensor([1]),
+        )
 
-        actual = model.compute_loss(query, target_ids)
+        actual = model.compute_loss(
+            query,
+            target_ids,
+            filtered_positive_indices,
+        )
         candidates = F.normalize(
             model.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
-        expected = F.cross_entropy(
-            torch.mm(query, candidates.t()) / model.temperature,
-            target_ids,
-        )
+        scores = torch.mm(query, candidates.t()) / model.temperature
+        scores[0, 1] = torch.finfo(scores.dtype).min
+        expected = F.cross_entropy(scores, target_ids)
 
         self.assertTrue(torch.allclose(actual, expected))
+
+    def test_train_truth_index_returns_only_alternate_positive_tails(self):
+        index = TrainTruthIndex(torch.tensor([
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 1, 3],
+            [1, 0, 3],
+        ]))
+
+        rows, columns = index.alternate_positive_indices(
+            head_ids=torch.tensor([0, 0, 1]),
+            relation_ids=torch.tensor([0, 1, 0]),
+            target_ids=torch.tensor([1, 3, 3]),
+            device=torch.device('cpu'),
+        )
+
+        self.assertEqual(rows.tolist(), [0])
+        self.assertEqual(columns.tolist(), [2])
 
 
 class DatasetTests(unittest.TestCase):

@@ -179,7 +179,12 @@ class GWM(nn.Module):
         target = self.struct_ent_embs(t_batch['id'])
         return F.normalize(target, p=2, dim=-1)
 
-    def compute_loss(self, query_vectors, target_ids):
+    def compute_loss(
+        self,
+        query_vectors,
+        target_ids,
+        filtered_positive_indices,
+    ):
         candidate_vectors = F.normalize(
             self.struct_ent_embs.weight,
             p=2,
@@ -187,6 +192,8 @@ class GWM(nn.Module):
         )
         scores = torch.mm(query_vectors, candidate_vectors.t())
         scores = scores / self.temperature
+        rows, columns = filtered_positive_indices
+        scores[rows, columns] = torch.finfo(scores.dtype).min
         return F.cross_entropy(scores, target_ids)
 
     def score_all_entities(

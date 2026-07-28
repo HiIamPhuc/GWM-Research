@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from model.dataset import CollateFN, GWMDataset
+from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import GWM
 from utils.early_stopping import EarlyStopping
 from utils.eval import (
@@ -28,7 +28,7 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 
 ARCHITECTURE = 'head_centered_world_state_transformer_next_state_dot'
-TRAINING_OBJECTIVE = 'triple_level_full_entity_cross_entropy'
+TRAINING_OBJECTIVE = 'filtered_single_positive_full_entity_cross_entropy'
 
 
 def get_config(args):
@@ -102,6 +102,7 @@ def train(args):
     print("Initializing model...")
     model = GWM(config).to(device)
     collate_fn = CollateFN()
+    train_truth_index = TrainTruthIndex(train_dataset.triples)
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -164,6 +165,14 @@ def train(args):
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
         for batch in progress:
+            filtered_positive_indices = (
+                train_truth_index.alternate_positive_indices(
+                    batch['h_batch']['id'],
+                    batch['r_batch']['id'],
+                    batch['t_batch']['id'],
+                    device,
+                )
+            )
             h_batch = {key: value.to(device) for key, value in batch['h_batch'].items()}
             r_batch = {key: value.to(device) for key, value in batch['r_batch'].items()}
             target_ids = batch['t_batch']['id'].to(device)
@@ -171,7 +180,11 @@ def train(args):
 
             optimizer.zero_grad()
             query = model(h_batch, r_batch, context_batch)
-            loss = model.compute_loss(query, target_ids)
+            loss = model.compute_loss(
+                query,
+                target_ids,
+                filtered_positive_indices,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
             optimizer.step()

@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 
 import torch
 from torch.utils.data import Dataset
@@ -64,3 +65,37 @@ class CollateFN:
                 'mask': torch.stack([item['context_mask'] for item in batch]),
             },
         }
+
+
+class TrainTruthIndex:
+    """Known training tails used to filter false negatives."""
+
+    def __init__(self, triples):
+        tails_by_query = defaultdict(set)
+        for h_id, r_id, t_id in triples.tolist():
+            tails_by_query[(h_id, r_id)].add(t_id)
+        self.tails_by_query = tails_by_query
+
+    def alternate_positive_indices(
+        self,
+        head_ids,
+        relation_ids,
+        target_ids,
+        device,
+    ):
+        rows = []
+        columns = []
+        for row, (h_id, r_id, target_id) in enumerate(zip(
+            head_ids.tolist(),
+            relation_ids.tolist(),
+            target_ids.tolist(),
+        )):
+            for tail_id in self.tails_by_query[(h_id, r_id)]:
+                if tail_id != target_id:
+                    rows.append(row)
+                    columns.append(tail_id)
+
+        return (
+            torch.tensor(rows, dtype=torch.long, device=device),
+            torch.tensor(columns, dtype=torch.long, device=device),
+        )

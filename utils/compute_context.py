@@ -62,7 +62,7 @@ class ContextProcessor:
 
         return selected
 
-    def compute_context_nodes(self, k=10):
+    def compute_context_nodes(self, k=16):
         print("Computing relation-diverse context memory...")
         num_entities = len(self.entity2id)
         pad_value = -1
@@ -128,7 +128,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--k',
         type=int,
-        default=10,
+        default=16,
         help='Max number of context neighbors per entity. Use k<=0 to keep all real neighbors (variable count).',
     )
     parser.add_argument(

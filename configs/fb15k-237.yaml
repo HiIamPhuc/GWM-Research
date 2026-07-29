@@ -4,6 +4,8 @@ context_encoder_heads: 4
 context_encoder_ffn_multiplier: 2
 context_encoder_dropout: 0.05
 context_encoder_layers: 1
+context_active_k: 8
+context_selection_temperature: 0.2
 transition_decoder_heads: 8
 transition_decoder_ffn_multiplier: 4
 transition_decoder_dropout: 0.05

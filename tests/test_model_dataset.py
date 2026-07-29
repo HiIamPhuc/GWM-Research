@@ -32,6 +32,8 @@ def make_config():
         context_encoder_heads=1,
         context_encoder_ffn_multiplier=2,
         context_encoder_dropout=0.0,
+        context_active_k=2,
+        context_selection_temperature=0.2,
         transition_decoder_heads=2,
         transition_decoder_ffn_multiplier=3,
         transition_decoder_dropout=0.0,
@@ -61,6 +63,7 @@ class ModelTests(unittest.TestCase):
                 'inverse_adapter',
                 'relation_norm',
                 'context_encoder',
+                'context_query_projection',
                 'transition_decoder',
                 'next_state_projection',
                 'context_fact_norm',
@@ -208,6 +211,11 @@ class ModelTests(unittest.TestCase):
         )
         self.assertIsNotNone(model.next_state_projection.weight.grad)
         self.assertIsNotNone(model.context_fact_norm.weight.grad)
+        self.assertIsNotNone(model.context_query_projection.weight.grad)
+        self.assertGreater(
+            model.context_query_projection.weight.grad.abs().sum().item(),
+            0.0,
+        )
         self.assertIsNotNone(model.token_roles.weight.grad)
         self.assertIsNotNone(model.next_state_token.grad)
         self.assertIsNotNone(model.masked_head_token.grad)
@@ -236,6 +244,60 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(mapping['num_base_relations'], 2)
         self.assertEqual(mapping['full_to_base'], [0, 1, 0, 1])
         self.assertEqual(mapping['directions'], [1, 1, 0, 0])
+
+    def test_query_context_selects_relation_compatible_fact(self):
+        config = make_config()
+        config.context_active_k = 1
+        model = GWM(config)
+        model.eval()
+        with torch.no_grad():
+            model.base_rel_embs.weight.copy_(torch.tensor([
+                [1.0, -1.0, 1.0, -1.0],
+                [-1.0, 1.0, -1.0, 1.0],
+            ]))
+            model.direction_embs.weight.zero_()
+
+        query_relation = model.encode_relation(torch.tensor([0]))
+        selected = model.select_query_context(
+            query_relation,
+            {
+                'id': torch.tensor([[1, 2, 3]]),
+                'rel_id': torch.tensor([[2, 0, 3]]),
+                'mask': torch.tensor([[True, True, True]]),
+            },
+        )
+
+        self.assertEqual(selected['id'].tolist(), [[2]])
+        self.assertEqual(selected['rel_id'].tolist(), [[0]])
+        self.assertEqual(selected['mask'].tolist(), [[True]])
+        self.assertEqual(selected['weight'].tolist(), [[1.0]])
+
+    def test_context_selection_refills_a_masked_pool_position(self):
+        model = GWM(make_config())
+        model.eval()
+        context = {
+            'id': torch.tensor([[1, 2, 3]]),
+            'rel_id': torch.tensor([[0, 1, 2]]),
+            'mask': torch.tensor([[False, True, True]]),
+        }
+        query_relation = model.encode_relation(torch.tensor([0]))
+
+        selected = model.select_query_context(
+            query_relation,
+            context,
+        )
+        reconstructed = model.sample_reconstruction_context(context)
+
+        self.assertEqual(selected['mask'].tolist(), [[True, True]])
+        self.assertEqual(
+            set(selected['id'].flatten().tolist()),
+            {2, 3},
+        )
+        self.assertEqual(reconstructed['mask'].tolist(), [[True, True]])
+        self.assertEqual(
+            set(reconstructed['id'].flatten().tolist()),
+            {2, 3},
+        )
 
     def test_targets_are_normalized_entity_embeddings(self):
         model = GWM(make_config())

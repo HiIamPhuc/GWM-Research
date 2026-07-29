@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
+from model.dataset import CollateFN, GWMDataset
 from model.model import GWM
 from studies.ablation_models import build_model
 from utils.compute_context import ContextProcessor
@@ -78,6 +78,7 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(hasattr(model, 'context_state_token'))
         self.assertEqual(tuple(model.token_roles.weight.shape), (3, 4))
         self.assertEqual(tuple(model.next_state_token.shape), (1, 1, 4))
+        self.assertEqual(tuple(model.masked_head_token.shape), (1, 1, 4))
         self.assertEqual(
             model.context_encoder.layers[0].self_attn.num_heads,
             1,
@@ -179,14 +180,19 @@ class ModelTests(unittest.TestCase):
             make_context_batch(),
         )
         target_ids = torch.tensor([2, 3])
-        loss = model.compute_loss(
+        kg_loss = model.compute_loss(
             query,
             target_ids,
-            (
-                torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.long),
-            ),
         )
+        reconstructed_heads = model.encode_masked_world_state(
+            {'id': torch.tensor([0, 1])},
+            make_context_batch(),
+        )
+        state_loss = model.compute_loss(
+            reconstructed_heads,
+            torch.tensor([0, 1]),
+        )
+        loss = kg_loss + 0.1 * state_loss
         loss.backward()
 
         self.assertTrue(torch.isfinite(loss))
@@ -204,6 +210,7 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.context_fact_norm.weight.grad)
         self.assertIsNotNone(model.token_roles.weight.grad)
         self.assertIsNotNone(model.next_state_token.grad)
+        self.assertIsNotNone(model.masked_head_token.grad)
 
     def test_forward_and_inverse_relations_share_the_same_base_row(self):
         model = GWM(make_config())
@@ -258,7 +265,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual({relation for relation, _ in selected}, {0, 1, 2})
 
-    def test_filtered_full_entity_loss_masks_alternate_training_truths(self):
+    def test_full_entity_loss_matches_unfiltered_cross_entropy(self):
         model = GWM(make_config())
         query = F.normalize(
             torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
@@ -266,44 +273,53 @@ class ModelTests(unittest.TestCase):
             dim=-1,
         )
         target_ids = torch.tensor([2])
-        filtered_positive_indices = (
-            torch.tensor([0]),
-            torch.tensor([1]),
-        )
 
-        actual = model.compute_loss(
-            query,
-            target_ids,
-            filtered_positive_indices,
-        )
+        actual = model.compute_loss(query, target_ids)
         candidates = F.normalize(
             model.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
         scores = torch.mm(query, candidates.t()) / model.temperature
-        scores[0, 1] = torch.finfo(scores.dtype).min
         expected = F.cross_entropy(scores, target_ids)
 
         self.assertTrue(torch.allclose(actual, expected))
 
-    def test_train_truth_index_returns_only_alternate_positive_tails(self):
-        index = TrainTruthIndex(torch.tensor([
-            [0, 0, 1],
-            [0, 0, 2],
-            [0, 1, 3],
-            [1, 0, 3],
-        ]))
+    def test_masked_world_state_ignores_head_identity(self):
+        model = GWM(make_config())
+        model.eval()
+        context = make_context_batch()
 
-        rows, columns = index.alternate_positive_indices(
-            head_ids=torch.tensor([0, 0, 1]),
-            relation_ids=torch.tensor([0, 1, 0]),
-            target_ids=torch.tensor([1, 3, 3]),
-            device=torch.device('cpu'),
+        first = model.encode_masked_world_state(
+            {'id': torch.tensor([0, 1])},
+            context,
+        )
+        second = model.encode_masked_world_state(
+            {'id': torch.tensor([2, 3])},
+            context,
         )
 
-        self.assertEqual(rows.tolist(), [0])
-        self.assertEqual(columns.tolist(), [2])
+        self.assertTrue(torch.allclose(first, second))
+
+    def test_masked_world_state_depends_on_context(self):
+        model = GWM(make_config())
+        model.eval()
+        h_batch = {'id': torch.tensor([0, 1])}
+
+        contextualized = model.encode_masked_world_state(
+            h_batch,
+            make_context_batch(),
+        )
+        empty_context = model.encode_masked_world_state(
+            h_batch,
+            {
+                'id': torch.full((2, 2), -1, dtype=torch.long),
+                'rel_id': torch.full((2, 2), -1, dtype=torch.long),
+                'mask': torch.zeros((2, 2), dtype=torch.bool),
+            },
+        )
+
+        self.assertFalse(torch.allclose(contextualized, empty_context))
 
 
 class DatasetTests(unittest.TestCase):

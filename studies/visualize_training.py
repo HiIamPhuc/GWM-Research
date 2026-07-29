@@ -1,8 +1,8 @@
 """Visualize GWM training logs.
 
 Current training logs contain aggregate and directional validation metrics plus
-training loss. The plotting code remains tolerant of incomplete runs and older
-logs.
+the total, KGC, and masked-state training losses. The plotting code remains
+tolerant of incomplete runs and older logs.
 """
 
 import argparse
@@ -79,8 +79,12 @@ def plot_training_curves(log_data, output_path=None, show=True, run_name=None):
     plot_lines(
         ax1,
         entries,
-        [('train_loss', 'train loss', 'b-')],
-        'Training Loss',
+        [
+            ('train_loss', 'total', 'b-'),
+            ('train_kg_loss', 'KGC', 'g-'),
+            ('train_state_loss', 'state reconstruction', 'm-'),
+        ],
+        'Training Objectives',
         'Loss',
     )
 

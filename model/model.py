@@ -80,6 +80,9 @@ class GWM(nn.Module):
         self.next_state_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
         )
+        self.masked_head_token = nn.Parameter(
+            torch.empty(1, 1, self.embedding_dim)
+        )
         self.register_buffer(
             'transition_mask',
             torch.tensor([[False, True], [False, False]]),
@@ -90,6 +93,7 @@ class GWM(nn.Module):
         nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
+        nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -100,15 +104,25 @@ class GWM(nn.Module):
         relation = relation + inverse_mask * self.inverse_adapter(base)
         return self.relation_norm(relation)
 
-    def encode_world_state(self, h_batch, context_batch):
+    def encode_world_state(
+        self,
+        h_batch,
+        context_batch,
+        mask_head=False,
+    ):
         entity_ids = context_batch['id']
         relation_ids = context_batch['rel_id']
         context_mask = context_batch['mask'].bool()
 
-        head_token = (
-            self.struct_ent_embs(h_batch['id'])
-            + self.token_roles.weight[0]
-        )
+        if mask_head:
+            head_token = self.masked_head_token.expand(
+                entity_ids.size(0),
+                -1,
+                -1,
+            ).squeeze(1)
+        else:
+            head_token = self.struct_ent_embs(h_batch['id'])
+        head_token = head_token + self.token_roles.weight[0]
         safe_entity_ids = entity_ids.masked_fill(~context_mask, 0)
         safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
         context_entities = self.struct_ent_embs(safe_entity_ids)
@@ -145,6 +159,14 @@ class GWM(nn.Module):
         )
         return memory, memory_padding_mask
 
+    def encode_masked_world_state(self, h_batch, context_batch):
+        memory, _ = self.encode_world_state(
+            h_batch,
+            context_batch,
+            mask_head=True,
+        )
+        return F.normalize(memory[:, 0], p=2, dim=-1)
+
     def encode_query(self, h_batch, r_batch, context_batch):
         relation = (
             self.encode_relation(r_batch['id'])
@@ -179,12 +201,7 @@ class GWM(nn.Module):
         target = self.struct_ent_embs(t_batch['id'])
         return F.normalize(target, p=2, dim=-1)
 
-    def compute_loss(
-        self,
-        query_vectors,
-        target_ids,
-        filtered_positive_indices,
-    ):
+    def compute_loss(self, query_vectors, target_ids):
         candidate_vectors = F.normalize(
             self.struct_ent_embs.weight,
             p=2,
@@ -192,8 +209,6 @@ class GWM(nn.Module):
         )
         scores = torch.mm(query_vectors, candidate_vectors.t())
         scores = scores / self.temperature
-        rows, columns = filtered_positive_indices
-        scores[rows, columns] = torch.finfo(scores.dtype).min
         return F.cross_entropy(scores, target_ids)
 
     def score_all_entities(

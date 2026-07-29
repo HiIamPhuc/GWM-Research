@@ -9,6 +9,8 @@ transition_decoder_ffn_multiplier: 2
 transition_decoder_dropout: 0.1
 transition_decoder_layers: 2
 temperature: 0.07
+state_reconstruction_ratio: 0.15
+state_reconstruction_weight: 0.1
 
 learning_rate: 0.0005
 weight_decay: 0.0001

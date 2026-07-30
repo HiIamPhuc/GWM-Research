@@ -135,7 +135,7 @@ class GWM(nn.Module):
         context_entities = self.struct_ent_embs(safe_entity_ids)
         context_relations = self.encode_relation(safe_relation_ids)
         fact_tokens = self.context_fact_norm(
-            context_entities * context_relations
+            context_entities + context_relations
         )
         if query_relation is not None:
             fact_tokens = (

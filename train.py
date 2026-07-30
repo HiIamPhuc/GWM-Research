@@ -28,8 +28,8 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 
 ARCHITECTURE = (
-    'head_centered_world_state_transformer_next_state_dot_'
-    'query_context_retrieval_masked_reconstruction'
+    'atomic_fact_world_state_transformer_next_state_dot_'
+    'masked_reconstruction'
 )
 TRAINING_OBJECTIVE = (
     'triple_level_full_entity_cross_entropy_with_'
@@ -98,7 +98,7 @@ def train(args):
     print(f"Loading data from {config.data_dir}...")
     train_dataset = GWMDataset(config.data_dir, split='train')
     valid_dataset = GWMDataset(config.data_dir, split='valid')
-    config.context_pool_k = train_dataset.context_entity_ids.size(1)
+    config.context_k = train_dataset.context_entity_ids.size(1)
     with open(os.path.join(config.data_dir, 'entity2id.json')) as f:
         config.num_entities = len(json.load(f))
     with open(os.path.join(config.data_dir, 'relation2id.json')) as f:

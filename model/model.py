@@ -38,6 +38,22 @@ class GWM(nn.Module):
         )
         self.register_buffer('relation_base_ids', relation_base_ids)
         self.register_buffer('relation_directions', relation_directions)
+        fact_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.embedding_dim,
+            nhead=config.context_encoder_heads,
+            dim_feedforward=(
+                config.context_encoder_ffn_multiplier * self.embedding_dim
+            ),
+            dropout=config.context_encoder_dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.fact_encoder = nn.TransformerEncoder(
+            fact_encoder_layer,
+            num_layers=1,
+            norm=nn.LayerNorm(self.embedding_dim),
+        )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embedding_dim,
             nhead=config.context_encoder_heads,
@@ -76,6 +92,7 @@ class GWM(nn.Module):
             bias=False,
         )
         self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
+        self.fact_token_roles = nn.Embedding(2, self.embedding_dim)
         self.token_roles = nn.Embedding(3, self.embedding_dim)
         self.next_state_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
@@ -88,18 +105,13 @@ class GWM(nn.Module):
             torch.tensor([[False, True], [False, False]]),
             persistent=False,
         )
+        nn.init.normal_(self.fact_token_roles.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.token_roles.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.next_state_token, mean=0.0, std=0.02)
         nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
-        self.context_query_projection = nn.Linear(
-            self.embedding_dim,
-            self.embedding_dim,
-            bias=False,
-        )
-        nn.init.eye_(self.context_query_projection.weight)
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -115,7 +127,6 @@ class GWM(nn.Module):
         h_batch,
         context_batch,
         mask_head=False,
-        query_relation=None,
     ):
         entity_ids = context_batch['id']
         relation_ids = context_batch['rel_id']
@@ -134,15 +145,26 @@ class GWM(nn.Module):
         safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
         context_entities = self.struct_ent_embs(safe_entity_ids)
         context_relations = self.encode_relation(safe_relation_ids)
-        fact_tokens = self.context_fact_norm(
-            context_entities + context_relations
+        fact_pairs = torch.stack(
+            [
+                context_relations + self.fact_token_roles.weight[0],
+                context_entities + self.fact_token_roles.weight[1],
+            ],
+            dim=2,
         )
-        if query_relation is not None:
-            fact_tokens = (
-                fact_tokens
-                + context_batch['weight'].unsqueeze(-1)
-                * query_relation.unsqueeze(1)
+        fact_pairs = fact_pairs.reshape(
+            -1,
+            2,
+            self.embedding_dim,
+        )
+        encoded_facts = self.fact_encoder(fact_pairs)
+        fact_tokens = self.context_fact_norm(
+            encoded_facts[:, 1].reshape(
+                entity_ids.size(0),
+                entity_ids.size(1),
+                self.embedding_dim,
             )
+        )
         fact_tokens = fact_tokens + self.token_roles.weight[1]
         fact_tokens = fact_tokens.masked_fill(
             ~context_mask.unsqueeze(-1),
@@ -172,93 +194,7 @@ class GWM(nn.Module):
         )
         return memory, memory_padding_mask
 
-    @staticmethod
-    def _gather_context(context_batch, indices):
-        return {
-            key: torch.gather(value, 1, indices)
-            for key, value in context_batch.items()
-        }
-
-    def select_query_context(self, query_relation, context_batch):
-        context_mask = context_batch['mask'].bool()
-        safe_relation_ids = context_batch['rel_id'].masked_fill(
-            ~context_mask,
-            0,
-        )
-        context_relations = self.encode_relation(safe_relation_ids)
-        selection_query = F.normalize(
-            self.context_query_projection(query_relation),
-            p=2,
-            dim=-1,
-        )
-        selection_keys = F.normalize(
-            context_relations,
-            p=2,
-            dim=-1,
-        )
-        scores = torch.einsum(
-            'bd,bkd->bk',
-            selection_query,
-            selection_keys,
-        )
-        scores = scores / self.config.context_selection_temperature
-        scores = scores.masked_fill(
-            ~context_mask,
-            torch.finfo(scores.dtype).min,
-        )
-
-        active_k = min(
-            self.config.context_active_k,
-            context_mask.size(1),
-        )
-        selected_scores, indices = torch.topk(
-            scores,
-            k=active_k,
-            dim=1,
-        )
-        selected = self._gather_context(context_batch, indices)
-        selected_mask = selected['mask'].bool()
-        selected_scores = selected_scores.masked_fill(
-            ~selected_mask,
-            torch.finfo(selected_scores.dtype).min,
-        )
-        weights = F.softmax(selected_scores, dim=1)
-        weights = weights * selected_mask
-        weights = weights / weights.sum(
-            dim=1,
-            keepdim=True,
-        ).clamp_min(1.0)
-        selected['weight'] = weights
-        return selected
-
-    def sample_reconstruction_context(self, context_batch):
-        context_mask = context_batch['mask'].bool()
-        if self.training:
-            scores = torch.rand(
-                context_mask.shape,
-                device=context_mask.device,
-            )
-        else:
-            scores = -torch.arange(
-                context_mask.size(1),
-                device=context_mask.device,
-                dtype=torch.float,
-            ).expand_as(context_mask)
-        scores = scores.masked_fill(
-            ~context_mask,
-            torch.finfo(scores.dtype).min,
-        )
-        active_k = min(
-            self.config.context_active_k,
-            context_mask.size(1),
-        )
-        indices = torch.topk(scores, k=active_k, dim=1).indices
-        return self._gather_context(context_batch, indices)
-
     def encode_masked_world_state(self, h_batch, context_batch):
-        context_batch = self.sample_reconstruction_context(
-            context_batch,
-        )
         memory, _ = self.encode_world_state(
             h_batch,
             context_batch,
@@ -267,17 +203,14 @@ class GWM(nn.Module):
         return F.normalize(memory[:, 0], p=2, dim=-1)
 
     def encode_query(self, h_batch, r_batch, context_batch):
-        query_relation = self.encode_relation(r_batch['id'])
-        context_batch = self.select_query_context(
-            query_relation,
-            context_batch,
+        relation = (
+            self.encode_relation(r_batch['id'])
+            + self.token_roles.weight[2]
         )
         memory, memory_padding_mask = self.encode_world_state(
             h_batch,
             context_batch,
-            query_relation=query_relation,
         )
-        relation = query_relation + self.token_roles.weight[2]
         next_state_token = self.next_state_token.expand(
             relation.size(0),
             -1,

@@ -32,8 +32,6 @@ def make_config():
         context_encoder_heads=1,
         context_encoder_ffn_multiplier=2,
         context_encoder_dropout=0.0,
-        context_active_k=2,
-        context_selection_temperature=0.2,
         transition_decoder_heads=2,
         transition_decoder_ffn_multiplier=3,
         transition_decoder_dropout=0.0,
@@ -62,11 +60,12 @@ class ModelTests(unittest.TestCase):
                 'direction_embs',
                 'inverse_adapter',
                 'relation_norm',
+                'fact_encoder',
                 'context_encoder',
-                'context_query_projection',
                 'transition_decoder',
                 'next_state_projection',
                 'context_fact_norm',
+                'fact_token_roles',
                 'token_roles',
             },
         )
@@ -79,9 +78,14 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(hasattr(model, 'transition_projection'))
         self.assertFalse(hasattr(model, 'output_norm'))
         self.assertFalse(hasattr(model, 'context_state_token'))
+        self.assertEqual(tuple(model.fact_token_roles.weight.shape), (2, 4))
         self.assertEqual(tuple(model.token_roles.weight.shape), (3, 4))
         self.assertEqual(tuple(model.next_state_token.shape), (1, 1, 4))
         self.assertEqual(tuple(model.masked_head_token.shape), (1, 1, 4))
+        self.assertEqual(
+            model.fact_encoder.layers[0].self_attn.num_heads,
+            1,
+        )
         self.assertEqual(
             model.context_encoder.layers[0].self_attn.num_heads,
             1,
@@ -89,6 +93,10 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(
             model.transition_decoder.layers[0].self_attn.num_heads,
             2,
+        )
+        self.assertEqual(
+            model.fact_encoder.layers[0].linear1.out_features,
+            8,
         )
         self.assertEqual(
             model.context_encoder.layers[0].linear1.out_features,
@@ -111,10 +119,16 @@ class ModelTests(unittest.TestCase):
         def capture_context(module, inputs):
             captured['context_tokens'] = inputs[0].detach().clone()
 
+        def capture_facts(module, inputs):
+            captured['fact_pairs'] = inputs[0].detach().clone()
+
         def capture_transition(module, inputs):
             captured['transition_tokens'] = inputs[0].detach().clone()
             captured['memory'] = inputs[1].detach().clone()
 
+        fact_handle = model.fact_encoder.register_forward_pre_hook(
+            capture_facts
+        )
         context_handle = model.context_encoder.register_forward_pre_hook(
             capture_context
         )
@@ -124,6 +138,7 @@ class ModelTests(unittest.TestCase):
         h_ids = torch.tensor([0, 1])
         r_ids = torch.tensor([2, 3])
         model({'id': h_ids}, {'id': r_ids}, make_context_batch())
+        fact_handle.remove()
         context_handle.remove()
         transition_handle.remove()
 
@@ -134,6 +149,15 @@ class ModelTests(unittest.TestCase):
         expected_relation = (
             model.encode_relation(r_ids)
             + model.token_roles.weight[2]
+        )
+        expected_fact_pair = torch.stack(
+            [
+                model.encode_relation(torch.tensor([0]))
+                + model.fact_token_roles.weight[0],
+                model.struct_ent_embs(torch.tensor([1]))
+                + model.fact_token_roles.weight[1],
+            ],
+            dim=1,
         )
         expected_transition = torch.cat(
             [
@@ -150,6 +174,11 @@ class ModelTests(unittest.TestCase):
             captured['context_tokens'][:, 0],
             expected_context_head,
         ))
+        self.assertTrue(torch.equal(
+            captured['fact_pairs'][0],
+            expected_fact_pair[0],
+        ))
+        self.assertEqual(captured['fact_pairs'].shape, (4, 2, 4))
         self.assertEqual(captured['context_tokens'].shape, (2, 3, 4))
         self.assertEqual(captured['memory'].shape, (2, 3, 4))
         self.assertEqual(
@@ -204,6 +233,9 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.direction_embs.weight.grad)
         self.assertIsNotNone(model.inverse_adapter.weight.grad)
         self.assertIsNotNone(
+            model.fact_encoder.layers[0].self_attn.in_proj_weight.grad
+        )
+        self.assertIsNotNone(
             model.context_encoder.layers[0].self_attn.in_proj_weight.grad
         )
         self.assertIsNotNone(
@@ -211,11 +243,7 @@ class ModelTests(unittest.TestCase):
         )
         self.assertIsNotNone(model.next_state_projection.weight.grad)
         self.assertIsNotNone(model.context_fact_norm.weight.grad)
-        self.assertIsNotNone(model.context_query_projection.weight.grad)
-        self.assertGreater(
-            model.context_query_projection.weight.grad.abs().sum().item(),
-            0.0,
-        )
+        self.assertIsNotNone(model.fact_token_roles.weight.grad)
         self.assertIsNotNone(model.token_roles.weight.grad)
         self.assertIsNotNone(model.next_state_token.grad)
         self.assertIsNotNone(model.masked_head_token.grad)
@@ -244,60 +272,6 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(mapping['num_base_relations'], 2)
         self.assertEqual(mapping['full_to_base'], [0, 1, 0, 1])
         self.assertEqual(mapping['directions'], [1, 1, 0, 0])
-
-    def test_query_context_selects_relation_compatible_fact(self):
-        config = make_config()
-        config.context_active_k = 1
-        model = GWM(config)
-        model.eval()
-        with torch.no_grad():
-            model.base_rel_embs.weight.copy_(torch.tensor([
-                [1.0, -1.0, 1.0, -1.0],
-                [-1.0, 1.0, -1.0, 1.0],
-            ]))
-            model.direction_embs.weight.zero_()
-
-        query_relation = model.encode_relation(torch.tensor([0]))
-        selected = model.select_query_context(
-            query_relation,
-            {
-                'id': torch.tensor([[1, 2, 3]]),
-                'rel_id': torch.tensor([[2, 0, 3]]),
-                'mask': torch.tensor([[True, True, True]]),
-            },
-        )
-
-        self.assertEqual(selected['id'].tolist(), [[2]])
-        self.assertEqual(selected['rel_id'].tolist(), [[0]])
-        self.assertEqual(selected['mask'].tolist(), [[True]])
-        self.assertEqual(selected['weight'].tolist(), [[1.0]])
-
-    def test_context_selection_refills_a_masked_pool_position(self):
-        model = GWM(make_config())
-        model.eval()
-        context = {
-            'id': torch.tensor([[1, 2, 3]]),
-            'rel_id': torch.tensor([[0, 1, 2]]),
-            'mask': torch.tensor([[False, True, True]]),
-        }
-        query_relation = model.encode_relation(torch.tensor([0]))
-
-        selected = model.select_query_context(
-            query_relation,
-            context,
-        )
-        reconstructed = model.sample_reconstruction_context(context)
-
-        self.assertEqual(selected['mask'].tolist(), [[True, True]])
-        self.assertEqual(
-            set(selected['id'].flatten().tolist()),
-            {2, 3},
-        )
-        self.assertEqual(reconstructed['mask'].tolist(), [[True, True]])
-        self.assertEqual(
-            set(reconstructed['id'].flatten().tolist()),
-            {2, 3},
-        )
 
     def test_targets_are_normalized_entity_embeddings(self):
         model = GWM(make_config())

@@ -4,8 +4,6 @@ context_encoder_heads: 4
 context_encoder_ffn_multiplier: 2
 context_encoder_dropout: 0.05
 context_encoder_layers: 1
-context_active_k: 4
-context_selection_temperature: 0.2
 transition_decoder_heads: 4
 transition_decoder_ffn_multiplier: 2
 transition_decoder_dropout: 0.05
@@ -19,7 +17,7 @@ weight_decay: 0.01
 min_lr: 0.001
 warmup_ratio: 0.05
 grad_clip_norm: 1.0
-num_epochs: 300
+num_epochs: 200
 early_stopping_patience: 15
 
 batch_size: 2048

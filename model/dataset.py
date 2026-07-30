@@ -5,7 +5,7 @@ from torch.utils.data import Dataset
 
 
 class GWMDataset(Dataset):
-    """Knowledge graph triples with a precomputed head-context pool."""
+    """Knowledge graph triples with fixed relation-aware head context."""
 
     def __init__(self, data_dir, split='train'):
         self.data_dir = data_dir

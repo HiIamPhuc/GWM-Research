@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class GWM(nn.Module):
-    """One- and two-hop world-state encoder with a transition decoder."""
+    """Head-centered world-state encoder with a transition decoder."""
 
     def __init__(self, config):
         super().__init__()
@@ -12,7 +12,7 @@ class GWM(nn.Module):
         self.embedding_dim = config.struct_emb_dim
         self.temperature = config.temperature
 
-        self.struct_ent_embs = nn.Embedding(
+        self.state_ent_embs = nn.Embedding(
             config.num_entities,
             self.embedding_dim,
         )
@@ -76,13 +76,7 @@ class GWM(nn.Module):
             bias=False,
         )
         self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
-        self.path_projection = nn.Linear(
-            self.embedding_dim * 2,
-            self.embedding_dim,
-            bias=False,
-        )
-        self.path_norm = nn.LayerNorm(self.embedding_dim)
-        self.token_roles = nn.Embedding(4, self.embedding_dim)
+        self.token_roles = nn.Embedding(3, self.embedding_dim)
         self.next_state_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
         )
@@ -100,14 +94,13 @@ class GWM(nn.Module):
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
+        self.target_ent_embs = nn.Embedding(
+            config.num_entities,
+            self.embedding_dim,
+        )
         with torch.no_grad():
-            self.path_projection.weight.zero_()
-            identity = torch.eye(self.embedding_dim)
-            self.path_projection.weight[:, :self.embedding_dim].copy_(
-                0.6 * identity
-            )
-            self.path_projection.weight[:, self.embedding_dim:].copy_(
-                0.4 * identity
+            self.target_ent_embs.weight.copy_(
+                self.state_ent_embs.weight
             )
 
     def encode_relation(self, relation_ids):
@@ -136,11 +129,11 @@ class GWM(nn.Module):
                 -1,
             ).squeeze(1)
         else:
-            head_token = self.struct_ent_embs(h_batch['id'])
+            head_token = self.state_ent_embs(h_batch['id'])
         head_token = head_token + self.token_roles.weight[0]
         safe_entity_ids = entity_ids.masked_fill(~context_mask, 0)
         safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
-        context_entities = self.struct_ent_embs(safe_entity_ids)
+        context_entities = self.state_ent_embs(safe_entity_ids)
         context_relations = self.encode_relation(safe_relation_ids)
         fact_tokens = self.context_fact_norm(
             context_entities + context_relations
@@ -151,45 +144,9 @@ class GWM(nn.Module):
             0.0,
         )
 
-        path_mask = context_batch['path_mask'].bool()
-        safe_intermediate_ids = context_batch[
-            'path_intermediate_id'
-        ].masked_fill(~path_mask, 0)
-        safe_final_ids = context_batch['path_final_id'].masked_fill(
-            ~path_mask,
-            0,
-        )
-        safe_first_relation_ids = context_batch[
-            'path_first_rel_id'
-        ].masked_fill(~path_mask, 0)
-        safe_second_relation_ids = context_batch[
-            'path_second_rel_id'
-        ].masked_fill(~path_mask, 0)
-        first_hop_tokens = self.context_fact_norm(
-            self.struct_ent_embs(safe_intermediate_ids)
-            + self.encode_relation(safe_first_relation_ids)
-        )
-        second_hop_tokens = self.context_fact_norm(
-            self.struct_ent_embs(safe_final_ids)
-            + self.encode_relation(safe_second_relation_ids)
-        )
-        path_tokens = self.path_norm(
-            self.path_projection(
-                torch.cat(
-                    [first_hop_tokens, second_hop_tokens],
-                    dim=-1,
-                )
-            )
-        )
-        path_tokens = path_tokens + self.token_roles.weight[3]
-        path_tokens = path_tokens.masked_fill(
-            ~path_mask.unsqueeze(-1),
-            0.0,
-        )
-
         batch_size = entity_ids.size(0)
         memory_tokens = torch.cat(
-            [head_token.unsqueeze(1), fact_tokens, path_tokens],
+            [head_token.unsqueeze(1), fact_tokens],
             dim=1,
         )
         memory_padding_mask = torch.cat(
@@ -201,7 +158,6 @@ class GWM(nn.Module):
                     device=context_mask.device,
                 ),
                 ~context_mask,
-                ~path_mask,
             ],
             dim=1,
         )
@@ -250,18 +206,41 @@ class GWM(nn.Module):
         return self.encode_query(h_batch, r_batch, context_batch)
 
     def encode_target(self, t_batch):
-        target = self.struct_ent_embs(t_batch['id'])
+        target = self.target_ent_embs(t_batch['id'])
         return F.normalize(target, p=2, dim=-1)
 
-    def compute_loss(self, query_vectors, target_ids):
+    def _compute_entity_loss(
+        self,
+        query_vectors,
+        target_ids,
+        entity_table,
+    ):
         candidate_vectors = F.normalize(
-            self.struct_ent_embs.weight,
+            entity_table.weight,
             p=2,
             dim=-1,
         )
         scores = torch.mm(query_vectors, candidate_vectors.t())
         scores = scores / self.temperature
         return F.cross_entropy(scores, target_ids)
+
+    def compute_loss(self, query_vectors, target_ids):
+        return self._compute_entity_loss(
+            query_vectors,
+            target_ids,
+            self.target_ent_embs,
+        )
+
+    def compute_state_reconstruction_loss(
+        self,
+        reconstructed_states,
+        entity_ids,
+    ):
+        return self._compute_entity_loss(
+            reconstructed_states,
+            entity_ids,
+            self.state_ent_embs,
+        )
 
     def score_all_entities(
         self,

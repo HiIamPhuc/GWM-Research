@@ -28,7 +28,7 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 
 ARCHITECTURE = (
-    'atomic_fact_world_state_transformer_next_state_dot_'
+    'two_hop_world_state_transformer_next_state_dot_'
     'masked_reconstruction'
 )
 TRAINING_OBJECTIVE = (
@@ -99,6 +99,7 @@ def train(args):
     train_dataset = GWMDataset(config.data_dir, split='train')
     valid_dataset = GWMDataset(config.data_dir, split='valid')
     config.context_k = train_dataset.context_entity_ids.size(1)
+    config.context_path_k = train_dataset.path_mask.size(1)
     with open(os.path.join(config.data_dir, 'entity2id.json')) as f:
         config.num_entities = len(json.load(f))
     with open(os.path.join(config.data_dir, 'relation2id.json')) as f:

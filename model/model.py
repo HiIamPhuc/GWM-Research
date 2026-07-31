@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class GWM(nn.Module):
-    """Head-centered world-state encoder with a transition decoder."""
+    """One- and two-hop world-state encoder with a transition decoder."""
 
     def __init__(self, config):
         super().__init__()
@@ -38,22 +38,6 @@ class GWM(nn.Module):
         )
         self.register_buffer('relation_base_ids', relation_base_ids)
         self.register_buffer('relation_directions', relation_directions)
-        fact_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embedding_dim,
-            nhead=config.context_encoder_heads,
-            dim_feedforward=(
-                config.context_encoder_ffn_multiplier * self.embedding_dim
-            ),
-            dropout=config.context_encoder_dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.fact_encoder = nn.TransformerEncoder(
-            fact_encoder_layer,
-            num_layers=1,
-            norm=nn.LayerNorm(self.embedding_dim),
-        )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embedding_dim,
             nhead=config.context_encoder_heads,
@@ -92,8 +76,13 @@ class GWM(nn.Module):
             bias=False,
         )
         self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
-        self.fact_token_roles = nn.Embedding(2, self.embedding_dim)
-        self.token_roles = nn.Embedding(3, self.embedding_dim)
+        self.path_projection = nn.Linear(
+            self.embedding_dim * 2,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.path_norm = nn.LayerNorm(self.embedding_dim)
+        self.token_roles = nn.Embedding(4, self.embedding_dim)
         self.next_state_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
         )
@@ -105,13 +94,21 @@ class GWM(nn.Module):
             torch.tensor([[False, True], [False, False]]),
             persistent=False,
         )
-        nn.init.normal_(self.fact_token_roles.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.token_roles.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.next_state_token, mean=0.0, std=0.02)
         nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.path_projection.weight.zero_()
+            identity = torch.eye(self.embedding_dim)
+            self.path_projection.weight[:, :self.embedding_dim].copy_(
+                0.6 * identity
+            )
+            self.path_projection.weight[:, self.embedding_dim:].copy_(
+                0.4 * identity
+            )
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -145,25 +142,8 @@ class GWM(nn.Module):
         safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
         context_entities = self.struct_ent_embs(safe_entity_ids)
         context_relations = self.encode_relation(safe_relation_ids)
-        fact_pairs = torch.stack(
-            [
-                context_relations + self.fact_token_roles.weight[0],
-                context_entities + self.fact_token_roles.weight[1],
-            ],
-            dim=2,
-        )
-        fact_pairs = fact_pairs.reshape(
-            -1,
-            2,
-            self.embedding_dim,
-        )
-        encoded_facts = self.fact_encoder(fact_pairs)
         fact_tokens = self.context_fact_norm(
-            encoded_facts[:, 1].reshape(
-                entity_ids.size(0),
-                entity_ids.size(1),
-                self.embedding_dim,
-            )
+            context_entities + context_relations
         )
         fact_tokens = fact_tokens + self.token_roles.weight[1]
         fact_tokens = fact_tokens.masked_fill(
@@ -171,9 +151,45 @@ class GWM(nn.Module):
             0.0,
         )
 
+        path_mask = context_batch['path_mask'].bool()
+        safe_intermediate_ids = context_batch[
+            'path_intermediate_id'
+        ].masked_fill(~path_mask, 0)
+        safe_final_ids = context_batch['path_final_id'].masked_fill(
+            ~path_mask,
+            0,
+        )
+        safe_first_relation_ids = context_batch[
+            'path_first_rel_id'
+        ].masked_fill(~path_mask, 0)
+        safe_second_relation_ids = context_batch[
+            'path_second_rel_id'
+        ].masked_fill(~path_mask, 0)
+        first_hop_tokens = self.context_fact_norm(
+            self.struct_ent_embs(safe_intermediate_ids)
+            + self.encode_relation(safe_first_relation_ids)
+        )
+        second_hop_tokens = self.context_fact_norm(
+            self.struct_ent_embs(safe_final_ids)
+            + self.encode_relation(safe_second_relation_ids)
+        )
+        path_tokens = self.path_norm(
+            self.path_projection(
+                torch.cat(
+                    [first_hop_tokens, second_hop_tokens],
+                    dim=-1,
+                )
+            )
+        )
+        path_tokens = path_tokens + self.token_roles.weight[3]
+        path_tokens = path_tokens.masked_fill(
+            ~path_mask.unsqueeze(-1),
+            0.0,
+        )
+
         batch_size = entity_ids.size(0)
         memory_tokens = torch.cat(
-            [head_token.unsqueeze(1), fact_tokens],
+            [head_token.unsqueeze(1), fact_tokens, path_tokens],
             dim=1,
         )
         memory_padding_mask = torch.cat(
@@ -185,6 +201,7 @@ class GWM(nn.Module):
                     device=context_mask.device,
                 ),
                 ~context_mask,
+                ~path_mask,
             ],
             dim=1,
         )

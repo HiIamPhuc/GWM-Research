@@ -12,7 +12,7 @@ class GWM(nn.Module):
         self.embedding_dim = config.struct_emb_dim
         self.temperature = config.temperature
 
-        self.state_ent_embs = nn.Embedding(
+        self.struct_ent_embs = nn.Embedding(
             config.num_entities,
             self.embedding_dim,
         )
@@ -94,14 +94,12 @@ class GWM(nn.Module):
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
-        self.target_ent_embs = nn.Embedding(
-            config.num_entities,
+        self.precision_projection = nn.Linear(
+            self.embedding_dim,
             self.embedding_dim,
         )
-        with torch.no_grad():
-            self.target_ent_embs.weight.copy_(
-                self.state_ent_embs.weight
-            )
+        nn.init.zeros_(self.precision_projection.weight)
+        nn.init.zeros_(self.precision_projection.bias)
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -129,11 +127,11 @@ class GWM(nn.Module):
                 -1,
             ).squeeze(1)
         else:
-            head_token = self.state_ent_embs(h_batch['id'])
+            head_token = self.struct_ent_embs(h_batch['id'])
         head_token = head_token + self.token_roles.weight[0]
         safe_entity_ids = entity_ids.masked_fill(~context_mask, 0)
         safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
-        context_entities = self.state_ent_embs(safe_entity_ids)
+        context_entities = self.struct_ent_embs(safe_entity_ids)
         context_relations = self.encode_relation(safe_relation_ids)
         fact_tokens = self.context_fact_norm(
             context_entities + context_relations
@@ -199,48 +197,70 @@ class GWM(nn.Module):
             tgt_mask=self.transition_mask,
             memory_key_padding_mask=memory_padding_mask,
         )
-        next_state = self.next_state_projection(decoded[:, 1])
-        return F.normalize(next_state, p=2, dim=-1)
+        decoded_state = decoded[:, 1]
+        next_state = self.next_state_projection(decoded_state)
+        mean = F.normalize(next_state, p=2, dim=-1)
+        precision = torch.exp(
+            2.0 * torch.tanh(
+                self.precision_projection(decoded_state)
+            )
+        )
+        return mean, precision
 
     def forward(self, h_batch, r_batch, context_batch):
         return self.encode_query(h_batch, r_batch, context_batch)
 
     def encode_target(self, t_batch):
-        target = self.target_ent_embs(t_batch['id'])
+        target = self.struct_ent_embs(t_batch['id'])
         return F.normalize(target, p=2, dim=-1)
 
-    def _compute_entity_loss(
+    def score_candidates(
         self,
-        query_vectors,
-        target_ids,
-        entity_table,
+        means,
+        precisions,
+        candidate_vectors,
     ):
+        scores = torch.mm(
+            precisions * means,
+            candidate_vectors.t(),
+        )
+        scores.addmm_(
+            precisions,
+            candidate_vectors.square().t(),
+            beta=1.0,
+            alpha=-0.5,
+        )
+        return scores / self.temperature
+
+    def compute_loss(self, means, precisions, target_ids):
         candidate_vectors = F.normalize(
-            entity_table.weight,
+            self.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
-        scores = torch.mm(query_vectors, candidate_vectors.t())
-        scores = scores / self.temperature
-        return F.cross_entropy(scores, target_ids)
-
-    def compute_loss(self, query_vectors, target_ids):
-        return self._compute_entity_loss(
-            query_vectors,
-            target_ids,
-            self.target_ent_embs,
+        scores = self.score_candidates(
+            means,
+            precisions,
+            candidate_vectors,
         )
+        return F.cross_entropy(scores, target_ids)
 
     def compute_state_reconstruction_loss(
         self,
         reconstructed_states,
         entity_ids,
     ):
-        return self._compute_entity_loss(
-            reconstructed_states,
-            entity_ids,
-            self.state_ent_embs,
+        candidate_vectors = F.normalize(
+            self.struct_ent_embs.weight,
+            p=2,
+            dim=-1,
         )
+        scores = torch.mm(
+            reconstructed_states,
+            candidate_vectors.t(),
+        )
+        scores = scores / self.temperature
+        return F.cross_entropy(scores, entity_ids)
 
     def score_all_entities(
         self,
@@ -249,13 +269,21 @@ class GWM(nn.Module):
         context_batch,
         candidate_vectors=None,
     ):
-        query_vectors = self.encode_query(h_batch, r_batch, context_batch)
+        means, precisions = self.encode_query(
+            h_batch,
+            r_batch,
+            context_batch,
+        )
         if candidate_vectors is None:
             entity_ids = torch.arange(
                 self.config.num_entities,
-                device=query_vectors.device,
+                device=means.device,
                 dtype=torch.long,
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        return torch.mm(query_vectors, candidate_vectors.t()) / self.temperature
+        return self.score_candidates(
+            means,
+            precisions,
+            candidate_vectors,
+        )

@@ -43,7 +43,7 @@ def plot_lines(ax, entries, specs, title, ylabel, ylim=None):
         if not points:
             continue
         xs, ys = zip(*points)
-        ax.plot(xs, ys, style, markersize=2, linewidth=1.5, label=label)
+        ax.plot(xs, ys, style, markersize=1, linewidth=1.5, label=label)
         plotted = True
 
     ax.set_title(title, fontsize=12, fontweight='bold')

@@ -94,12 +94,32 @@ class GWM(nn.Module):
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
-        self.precision_projection = nn.Linear(
+        self.observation_basis_count = 16
+        self.observation_query_bases = nn.Parameter(torch.empty(
+            self.observation_basis_count,
             self.embedding_dim,
+        ))
+        self.observation_target_bases = nn.Parameter(torch.empty(
+            self.observation_basis_count,
             self.embedding_dim,
+        ))
+        self.observation_coefficient_projection = nn.Linear(
+            self.embedding_dim,
+            self.observation_basis_count,
         )
-        nn.init.zeros_(self.precision_projection.weight)
-        nn.init.zeros_(self.precision_projection.bias)
+        basis_std = self.embedding_dim ** -0.5
+        nn.init.normal_(
+            self.observation_query_bases,
+            mean=0.0,
+            std=basis_std,
+        )
+        nn.init.normal_(
+            self.observation_target_bases,
+            mean=0.0,
+            std=basis_std,
+        )
+        nn.init.zeros_(self.observation_coefficient_projection.weight)
+        nn.init.zeros_(self.observation_coefficient_projection.bias)
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -174,21 +194,22 @@ class GWM(nn.Module):
         return F.normalize(memory[:, 0], p=2, dim=-1)
 
     def encode_query(self, h_batch, r_batch, context_batch):
-        relation = (
-            self.encode_relation(r_batch['id'])
-            + self.token_roles.weight[2]
+        relation = self.encode_relation(r_batch['id'])
+        observation_coefficients = torch.tanh(
+            self.observation_coefficient_projection(relation)
         )
+        relation_token = relation + self.token_roles.weight[2]
         memory, memory_padding_mask = self.encode_world_state(
             h_batch,
             context_batch,
         )
         next_state_token = self.next_state_token.expand(
-            relation.size(0),
+            relation_token.size(0),
             -1,
             -1,
         )
         transition_tokens = torch.cat(
-            [relation.unsqueeze(1), next_state_token],
+            [relation_token.unsqueeze(1), next_state_token],
             dim=1,
         )
         decoded = self.transition_decoder(
@@ -199,13 +220,8 @@ class GWM(nn.Module):
         )
         decoded_state = decoded[:, 1]
         next_state = self.next_state_projection(decoded_state)
-        mean = F.normalize(next_state, p=2, dim=-1)
-        precision = torch.exp(
-            2.0 * torch.tanh(
-                self.precision_projection(decoded_state)
-            )
-        )
-        return mean, precision
+        query = F.normalize(next_state, p=2, dim=-1)
+        return query, observation_coefficients
 
     def forward(self, h_batch, r_batch, context_batch):
         return self.encode_query(h_batch, r_batch, context_batch)
@@ -216,31 +232,35 @@ class GWM(nn.Module):
 
     def score_candidates(
         self,
-        means,
-        precisions,
+        queries,
+        observation_coefficients,
         candidate_vectors,
     ):
-        scores = torch.mm(
-            precisions * means,
-            candidate_vectors.t(),
+        scores = torch.mm(queries, candidate_vectors.t())
+        query_factors = torch.mm(
+            queries,
+            self.observation_query_bases.t(),
+        )
+        candidate_factors = torch.mm(
+            candidate_vectors,
+            self.observation_target_bases.t(),
         )
         scores.addmm_(
-            precisions,
-            candidate_vectors.square().t(),
+            observation_coefficients * query_factors,
+            candidate_factors.t(),
             beta=1.0,
-            alpha=-0.5,
         )
         return scores / self.temperature
 
-    def compute_loss(self, means, precisions, target_ids):
+    def compute_loss(self, queries, observation_coefficients, target_ids):
         candidate_vectors = F.normalize(
             self.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
         scores = self.score_candidates(
-            means,
-            precisions,
+            queries,
+            observation_coefficients,
             candidate_vectors,
         )
         return F.cross_entropy(scores, target_ids)
@@ -269,7 +289,7 @@ class GWM(nn.Module):
         context_batch,
         candidate_vectors=None,
     ):
-        means, precisions = self.encode_query(
+        queries, observation_coefficients = self.encode_query(
             h_batch,
             r_batch,
             context_batch,
@@ -277,13 +297,13 @@ class GWM(nn.Module):
         if candidate_vectors is None:
             entity_ids = torch.arange(
                 self.config.num_entities,
-                device=means.device,
+                device=queries.device,
                 dtype=torch.long,
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
         return self.score_candidates(
-            means,
-            precisions,
+            queries,
+            observation_coefficients,
             candidate_vectors,
         )

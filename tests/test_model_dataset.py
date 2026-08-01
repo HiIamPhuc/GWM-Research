@@ -63,7 +63,7 @@ class ModelTests(unittest.TestCase):
                 'context_encoder',
                 'transition_decoder',
                 'next_state_projection',
-                'precision_projection',
+                'observation_coefficient_projection',
                 'context_fact_norm',
                 'token_roles',
             },
@@ -100,13 +100,21 @@ class ModelTests(unittest.TestCase):
             model.next_state_projection.weight,
             torch.eye(4),
         ))
+        self.assertEqual(
+            tuple(model.observation_query_bases.shape),
+            (16, 4),
+        )
+        self.assertEqual(
+            tuple(model.observation_target_bases.shape),
+            (16, 4),
+        )
         self.assertTrue(torch.equal(
-            model.precision_projection.weight,
-            torch.zeros(4, 4),
+            model.observation_coefficient_projection.weight,
+            torch.zeros(16, 4),
         ))
         self.assertTrue(torch.equal(
-            model.precision_projection.bias,
-            torch.zeros(4),
+            model.observation_coefficient_projection.bias,
+            torch.zeros(16),
         ))
 
     def test_context_and_transition_use_separate_sequences(self):
@@ -168,12 +176,12 @@ class ModelTests(unittest.TestCase):
         model.eval()
         h_batch = {'id': torch.tensor([0, 1])}
         r_batch = {'id': torch.tensor([2, 3])}
-        first_mean, first_precision = model(
+        first_query, first_coefficients = model(
             h_batch,
             r_batch,
             make_context_batch(),
         )
-        second_mean, second_precision = model(
+        second_query, second_coefficients = model(
             h_batch,
             r_batch,
             {
@@ -182,29 +190,29 @@ class ModelTests(unittest.TestCase):
                 'mask': torch.zeros((2, 2), dtype=torch.bool),
             },
         )
-        self.assertFalse(torch.allclose(first_mean, second_mean))
+        self.assertFalse(torch.allclose(first_query, second_query))
         self.assertTrue(torch.equal(
-            first_precision,
-            torch.ones_like(first_precision),
+            first_coefficients,
+            torch.zeros_like(first_coefficients),
         ))
         self.assertTrue(torch.equal(
-            second_precision,
-            torch.ones_like(second_precision),
+            second_coefficients,
+            torch.zeros_like(second_coefficients),
         ))
-        self.assertTrue(torch.isfinite(second_mean).all())
-        self.assertTrue(torch.isfinite(second_precision).all())
+        self.assertTrue(torch.isfinite(second_query).all())
+        self.assertTrue(torch.isfinite(second_coefficients).all())
 
     def test_query_target_loss_backpropagates(self):
         model = GWM(make_config())
-        query_mean, query_precision = model(
+        query, observation_coefficients = model(
             {'id': torch.tensor([0, 1])},
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
         )
         target_ids = torch.tensor([2, 3])
         kg_loss = model.compute_loss(
-            query_mean,
-            query_precision,
+            query,
+            observation_coefficients,
             target_ids,
         )
         reconstructed_heads = model.encode_masked_world_state(
@@ -230,9 +238,13 @@ class ModelTests(unittest.TestCase):
             model.transition_decoder.layers[0].multihead_attn.in_proj_weight.grad
         )
         self.assertIsNotNone(model.next_state_projection.weight.grad)
-        self.assertIsNotNone(model.precision_projection.weight.grad)
+        self.assertIsNotNone(model.observation_query_bases.grad)
+        self.assertIsNotNone(model.observation_target_bases.grad)
+        self.assertIsNotNone(
+            model.observation_coefficient_projection.weight.grad
+        )
         self.assertGreater(
-            model.precision_projection.weight.grad.abs().sum().item(),
+            model.observation_coefficient_projection.weight.grad.abs().sum().item(),
             0.0,
         )
         self.assertIsNotNone(model.context_fact_norm.weight.grad)
@@ -272,7 +284,7 @@ class ModelTests(unittest.TestCase):
         expected = F.normalize(model.struct_ent_embs(ids), p=2, dim=-1)
         self.assertTrue(torch.allclose(actual, expected))
 
-    def test_probabilistic_scorer_scores_all_entities(self):
+    def test_asymmetric_readout_scores_all_entities(self):
         model = GWM(make_config())
         scores = model.score_all_entities(
             {'id': torch.tensor([0, 1])},
@@ -293,36 +305,39 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual({relation for relation, _ in selected}, {0, 1, 2})
 
-    def test_initial_probabilistic_loss_matches_dot_product_cross_entropy(self):
+    def test_initial_readout_loss_matches_dot_product_cross_entropy(self):
         model = GWM(make_config())
-        mean = F.normalize(
+        query = F.normalize(
             torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
             p=2,
             dim=-1,
         )
-        precision = torch.ones_like(mean)
+        coefficients = torch.zeros(1, model.observation_basis_count)
         target_ids = torch.tensor([2])
 
-        actual = model.compute_loss(mean, precision, target_ids)
+        actual = model.compute_loss(query, coefficients, target_ids)
         candidates = F.normalize(
             model.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
-        scores = torch.mm(mean, candidates.t()) / model.temperature
+        scores = torch.mm(query, candidates.t()) / model.temperature
         expected = F.cross_entropy(scores, target_ids)
 
         self.assertTrue(torch.allclose(actual, expected))
 
-    def test_precision_initializes_to_one(self):
+    def test_observation_coefficients_initialize_to_zero(self):
         model = GWM(make_config())
-        _, precision = model(
+        _, coefficients = model(
             {'id': torch.tensor([0, 1])},
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
         )
 
-        self.assertTrue(torch.equal(precision, torch.ones_like(precision)))
+        self.assertTrue(torch.equal(
+            coefficients,
+            torch.zeros_like(coefficients),
+        ))
 
     def test_state_reconstruction_uses_shared_entity_table(self):
         model = GWM(make_config())

@@ -28,8 +28,8 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 
 ARCHITECTURE = (
-    'head_centered_world_state_transformer_probabilistic_'
-    'next_state_diagonal_gaussian_'
+    'head_centered_world_state_transformer_'
+    'low_rank_asymmetric_observation_decoder_'
     'masked_reconstruction'
 )
 TRAINING_OBJECTIVE = (
@@ -171,9 +171,8 @@ def train(args):
         total_kg_loss = 0.0
         total_state_loss = 0.0
         state_examples = 0
-        precision_sum = torch.zeros((), device=device)
-        precision_square_sum = torch.zeros((), device=device)
-        precision_count = 0
+        coefficient_abs_sum = torch.zeros((), device=device)
+        coefficient_count = 0
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
         for batch in progress:
@@ -183,20 +182,18 @@ def train(args):
             context_batch = {key: value.to(device) for key, value in batch['context_batch'].items()}
 
             optimizer.zero_grad()
-            query_mean, query_precision = model(
+            query, observation_coefficients = model(
                 h_batch,
                 r_batch,
                 context_batch,
             )
             kg_loss = model.compute_loss(
-                query_mean,
-                query_precision,
+                query,
+                observation_coefficients,
                 target_ids,
             )
-            detached_precision = query_precision.detach()
-            precision_sum += detached_precision.sum()
-            precision_square_sum += detached_precision.square().sum()
-            precision_count += detached_precision.numel()
+            coefficient_abs_sum += observation_coefficients.detach().abs().sum()
+            coefficient_count += observation_coefficients.numel()
 
             eligible = context_batch['mask'].any(dim=1)
             reconstruct = (
@@ -248,19 +245,14 @@ def train(args):
             total_state_loss / state_examples
             if state_examples else 0.0
         )
-        precision_mean_tensor = precision_sum / precision_count
-        precision_variance = (
-            precision_square_sum / precision_count
-            - precision_mean_tensor.square()
-        ).clamp_min(0.0)
-        train_precision_mean = precision_mean_tensor.item()
-        train_precision_std = precision_variance.sqrt().item()
+        train_coefficient_abs_mean = (
+            coefficient_abs_sum / coefficient_count
+        ).item()
         print(
             f"Epoch {epoch + 1} Train Loss: {train_loss:.4f} | "
             f"KGC: {train_kg_loss:.4f} | "
             f"State: {train_state_loss:.4f} | "
-            f"Precision: {train_precision_mean:.4f}"
-            f"+/-{train_precision_std:.4f} | "
+            f"Readout |a|: {train_coefficient_abs_mean:.4f} | "
             f"Train Time: {train_seconds:.2f}s"
         )
 
@@ -292,8 +284,7 @@ def train(args):
             'train_loss': train_loss,
             'train_kg_loss': train_kg_loss,
             'train_state_loss': train_state_loss,
-            'train_precision_mean': train_precision_mean,
-            'train_precision_std': train_precision_std,
+            'train_readout_coefficient_abs_mean': train_coefficient_abs_mean,
             'val_mrr': micro['MRR'],
             'val_mr': micro['MR'],
             'val_hits1': micro['Hits@1'],

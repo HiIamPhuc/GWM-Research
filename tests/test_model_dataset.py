@@ -27,6 +27,8 @@ def make_config():
         relation_base_ids=[0, 0, 1, 1],
         relation_directions=[0, 1, 0, 1],
         struct_emb_dim=4,
+        num_next_state_slots=4,
+        router_secondary_logit=-4.0,
         context_encoder_layers=1,
         transition_decoder_layers=2,
         context_encoder_heads=1,
@@ -63,6 +65,7 @@ class ModelTests(unittest.TestCase):
                 'context_encoder',
                 'transition_decoder',
                 'next_state_projection',
+                'state_router',
                 'context_fact_norm',
                 'token_roles',
             },
@@ -77,7 +80,7 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(hasattr(model, 'output_norm'))
         self.assertFalse(hasattr(model, 'context_state_token'))
         self.assertEqual(tuple(model.token_roles.weight.shape), (3, 4))
-        self.assertEqual(tuple(model.next_state_token.shape), (1, 1, 4))
+        self.assertEqual(tuple(model.next_state_tokens.shape), (1, 4, 4))
         self.assertEqual(tuple(model.masked_head_token.shape), (1, 1, 4))
         self.assertEqual(
             model.context_encoder.layers[0].self_attn.num_heads,
@@ -98,6 +101,14 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(torch.equal(
             model.next_state_projection.weight,
             torch.eye(4),
+        ))
+        self.assertTrue(torch.equal(
+            model.state_router.weight,
+            torch.zeros(4, 4),
+        ))
+        self.assertTrue(torch.equal(
+            model.state_router.bias,
+            torch.tensor([0.0, -4.0, -4.0, -4.0]),
         ))
 
     def test_context_and_transition_use_separate_sequences(self):
@@ -135,7 +146,7 @@ class ModelTests(unittest.TestCase):
         expected_transition = torch.cat(
             [
                 expected_relation.unsqueeze(1),
-                model.next_state_token.expand(2, -1, -1),
+                model.next_state_tokens.expand(2, -1, -1),
             ],
             dim=1,
         )
@@ -151,7 +162,13 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(captured['memory'].shape, (2, 3, 4))
         self.assertEqual(
             model.transition_mask.tolist(),
-            [[False, True], [False, False]],
+            [
+                [False, True, True, True, True],
+                [False, False, True, True, True],
+                [False, False, False, False, False],
+                [False, False, False, False, False],
+                [False, False, False, False, False],
+            ],
         )
 
     def test_query_depends_on_context(self):
@@ -159,12 +176,12 @@ class ModelTests(unittest.TestCase):
         model.eval()
         h_batch = {'id': torch.tensor([0, 1])}
         r_batch = {'id': torch.tensor([2, 3])}
-        first_query = model(
+        first_slots, first_log_weights = model(
             h_batch,
             r_batch,
             make_context_batch(),
         )
-        second_query = model(
+        second_slots, second_log_weights = model(
             h_batch,
             r_batch,
             {
@@ -173,18 +190,28 @@ class ModelTests(unittest.TestCase):
                 'mask': torch.zeros((2, 2), dtype=torch.bool),
             },
         )
-        self.assertFalse(torch.allclose(first_query, second_query))
-        self.assertTrue(torch.isfinite(second_query).all())
+        self.assertFalse(torch.allclose(first_slots, second_slots))
+        self.assertTrue(torch.equal(first_log_weights, second_log_weights))
+        self.assertEqual(second_slots.shape, (2, 4, 4))
+        self.assertTrue(torch.isfinite(second_slots).all())
+        self.assertTrue(torch.allclose(
+            second_log_weights.exp().sum(dim=-1),
+            torch.ones(2),
+        ))
 
     def test_query_target_loss_backpropagates(self):
         model = GWM(make_config())
-        query = model(
+        query_slots, mixture_log_weights = model(
             {'id': torch.tensor([0, 1])},
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
         )
         target_ids = torch.tensor([2, 3])
-        kg_loss = model.compute_loss(query, target_ids)
+        kg_loss = model.compute_loss(
+            query_slots,
+            mixture_log_weights,
+            target_ids,
+        )
         reconstructed_heads = model.encode_masked_world_state(
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
@@ -208,9 +235,10 @@ class ModelTests(unittest.TestCase):
             model.transition_decoder.layers[0].multihead_attn.in_proj_weight.grad
         )
         self.assertIsNotNone(model.next_state_projection.weight.grad)
+        self.assertIsNotNone(model.state_router.weight.grad)
         self.assertIsNotNone(model.context_fact_norm.weight.grad)
         self.assertIsNotNone(model.token_roles.weight.grad)
-        self.assertIsNotNone(model.next_state_token.grad)
+        self.assertIsNotNone(model.next_state_tokens.grad)
         self.assertIsNotNone(model.masked_head_token.grad)
 
     def test_forward_and_inverse_relations_share_the_same_base_row(self):
@@ -245,7 +273,7 @@ class ModelTests(unittest.TestCase):
         expected = F.normalize(model.struct_ent_embs(ids), p=2, dim=-1)
         self.assertTrue(torch.allclose(actual, expected))
 
-    def test_dot_scorer_scores_all_entities(self):
+    def test_routed_slot_scorer_scores_all_entities(self):
         model = GWM(make_config())
         scores = model.score_all_entities(
             {'id': torch.tensor([0, 1])},
@@ -266,25 +294,58 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual({relation for relation, _ in selected}, {0, 1, 2})
 
-    def test_loss_matches_dot_product_cross_entropy(self):
+    def test_loss_matches_routed_spherical_mixture_cross_entropy(self):
         model = GWM(make_config())
-        query = F.normalize(
-            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+        query_slots = F.normalize(
+            torch.tensor([[
+                [1.0, 2.0, 3.0, 4.0],
+                [2.0, 1.0, 4.0, 3.0],
+                [4.0, 3.0, 2.0, 1.0],
+                [3.0, 4.0, 1.0, 2.0],
+            ]]),
             p=2,
             dim=-1,
         )
+        mixture_log_weights = torch.log(torch.tensor([
+            [0.7, 0.1, 0.1, 0.1],
+        ]))
         target_ids = torch.tensor([2])
 
-        actual = model.compute_loss(query, target_ids)
+        actual = model.compute_loss(
+            query_slots,
+            mixture_log_weights,
+            target_ids,
+        )
         candidates = F.normalize(
             model.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
-        scores = torch.mm(query, candidates.t()) / model.temperature
+        component_logits = torch.einsum(
+            'bkd,nd->bkn',
+            query_slots,
+            candidates,
+        ) / model.temperature
+        scores = torch.logsumexp(
+            component_logits + mixture_log_weights.unsqueeze(-1),
+            dim=1,
+        )
         expected = F.cross_entropy(scores, target_ids)
 
         self.assertTrue(torch.allclose(actual, expected))
+
+    def test_router_starts_with_one_dominant_slot(self):
+        model = GWM(make_config())
+        _, mixture_log_weights = model(
+            {'id': torch.tensor([0, 1])},
+            {'id': torch.tensor([0, 1])},
+            make_context_batch(),
+        )
+        weights = mixture_log_weights.exp()
+
+        self.assertTrue(torch.all(weights[:, 0] > 0.94))
+        self.assertTrue(torch.allclose(weights[:, 1], weights[:, 2]))
+        self.assertTrue(torch.allclose(weights[:, 2], weights[:, 3]))
 
     def test_state_reconstruction_uses_shared_entity_table(self):
         model = GWM(make_config())

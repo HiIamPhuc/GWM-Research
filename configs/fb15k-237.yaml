@@ -1,5 +1,7 @@
 # Head-centered world-state Transformer with shared inverse relations
 struct_emb_dim: 512
+num_next_state_slots: 4
+router_secondary_logit: -4.0
 context_encoder_heads: 4
 context_encoder_ffn_multiplier: 2
 context_encoder_dropout: 0.05
@@ -20,9 +22,10 @@ grad_clip_norm: 1.0
 num_epochs: 200
 early_stopping_patience: 7
 
-batch_size: 2048
-eval_batch_size: 2048
+batch_size: 512
+eval_batch_size: 512
 candidate_batch_size: 2048
+gradient_accumulation_steps: 4
 
 data_dir: data-processed/fb15k-237
 output_dir: output/fb15k-237-context-memory-transformer

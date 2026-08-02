@@ -29,11 +29,11 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 ARCHITECTURE = (
     'head_centered_world_state_transformer_'
-    'next_state_dot_'
+    'routed_spherical_next_state_slots_'
     'masked_reconstruction'
 )
 TRAINING_OBJECTIVE = (
-    'triple_level_full_entity_cross_entropy_with_'
+    'triple_level_full_entity_cross_entropy_with_routed_slots_and_'
     'masked_state_reconstruction'
 )
 
@@ -154,7 +154,14 @@ def train(args):
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    scheduler = build_scheduler(optimizer, config, len(train_loader))
+    optimizer_steps_per_epoch = math.ceil(
+        len(train_loader) / config.gradient_accumulation_steps
+    )
+    scheduler = build_scheduler(
+        optimizer,
+        config,
+        optimizer_steps_per_epoch,
+    )
     early_stopping = EarlyStopping(patience=config.early_stopping_patience, mode='max')
 
     log_path = os.path.join(config.output_dir, 'training_log.json')
@@ -171,21 +178,33 @@ def train(args):
         total_kg_loss = 0.0
         total_state_loss = 0.0
         state_examples = 0
+        effective_slot_sum = torch.zeros((), device=device)
+        routed_query_count = 0
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
-        for batch in progress:
+        optimizer.zero_grad()
+        for step, batch in enumerate(progress):
             h_batch = {key: value.to(device) for key, value in batch['h_batch'].items()}
             r_batch = {key: value.to(device) for key, value in batch['r_batch'].items()}
             target_ids = batch['t_batch']['id'].to(device)
             context_batch = {key: value.to(device) for key, value in batch['context_batch'].items()}
 
-            optimizer.zero_grad()
-            query = model(
+            query_slots, mixture_log_weights = model(
                 h_batch,
                 r_batch,
                 context_batch,
             )
-            kg_loss = model.compute_loss(query, target_ids)
+            kg_loss = model.compute_loss(
+                query_slots,
+                mixture_log_weights,
+                target_ids,
+            )
+            mixture_weights = mixture_log_weights.detach().exp()
+            router_entropy = -(
+                mixture_weights * mixture_log_weights.detach()
+            ).sum(dim=-1)
+            effective_slot_sum += router_entropy.exp().sum()
+            routed_query_count += mixture_log_weights.size(0)
 
             eligible = context_batch['mask'].any(dim=1)
             reconstruct = (
@@ -215,10 +234,27 @@ def train(args):
                 kg_loss
                 + config.state_reconstruction_weight * state_loss
             )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
-            optimizer.step()
-            scheduler.step()
+            accumulation_group_start = (
+                step // config.gradient_accumulation_steps
+            ) * config.gradient_accumulation_steps
+            accumulation_group_size = min(
+                config.gradient_accumulation_steps,
+                len(train_loader) - accumulation_group_start,
+            )
+            scaled_loss = loss / accumulation_group_size
+            scaled_loss.backward()
+            should_step = (
+                (step + 1) % config.gradient_accumulation_steps == 0
+                or step + 1 == len(train_loader)
+            )
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    config.grad_clip_norm,
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
             total_loss += loss.item()
             total_kg_loss += kg_loss.item()
@@ -237,10 +273,14 @@ def train(args):
             total_state_loss / state_examples
             if state_examples else 0.0
         )
+        train_effective_slots = (
+            effective_slot_sum / routed_query_count
+        ).item()
         print(
             f"Epoch {epoch + 1} Train Loss: {train_loss:.4f} | "
             f"KGC: {train_kg_loss:.4f} | "
             f"State: {train_state_loss:.4f} | "
+            f"Effective Slots: {train_effective_slots:.3f} | "
             f"Train Time: {train_seconds:.2f}s"
         )
 
@@ -272,6 +312,7 @@ def train(args):
             'train_loss': train_loss,
             'train_kg_loss': train_kg_loss,
             'train_state_loss': train_state_loss,
+            'train_effective_slots': train_effective_slots,
             'val_mrr': micro['MRR'],
             'val_mr': micro['MR'],
             'val_hits1': micro['Hits@1'],

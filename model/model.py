@@ -94,32 +94,6 @@ class GWM(nn.Module):
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
-        self.observation_basis_count = 16
-        self.observation_query_bases = nn.Parameter(torch.empty(
-            self.observation_basis_count,
-            self.embedding_dim,
-        ))
-        self.observation_target_bases = nn.Parameter(torch.empty(
-            self.observation_basis_count,
-            self.embedding_dim,
-        ))
-        self.observation_coefficient_projection = nn.Linear(
-            self.embedding_dim,
-            self.observation_basis_count,
-        )
-        basis_std = self.embedding_dim ** -0.5
-        nn.init.normal_(
-            self.observation_query_bases,
-            mean=0.0,
-            std=basis_std,
-        )
-        nn.init.normal_(
-            self.observation_target_bases,
-            mean=0.0,
-            std=basis_std,
-        )
-        nn.init.zeros_(self.observation_coefficient_projection.weight)
-        nn.init.zeros_(self.observation_coefficient_projection.bias)
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -194,11 +168,10 @@ class GWM(nn.Module):
         return F.normalize(memory[:, 0], p=2, dim=-1)
 
     def encode_query(self, h_batch, r_batch, context_batch):
-        relation = self.encode_relation(r_batch['id'])
-        observation_coefficients = torch.tanh(
-            self.observation_coefficient_projection(relation)
+        relation_token = (
+            self.encode_relation(r_batch['id'])
+            + self.token_roles.weight[2]
         )
-        relation_token = relation + self.token_roles.weight[2]
         memory, memory_padding_mask = self.encode_world_state(
             h_batch,
             context_batch,
@@ -220,8 +193,7 @@ class GWM(nn.Module):
         )
         decoded_state = decoded[:, 1]
         next_state = self.next_state_projection(decoded_state)
-        query = F.normalize(next_state, p=2, dim=-1)
-        return query, observation_coefficients
+        return F.normalize(next_state, p=2, dim=-1)
 
     def forward(self, h_batch, r_batch, context_batch):
         return self.encode_query(h_batch, r_batch, context_batch)
@@ -230,39 +202,16 @@ class GWM(nn.Module):
         target = self.struct_ent_embs(t_batch['id'])
         return F.normalize(target, p=2, dim=-1)
 
-    def score_candidates(
-        self,
-        queries,
-        observation_coefficients,
-        candidate_vectors,
-    ):
-        scores = torch.mm(queries, candidate_vectors.t())
-        query_factors = torch.mm(
-            queries,
-            self.observation_query_bases.t(),
-        )
-        candidate_factors = torch.mm(
-            candidate_vectors,
-            self.observation_target_bases.t(),
-        )
-        scores.addmm_(
-            observation_coefficients * query_factors,
-            candidate_factors.t(),
-            beta=1.0,
-        )
-        return scores / self.temperature
+    def score_candidates(self, queries, candidate_vectors):
+        return torch.mm(queries, candidate_vectors.t()) / self.temperature
 
-    def compute_loss(self, queries, observation_coefficients, target_ids):
+    def compute_loss(self, queries, target_ids):
         candidate_vectors = F.normalize(
             self.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
-        scores = self.score_candidates(
-            queries,
-            observation_coefficients,
-            candidate_vectors,
-        )
+        scores = self.score_candidates(queries, candidate_vectors)
         return F.cross_entropy(scores, target_ids)
 
     def compute_state_reconstruction_loss(
@@ -289,7 +238,7 @@ class GWM(nn.Module):
         context_batch,
         candidate_vectors=None,
     ):
-        queries, observation_coefficients = self.encode_query(
+        queries = self.encode_query(
             h_batch,
             r_batch,
             context_batch,
@@ -302,8 +251,4 @@ class GWM(nn.Module):
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        return self.score_candidates(
-            queries,
-            observation_coefficients,
-            candidate_vectors,
-        )
+        return self.score_candidates(queries, candidate_vectors)

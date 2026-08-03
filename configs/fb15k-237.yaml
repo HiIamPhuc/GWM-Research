@@ -1,5 +1,5 @@
 # Head-centered world-state Transformer with shared inverse relations
-struct_emb_dim: 512
+struct_emb_dim: 256
 num_next_state_slots: 4
 router_secondary_logit: -4.0
 context_encoder_heads: 4
@@ -11,7 +11,7 @@ transition_decoder_ffn_multiplier: 4
 transition_decoder_dropout: 0.1
 transition_decoder_layers: 2
 temperature: 0.1
-state_reconstruction_ratio: 0.2
+state_reconstruction_ratio: 0.05
 state_reconstruction_weight: 0.1
 
 learning_rate: 0.005

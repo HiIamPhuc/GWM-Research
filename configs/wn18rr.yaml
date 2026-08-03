@@ -1,5 +1,5 @@
 # Head-centered world-state Transformer with shared inverse relations
-struct_emb_dim: 512
+struct_emb_dim: 256
 num_next_state_slots: 4
 router_secondary_logit: -4.0
 context_encoder_heads: 4

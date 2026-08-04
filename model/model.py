@@ -246,7 +246,8 @@ class GWM(nn.Module):
         self,
         query_slots,
         mixture_log_weights,
-        target_ids,
+        positive_tail_ids,
+        positive_tail_mask,
     ):
         candidate_vectors = F.normalize(
             self.struct_ent_embs.weight,
@@ -258,7 +259,15 @@ class GWM(nn.Module):
             mixture_log_weights,
             candidate_vectors,
         )
-        return F.cross_entropy(scores, target_ids)
+        positive_scores = scores.gather(1, positive_tail_ids)
+        positive_scores = positive_scores.masked_fill(
+            ~positive_tail_mask,
+            float('-inf'),
+        )
+        return (
+            torch.logsumexp(scores, dim=-1)
+            - torch.logsumexp(positive_scores, dim=-1)
+        ).mean()
 
     def compute_state_reconstruction_loss(
         self,

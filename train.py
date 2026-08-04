@@ -33,7 +33,7 @@ ARCHITECTURE = (
     'masked_reconstruction'
 )
 TRAINING_OBJECTIVE = (
-    'triple_level_full_entity_cross_entropy_with_routed_slots_and_'
+    'positive_set_full_entity_softmax_with_routed_slots_and_'
     'masked_state_reconstruction'
 )
 
@@ -186,7 +186,10 @@ def train(args):
         for step, batch in enumerate(progress):
             h_batch = {key: value.to(device) for key, value in batch['h_batch'].items()}
             r_batch = {key: value.to(device) for key, value in batch['r_batch'].items()}
-            target_ids = batch['t_batch']['id'].to(device)
+            positive_tail_batch = {
+                key: value.to(device)
+                for key, value in batch['positive_tail_batch'].items()
+            }
             context_batch = {key: value.to(device) for key, value in batch['context_batch'].items()}
 
             query_slots, mixture_log_weights = model(
@@ -197,7 +200,8 @@ def train(args):
             kg_loss = model.compute_loss(
                 query_slots,
                 mixture_log_weights,
-                target_ids,
+                positive_tail_batch['id'],
+                positive_tail_batch['mask'],
             )
             mixture_weights = mixture_log_weights.detach().exp()
             router_entropy = -(

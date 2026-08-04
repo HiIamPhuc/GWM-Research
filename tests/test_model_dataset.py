@@ -206,11 +206,16 @@ class ModelTests(unittest.TestCase):
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
         )
-        target_ids = torch.tensor([2, 3])
+        positive_tail_ids = torch.tensor([[2], [3]])
+        positive_tail_mask = torch.ones_like(
+            positive_tail_ids,
+            dtype=torch.bool,
+        )
         kg_loss = model.compute_loss(
             query_slots,
             mixture_log_weights,
-            target_ids,
+            positive_tail_ids,
+            positive_tail_mask,
         )
         reconstructed_heads = model.encode_masked_world_state(
             {'id': torch.tensor([0, 1])},
@@ -294,7 +299,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual({relation for relation, _ in selected}, {0, 1, 2})
 
-    def test_loss_matches_routed_spherical_mixture_cross_entropy(self):
+    def test_loss_matches_positive_set_full_entity_softmax(self):
         model = GWM(make_config())
         query_slots = F.normalize(
             torch.tensor([[
@@ -309,12 +314,14 @@ class ModelTests(unittest.TestCase):
         mixture_log_weights = torch.log(torch.tensor([
             [0.7, 0.1, 0.1, 0.1],
         ]))
-        target_ids = torch.tensor([2])
+        positive_tail_ids = torch.tensor([[1, 2, 0]])
+        positive_tail_mask = torch.tensor([[True, True, False]])
 
         actual = model.compute_loss(
             query_slots,
             mixture_log_weights,
-            target_ids,
+            positive_tail_ids,
+            positive_tail_mask,
         )
         candidates = F.normalize(
             model.struct_ent_embs.weight,
@@ -330,7 +337,10 @@ class ModelTests(unittest.TestCase):
             component_logits + mixture_log_weights.unsqueeze(-1),
             dim=1,
         )
-        expected = F.cross_entropy(scores, target_ids)
+        expected = (
+            torch.logsumexp(scores, dim=-1)
+            - torch.logsumexp(scores[:, [1, 2]], dim=-1)
+        ).mean()
 
         self.assertTrue(torch.allclose(actual, expected))
 
@@ -444,15 +454,30 @@ class DatasetTests(unittest.TestCase):
                     'context_entity_ids',
                     'context_relation_ids',
                     'context_mask',
+                    'positive_tail_ids',
                 },
             )
             self.assertEqual(
                 set(batch),
-                {'h_batch', 'r_batch', 't_batch', 'context_batch'},
+                {
+                    'h_batch',
+                    'r_batch',
+                    't_batch',
+                    'context_batch',
+                    'positive_tail_batch',
+                },
             )
             self.assertEqual(batch['h_batch']['id'].tolist(), [0])
             self.assertEqual(batch['r_batch']['id'].tolist(), [0])
             self.assertEqual(batch['t_batch']['id'].tolist(), [1])
+            self.assertEqual(
+                batch['positive_tail_batch']['id'].tolist(),
+                [[1]],
+            )
+            self.assertEqual(
+                batch['positive_tail_batch']['mask'].tolist(),
+                [[True]],
+            )
             self.assertEqual(batch['context_batch']['id'].tolist(), [[1, 2]])
             self.assertEqual(
                 batch['context_batch']['rel_id'].tolist(),
@@ -461,6 +486,30 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(
                 batch['context_batch']['mask'].tolist(),
                 [[False, True]],
+            )
+
+    def test_training_query_uses_all_positive_tails(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_data(root)
+            torch.save(
+                torch.tensor([[0, 0, 1], [0, 0, 2], [1, 1, 0]]),
+                Path(root) / 'train_triples.pt',
+            )
+            dataset = GWMDataset(root, split='train')
+            first = dataset[0]
+            second = dataset[1]
+            batch = CollateFN()([first, dataset[2]])
+
+            self.assertEqual(first['positive_tail_ids'].tolist(), [1, 2])
+            self.assertEqual(second['positive_tail_ids'].tolist(), [1, 2])
+            self.assertEqual(first['context_mask'].tolist(), [False, False])
+            self.assertEqual(
+                batch['positive_tail_batch']['id'].tolist(),
+                [[1, 2], [0, 0]],
+            )
+            self.assertEqual(
+                batch['positive_tail_batch']['mask'].tolist(),
+                [[True, True], [True, False]],
             )
 
     def test_dataset_requires_precomputed_context(self):

@@ -29,11 +29,12 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 ARCHITECTURE = (
     'head_centered_world_state_transformer_'
-    'hard_arity_conditioned_spherical_next_state_slots_'
+    'single_spherical_next_state_'
+    'relation_conditioned_temperature_'
     'masked_reconstruction'
 )
 TRAINING_OBJECTIVE = (
-    'triple_level_full_entity_cross_entropy_with_arity_slots_and_'
+    'triple_level_full_entity_cross_entropy_with_learned_temperature_and_'
     'masked_state_reconstruction'
 )
 
@@ -140,11 +141,6 @@ def train(args):
         f"Loaded {len(train_dataset)} triples and "
         f"{relation_mapping['num_base_relations']} shared relations."
     )
-    slot_summary = {
-        slot_count: relation_mapping['slot_counts'].count(slot_count)
-        for slot_count in sorted(set(relation_mapping['slot_counts']))
-    }
-    print(f"Relation slot counts: {slot_summary}")
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     training_config = vars(config).copy()
     training_config['model_parameters'] = parameter_count
@@ -183,8 +179,6 @@ def train(args):
         total_kg_loss = 0.0
         total_state_loss = 0.0
         state_examples = 0
-        effective_slot_sum = torch.zeros((), device=device)
-        routed_query_count = 0
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
         optimizer.zero_grad()
@@ -194,20 +188,16 @@ def train(args):
             target_ids = batch['t_batch']['id'].to(device)
             context_batch = {key: value.to(device) for key, value in batch['context_batch'].items()}
 
-            query_slots, mixture_log_weights = model(
+            query_vector, relation_temperature = model(
                 h_batch,
                 r_batch,
                 context_batch,
             )
             kg_loss = model.compute_loss(
-                query_slots,
-                mixture_log_weights,
+                query_vector,
+                relation_temperature,
                 target_ids,
             )
-            effective_slot_sum += torch.isfinite(
-                mixture_log_weights
-            ).sum(dim=-1).sum()
-            routed_query_count += mixture_log_weights.size(0)
 
             eligible = context_batch['mask'].any(dim=1)
             reconstruct = (
@@ -276,14 +266,24 @@ def train(args):
             total_state_loss / state_examples
             if state_examples else 0.0
         )
-        train_effective_slots = (
-            effective_slot_sum / routed_query_count
-        ).item()
+        with torch.no_grad():
+            relation_ids = torch.arange(
+                config.num_relations,
+                device=device,
+            )
+            relation_vectors = model.encode_relation(relation_ids)
+            learned_temperatures = model.relation_temperature(
+                relation_vectors
+            )
+            train_temperature_mean = learned_temperatures.mean().item()
+            train_temperature_min = learned_temperatures.min().item()
+            train_temperature_max = learned_temperatures.max().item()
         print(
             f"Epoch {epoch + 1} Train Loss: {train_loss:.4f} | "
             f"KGC: {train_kg_loss:.4f} | "
             f"State: {train_state_loss:.4f} | "
-            f"Effective Slots: {train_effective_slots:.3f} | "
+            f"Tau: {train_temperature_mean:.4f} "
+            f"[{train_temperature_min:.4f}, {train_temperature_max:.4f}] | "
             f"Train Time: {train_seconds:.2f}s"
         )
 
@@ -315,7 +315,9 @@ def train(args):
             'train_loss': train_loss,
             'train_kg_loss': train_kg_loss,
             'train_state_loss': train_state_loss,
-            'train_effective_slots': train_effective_slots,
+            'train_temperature_mean': train_temperature_mean,
+            'train_temperature_min': train_temperature_min,
+            'train_temperature_max': train_temperature_max,
             'val_mrr': micro['MRR'],
             'val_mr': micro['MR'],
             'val_hits1': micro['Hits@1'],

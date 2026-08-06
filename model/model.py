@@ -11,7 +11,8 @@ class GWM(nn.Module):
         self.config = config
         self.embedding_dim = config.struct_emb_dim
         self.temperature = config.temperature
-        self.num_next_state_slots = config.num_next_state_slots
+        self.temperature_min = config.temperature_min
+        self.temperature_max = config.temperature_max
 
         self.struct_ent_embs = nn.Embedding(
             config.num_entities,
@@ -28,6 +29,7 @@ class GWM(nn.Module):
             bias=False,
         )
         self.relation_norm = nn.LayerNorm(self.embedding_dim)
+        self.temperature_head = nn.Linear(self.embedding_dim, 1)
 
         relation_base_ids = torch.as_tensor(
             config.relation_base_ids,
@@ -39,10 +41,6 @@ class GWM(nn.Module):
         )
         self.register_buffer('relation_base_ids', relation_base_ids)
         self.register_buffer('relation_directions', relation_directions)
-        self.register_buffer(
-            'relation_slot_counts',
-            torch.as_tensor(config.relation_slot_counts, dtype=torch.long),
-        )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embedding_dim,
             nhead=config.context_encoder_heads,
@@ -82,31 +80,35 @@ class GWM(nn.Module):
         )
         self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
         self.token_roles = nn.Embedding(3, self.embedding_dim)
-        self.next_state_tokens = nn.Parameter(
-            torch.empty(
-                1,
-                self.num_next_state_slots,
-                self.embedding_dim,
-            )
+        self.next_state_token = nn.Parameter(
+            torch.empty(1, 1, self.embedding_dim)
         )
         self.masked_head_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
         )
-        transition_mask = torch.ones(
-            self.num_next_state_slots + 1,
-            self.num_next_state_slots + 1,
-            dtype=torch.bool,
+        self.register_buffer(
+            'transition_mask',
+            torch.tensor(
+                [[False, True], [False, False]],
+                dtype=torch.bool,
+            ),
+            persistent=False,
         )
-        transition_mask[0, 0] = False
-        transition_mask[1, :2] = False
-        transition_mask[2:, :] = False
-        self.register_buffer('transition_mask', transition_mask, persistent=False)
         nn.init.normal_(self.token_roles.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.next_state_tokens, mean=0.0, std=0.02)
+        nn.init.normal_(self.next_state_token, mean=0.0, std=0.02)
         nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
+        initial_temperature = (
+            (self.temperature - self.temperature_min)
+            / (self.temperature_max - self.temperature_min)
+        )
+        nn.init.zeros_(self.temperature_head.weight)
+        nn.init.constant_(
+            self.temperature_head.bias,
+            torch.logit(torch.tensor(initial_temperature)).item(),
+        )
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -116,6 +118,11 @@ class GWM(nn.Module):
         inverse_mask = directions.unsqueeze(-1).to(dtype=base.dtype)
         relation = relation + inverse_mask * self.inverse_adapter(base)
         return self.relation_norm(relation)
+
+    def relation_temperature(self, relation):
+        return self.temperature_min + (
+            self.temperature_max - self.temperature_min
+        ) * torch.sigmoid(self.temperature_head(relation))
 
     def encode_world_state(
         self,
@@ -181,33 +188,20 @@ class GWM(nn.Module):
         return F.normalize(memory[:, 0], p=2, dim=-1)
 
     def encode_query(self, h_batch, r_batch, context_batch):
-        relation_ids = r_batch['id']
-        relation = self.encode_relation(relation_ids)
-        slot_counts = self.relation_slot_counts[relation_ids]
-        active_slots = (
-            torch.arange(
-                self.num_next_state_slots,
-                device=relation.device,
-            ).unsqueeze(0)
-            < slot_counts.unsqueeze(1)
-        )
-        mixture_log_weights = torch.where(
-            active_slots,
-            -slot_counts.to(relation.dtype).log().unsqueeze(1),
-            relation.new_full((), float('-inf')),
-        )
+        relation = self.encode_relation(r_batch['id'])
+        temperature = self.relation_temperature(relation)
         relation_token = relation + self.token_roles.weight[2]
         memory, memory_padding_mask = self.encode_world_state(
             h_batch,
             context_batch,
         )
-        next_state_tokens = self.next_state_tokens.expand(
+        next_state_token = self.next_state_token.expand(
             relation_token.size(0),
             -1,
             -1,
         )
         transition_tokens = torch.cat(
-            [relation_token.unsqueeze(1), next_state_tokens],
+            [relation_token.unsqueeze(1), next_state_token],
             dim=1,
         )
         decoded = self.transition_decoder(
@@ -216,11 +210,10 @@ class GWM(nn.Module):
             tgt_mask=self.transition_mask,
             memory_key_padding_mask=memory_padding_mask,
         )
-        decoded_states = decoded[:, 1:]
-        next_states = self.next_state_projection(decoded_states)
+        next_state = self.next_state_projection(decoded[:, 1])
         return (
-            F.normalize(next_states, p=2, dim=-1),
-            mixture_log_weights,
+            F.normalize(next_state, p=2, dim=-1),
+            temperature,
         )
 
     def forward(self, h_batch, r_batch, context_batch):
@@ -232,24 +225,16 @@ class GWM(nn.Module):
 
     def score_candidates(
         self,
-        query_slots,
-        mixture_log_weights,
+        query_vector,
+        temperature,
         candidate_vectors,
     ):
-        component_logits = torch.einsum(
-            'bkd,nd->bkn',
-            query_slots,
-            candidate_vectors,
-        ) / self.temperature
-        return torch.logsumexp(
-            component_logits + mixture_log_weights.unsqueeze(-1),
-            dim=1,
-        )
+        return torch.mm(query_vector, candidate_vectors.t()) / temperature
 
     def compute_loss(
         self,
-        query_slots,
-        mixture_log_weights,
+        query_vector,
+        temperature,
         target_ids,
     ):
         candidate_vectors = F.normalize(
@@ -258,8 +243,8 @@ class GWM(nn.Module):
             dim=-1,
         )
         scores = self.score_candidates(
-            query_slots,
-            mixture_log_weights,
+            query_vector,
+            temperature,
             candidate_vectors,
         )
         return F.cross_entropy(scores, target_ids)
@@ -288,7 +273,7 @@ class GWM(nn.Module):
         context_batch,
         candidate_vectors=None,
     ):
-        query_slots, mixture_log_weights = self.encode_query(
+        query_vector, temperature = self.encode_query(
             h_batch,
             r_batch,
             context_batch,
@@ -296,13 +281,13 @@ class GWM(nn.Module):
         if candidate_vectors is None:
             entity_ids = torch.arange(
                 self.config.num_entities,
-                device=query_slots.device,
+                device=query_vector.device,
                 dtype=torch.long,
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
         return self.score_candidates(
-            query_slots,
-            mixture_log_weights,
+            query_vector,
+            temperature,
             candidate_vectors,
         )

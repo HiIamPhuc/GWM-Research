@@ -29,11 +29,11 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 ARCHITECTURE = (
     'head_centered_world_state_transformer_'
-    'routed_spherical_next_state_slots_'
+    'hard_arity_conditioned_spherical_next_state_slots_'
     'masked_reconstruction'
 )
 TRAINING_OBJECTIVE = (
-    'triple_level_full_entity_cross_entropy_with_routed_slots_and_'
+    'triple_level_full_entity_cross_entropy_with_arity_slots_and_'
     'masked_state_reconstruction'
 )
 
@@ -140,6 +140,11 @@ def train(args):
         f"Loaded {len(train_dataset)} triples and "
         f"{relation_mapping['num_base_relations']} shared relations."
     )
+    slot_summary = {
+        slot_count: relation_mapping['slot_counts'].count(slot_count)
+        for slot_count in sorted(set(relation_mapping['slot_counts']))
+    }
+    print(f"Relation slot counts: {slot_summary}")
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     training_config = vars(config).copy()
     training_config['model_parameters'] = parameter_count
@@ -199,11 +204,9 @@ def train(args):
                 mixture_log_weights,
                 target_ids,
             )
-            mixture_weights = mixture_log_weights.detach().exp()
-            router_entropy = -(
-                mixture_weights * mixture_log_weights.detach()
-            ).sum(dim=-1)
-            effective_slot_sum += router_entropy.exp().sum()
+            effective_slot_sum += torch.isfinite(
+                mixture_log_weights
+            ).sum(dim=-1).sum()
             routed_query_count += mixture_log_weights.size(0)
 
             eligible = context_batch['mask'].any(dim=1)

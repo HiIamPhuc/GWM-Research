@@ -1,7 +1,6 @@
-# Head-centered world-state Transformer with shared inverse relations
+# Hard arity-conditioned world-state Transformer
 struct_emb_dim: 512
 num_next_state_slots: 3
-router_secondary_logit: -4.0
 context_encoder_heads: 4
 context_encoder_ffn_multiplier: 2
 context_encoder_dropout: 0.1
@@ -28,5 +27,5 @@ candidate_batch_size: 2048
 gradient_accumulation_steps: 1
 
 data_dir: data-processed/wn18rr
-output_dir: output/wn18rr-context-memory-transformer
+output_dir: output/wn18rr-arity-slots
 seed: 42

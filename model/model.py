@@ -39,6 +39,10 @@ class GWM(nn.Module):
         )
         self.register_buffer('relation_base_ids', relation_base_ids)
         self.register_buffer('relation_directions', relation_directions)
+        self.register_buffer(
+            'relation_slot_counts',
+            torch.as_tensor(config.relation_slot_counts, dtype=torch.long),
+        )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embedding_dim,
             nhead=config.context_encoder_heads,
@@ -85,10 +89,6 @@ class GWM(nn.Module):
                 self.embedding_dim,
             )
         )
-        self.state_router = nn.Linear(
-            self.embedding_dim,
-            self.num_next_state_slots,
-        )
         self.masked_head_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
         )
@@ -103,12 +103,6 @@ class GWM(nn.Module):
         self.register_buffer('transition_mask', transition_mask, persistent=False)
         nn.init.normal_(self.token_roles.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.next_state_tokens, mean=0.0, std=0.02)
-        nn.init.zeros_(self.state_router.weight)
-        nn.init.constant_(
-            self.state_router.bias[1:],
-            config.router_secondary_logit,
-        )
-        nn.init.zeros_(self.state_router.bias[:1])
         nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
@@ -187,10 +181,20 @@ class GWM(nn.Module):
         return F.normalize(memory[:, 0], p=2, dim=-1)
 
     def encode_query(self, h_batch, r_batch, context_batch):
-        relation = self.encode_relation(r_batch['id'])
-        mixture_log_weights = F.log_softmax(
-            self.state_router(relation),
-            dim=-1,
+        relation_ids = r_batch['id']
+        relation = self.encode_relation(relation_ids)
+        slot_counts = self.relation_slot_counts[relation_ids]
+        active_slots = (
+            torch.arange(
+                self.num_next_state_slots,
+                device=relation.device,
+            ).unsqueeze(0)
+            < slot_counts.unsqueeze(1)
+        )
+        mixture_log_weights = torch.where(
+            active_slots,
+            -slot_counts.to(relation.dtype).log().unsqueeze(1),
+            relation.new_full((), float('-inf')),
         )
         relation_token = relation + self.token_roles.weight[2]
         memory, memory_padding_mask = self.encode_world_state(

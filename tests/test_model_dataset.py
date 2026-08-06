@@ -16,7 +16,10 @@ from utils.eval import (
     build_bidirectional_hr_map_for_filtering,
     load_inverse_relation_ids,
 )
-from utils.relation_mapping import build_relation_direction_mapping
+from utils.relation_mapping import (
+    attach_relation_direction_mapping,
+    build_relation_direction_mapping,
+)
 
 
 def make_config():
@@ -26,9 +29,9 @@ def make_config():
         num_base_relations=2,
         relation_base_ids=[0, 0, 1, 1],
         relation_directions=[0, 1, 0, 1],
+        relation_slot_counts=[1, 4, 4, 1],
         struct_emb_dim=4,
         num_next_state_slots=4,
-        router_secondary_logit=-4.0,
         context_encoder_layers=1,
         transition_decoder_layers=2,
         context_encoder_heads=1,
@@ -65,7 +68,6 @@ class ModelTests(unittest.TestCase):
                 'context_encoder',
                 'transition_decoder',
                 'next_state_projection',
-                'state_router',
                 'context_fact_norm',
                 'token_roles',
             },
@@ -103,12 +105,8 @@ class ModelTests(unittest.TestCase):
             torch.eye(4),
         ))
         self.assertTrue(torch.equal(
-            model.state_router.weight,
-            torch.zeros(4, 4),
-        ))
-        self.assertTrue(torch.equal(
-            model.state_router.bias,
-            torch.tensor([0.0, -4.0, -4.0, -4.0]),
+            model.relation_slot_counts,
+            torch.tensor([1, 4, 4, 1]),
         ))
 
     def test_context_and_transition_use_separate_sequences(self):
@@ -235,7 +233,6 @@ class ModelTests(unittest.TestCase):
             model.transition_decoder.layers[0].multihead_attn.in_proj_weight.grad
         )
         self.assertIsNotNone(model.next_state_projection.weight.grad)
-        self.assertIsNotNone(model.state_router.weight.grad)
         self.assertIsNotNone(model.context_fact_norm.weight.grad)
         self.assertIsNotNone(model.token_roles.weight.grad)
         self.assertIsNotNone(model.next_state_tokens.grad)
@@ -273,7 +270,7 @@ class ModelTests(unittest.TestCase):
         expected = F.normalize(model.struct_ent_embs(ids), p=2, dim=-1)
         self.assertTrue(torch.allclose(actual, expected))
 
-    def test_routed_slot_scorer_scores_all_entities(self):
+    def test_arity_slot_scorer_scores_all_entities(self):
         model = GWM(make_config())
         scores = model.score_all_entities(
             {'id': torch.tensor([0, 1])},
@@ -294,7 +291,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual({relation for relation, _ in selected}, {0, 1, 2})
 
-    def test_loss_matches_routed_spherical_mixture_cross_entropy(self):
+    def test_loss_matches_arity_conditioned_spherical_mixture_cross_entropy(self):
         model = GWM(make_config())
         query_slots = F.normalize(
             torch.tensor([[
@@ -334,18 +331,29 @@ class ModelTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected))
 
-    def test_router_starts_with_one_dominant_slot(self):
+    def test_relation_arity_hard_masks_inactive_slots(self):
         model = GWM(make_config())
         _, mixture_log_weights = model(
-            {'id': torch.tensor([0, 1])},
-            {'id': torch.tensor([0, 1])},
-            make_context_batch(),
+            {'id': torch.tensor([0, 1, 2, 3])},
+            {'id': torch.tensor([0, 1, 2, 3])},
+            {
+                'id': torch.full((4, 2), -1, dtype=torch.long),
+                'rel_id': torch.full((4, 2), -1, dtype=torch.long),
+                'mask': torch.zeros((4, 2), dtype=torch.bool),
+            },
         )
         weights = mixture_log_weights.exp()
 
-        self.assertTrue(torch.all(weights[:, 0] > 0.94))
-        self.assertTrue(torch.allclose(weights[:, 1], weights[:, 2]))
-        self.assertTrue(torch.allclose(weights[:, 2], weights[:, 3]))
+        self.assertTrue(torch.equal(
+            weights,
+            torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.25, 0.25, 0.25, 0.25],
+                [0.25, 0.25, 0.25, 0.25],
+                [1.0, 0.0, 0.0, 0.0],
+            ]),
+        ))
+        self.assertTrue(torch.isneginf(mixture_log_weights[0, 1:]).all())
 
     def test_state_reconstruction_uses_shared_entity_table(self):
         model = GWM(make_config())
@@ -469,6 +477,42 @@ class DatasetTests(unittest.TestCase):
             (Path(root) / 'context_neighbors.pt').unlink()
             with self.assertRaises(FileNotFoundError):
                 GWMDataset(root, split='train')
+
+    def test_relation_arity_slots_are_direction_aware(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            relation2id = {
+                'one_to_many': 0,
+                'one_to_many_inv': 1,
+                'many_to_one': 2,
+                'many_to_one_inv': 3,
+            }
+            (root_path / 'relation2id.json').write_text(
+                json.dumps(relation2id),
+                encoding='utf-8',
+            )
+            torch.save(
+                torch.tensor([
+                    [0, 0, 1],
+                    [0, 0, 2],
+                    [1, 1, 0],
+                    [2, 1, 0],
+                    [0, 2, 2],
+                    [1, 2, 2],
+                    [2, 3, 0],
+                    [2, 3, 1],
+                ]),
+                root_path / 'train_triples.pt',
+            )
+            config = SimpleNamespace(num_next_state_slots=3)
+            mapping = attach_relation_direction_mapping(config, root)
+
+            self.assertEqual(
+                mapping['arities'],
+                ['1-N', 'N-1', 'N-1', '1-N'],
+            )
+            self.assertEqual(mapping['slot_counts'], [3, 1, 1, 3])
+            self.assertEqual(config.relation_slot_counts, [3, 1, 1, 3])
 
     def test_bidirectional_eval_dataset_builds_inverse_queries_on_the_fly(self):
         with tempfile.TemporaryDirectory() as root:

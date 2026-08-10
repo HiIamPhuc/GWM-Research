@@ -82,6 +82,26 @@ class GWM(nn.Module):
         )
         self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
         self.token_roles = nn.Embedding(3, self.embedding_dim)
+        self.path_query_projection = nn.Linear(
+            self.embedding_dim,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.path_edge_projection = nn.Linear(
+            self.embedding_dim,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.path_delta = nn.Linear(
+            self.embedding_dim,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.path_norm = nn.LayerNorm(self.embedding_dim)
+        self.path_score_gate = nn.Linear(
+            self.embedding_dim,
+            1,
+        )
         self.next_state_tokens = nn.Parameter(
             torch.empty(
                 1,
@@ -107,6 +127,11 @@ class GWM(nn.Module):
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
+        nn.init.zeros_(self.path_score_gate.weight)
+        nn.init.constant_(
+            self.path_score_gate.bias,
+            getattr(config, 'path_score_gate_init', -2.0),
+        )
 
     def encode_relation(self, relation_ids):
         base_ids = self.relation_base_ids[relation_ids]
@@ -226,6 +251,136 @@ class GWM(nn.Module):
     def forward(self, h_batch, r_batch, context_batch):
         return self.encode_query(h_batch, r_batch, context_batch)
 
+    def _path_transition(self, states, edge_relations, query_relation):
+        expanded_query = query_relation
+        while expanded_query.dim() < states.dim():
+            expanded_query = expanded_query.unsqueeze(1)
+        expanded_query = expanded_query.expand_as(states)
+
+        query_key = F.normalize(
+            self.path_query_projection(expanded_query),
+            p=2,
+            dim=-1,
+        )
+        edge_key = F.normalize(
+            self.path_edge_projection(edge_relations),
+            p=2,
+            dim=-1,
+        )
+        relevance = torch.sigmoid(
+            4.0 * (query_key * edge_key).sum(dim=-1)
+        )
+        delta = torch.tanh(self.path_delta(edge_relations))
+        return F.normalize(
+            self.path_norm(
+                states + relevance.unsqueeze(-1) * delta
+            ),
+            p=2,
+            dim=-1,
+        )
+
+    def encode_path_evidence(self, h_batch, r_batch, path_batch):
+        relation = self.encode_relation(r_batch['id'])
+        source = F.normalize(
+            self.struct_ent_embs(h_batch['id']) + relation,
+            p=2,
+            dim=-1,
+        )
+
+        hop1_mask = path_batch['hop1_mask'].bool()
+        hop1_ids = path_batch['hop1_id'].masked_fill(~hop1_mask, 0)
+        hop1_rel_ids = path_batch['hop1_rel_id'].masked_fill(~hop1_mask, 0)
+        hop1_relations = self.encode_relation(hop1_rel_ids)
+        hop1_states = self._path_transition(
+            source.unsqueeze(1).expand_as(hop1_relations),
+            hop1_relations,
+            relation,
+        )
+        hop1_targets = F.normalize(
+            self.struct_ent_embs(hop1_ids),
+            p=2,
+            dim=-1,
+        )
+        hop1_scores = (hop1_states * hop1_targets).sum(dim=-1)
+        hop1_scores = hop1_scores / self.temperature
+
+        hop2_mask = path_batch['hop2_mask'].bool()
+        hop2_ids = path_batch['hop2_id'].masked_fill(~hop2_mask, 0)
+        hop2_rel_ids = path_batch['hop2_rel_id'].masked_fill(~hop2_mask, 0)
+        hop2_relations = self.encode_relation(hop2_rel_ids)
+        hop2_states = self._path_transition(
+            hop1_states.unsqueeze(2).expand_as(hop2_relations),
+            hop2_relations,
+            relation,
+        )
+        hop2_targets = F.normalize(
+            self.struct_ent_embs(hop2_ids),
+            p=2,
+            dim=-1,
+        )
+        hop2_scores = (hop2_states * hop2_targets).sum(dim=-1)
+        hop2_scores = hop2_scores / self.temperature
+
+        return {
+            'entity_ids': torch.cat(
+                [hop1_ids, hop2_ids.flatten(1)],
+                dim=1,
+            ),
+            'scores': torch.cat(
+                [hop1_scores, hop2_scores.flatten(1)],
+                dim=1,
+            ),
+            'mask': torch.cat(
+                [hop1_mask, hop2_mask.flatten(1)],
+                dim=1,
+            ),
+            'gate': torch.sigmoid(self.path_score_gate(relation)),
+        }
+
+    def _aggregate_path_evidence(self, path_evidence):
+        entity_ids = path_evidence['entity_ids']
+        path_scores = path_evidence['scores']
+        path_mask = path_evidence['mask'].bool()
+        path_count = entity_ids.size(1)
+
+        same_endpoint = entity_ids.unsqueeze(2).eq(entity_ids.unsqueeze(1))
+        valid_pairs = (
+            same_endpoint
+            & path_mask.unsqueeze(2)
+            & path_mask.unsqueeze(1)
+        )
+        endpoint_counts = valid_pairs.sum(dim=-1).clamp_min(1)
+        endpoint_scores = (
+            valid_pairs.to(path_scores.dtype)
+            * path_scores.unsqueeze(1)
+        ).sum(dim=-1) / endpoint_counts
+
+        previous = torch.tril(
+            torch.ones(
+                path_count,
+                path_count,
+                dtype=torch.bool,
+                device=entity_ids.device,
+            ),
+            diagonal=-1,
+        )
+        unique_mask = path_mask & ~(valid_pairs & previous).any(dim=-1)
+        bonuses = endpoint_scores * path_evidence['gate']
+        safe_entity_ids = entity_ids.masked_fill(~unique_mask, 0)
+        return safe_entity_ids, bonuses, unique_mask
+
+    def _add_path_evidence(self, scores, path_evidence):
+        if path_evidence is None:
+            return scores
+        entity_ids, bonuses, unique_mask = self._aggregate_path_evidence(
+            path_evidence
+        )
+        contributions = bonuses * unique_mask.to(bonuses.dtype)
+        if not torch.is_grad_enabled():
+            scores.scatter_add_(1, entity_ids, contributions)
+            return scores
+        return scores.scatter_add(1, entity_ids, contributions)
+
     def encode_target(self, t_batch):
         target = self.struct_ent_embs(t_batch['id'])
         return F.normalize(target, p=2, dim=-1)
@@ -251,6 +406,7 @@ class GWM(nn.Module):
         query_slots,
         mixture_log_weights,
         target_ids,
+        path_evidence=None,
     ):
         candidate_vectors = F.normalize(
             self.struct_ent_embs.weight,
@@ -262,7 +418,29 @@ class GWM(nn.Module):
             mixture_log_weights,
             candidate_vectors,
         )
-        return F.cross_entropy(scores, target_ids)
+        if path_evidence is None:
+            return F.cross_entropy(scores, target_ids)
+
+        entity_ids, bonuses, unique_mask = self._aggregate_path_evidence(
+            path_evidence
+        )
+        log_partition = torch.logsumexp(scores, dim=1)
+        selected_scores = scores.gather(1, entity_ids)
+        partition_ratio = 1.0 + (
+            torch.exp(selected_scores - log_partition.unsqueeze(1))
+            * torch.expm1(bonuses)
+            * unique_mask.to(scores.dtype)
+        ).sum(dim=1)
+        combined_log_partition = (
+            log_partition + partition_ratio.clamp_min(1e-12).log()
+        )
+        target_scores = scores.gather(1, target_ids.unsqueeze(1)).squeeze(1)
+        target_bonus = (
+            bonuses
+            * unique_mask.to(bonuses.dtype)
+            * entity_ids.eq(target_ids.unsqueeze(1)).to(bonuses.dtype)
+        ).sum(dim=1)
+        return (combined_log_partition - target_scores - target_bonus).mean()
 
     def compute_state_reconstruction_loss(
         self,
@@ -286,6 +464,7 @@ class GWM(nn.Module):
         h_batch,
         r_batch,
         context_batch,
+        path_batch=None,
         candidate_vectors=None,
     ):
         query_slots, mixture_log_weights = self.encode_query(
@@ -301,8 +480,16 @@ class GWM(nn.Module):
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        return self.score_candidates(
+        scores = self.score_candidates(
             query_slots,
             mixture_log_weights,
             candidate_vectors,
         )
+        path_evidence = None
+        if path_batch is not None:
+            path_evidence = self.encode_path_evidence(
+                h_batch,
+                r_batch,
+                path_batch,
+            )
+        return self._add_path_evidence(scores, path_evidence)

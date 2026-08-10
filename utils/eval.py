@@ -283,6 +283,9 @@ def compute_filtered_ranking_metrics(
             context_batch = {
                 k: v.to(device) for k, v in batch['context_batch'].items()
             }
+            path_batch = {
+                k: v.to(device) for k, v in batch['path_batch'].items()
+            }
 
             t_ids = batch['t_batch']['id'].to(device)
             h_ids_tensor = batch['h_batch']['id']
@@ -294,6 +297,7 @@ def compute_filtered_ranking_metrics(
                 h_batch,
                 r_batch,
                 context_batch=context_batch,
+                path_batch=path_batch,
                 candidate_vectors=all_entity_embeddings,
             )
 

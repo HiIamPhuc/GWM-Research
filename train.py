@@ -30,6 +30,7 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 ARCHITECTURE = (
     'head_centered_world_state_transformer_'
     'hard_arity_conditioned_spherical_next_state_slots_'
+    'query_conditioned_two_hop_path_residual_'
     'masked_reconstruction'
 )
 TRAINING_OBJECTIVE = (
@@ -185,6 +186,9 @@ def train(args):
         state_examples = 0
         effective_slot_sum = torch.zeros((), device=device)
         routed_query_count = 0
+        path_gate_sum = torch.zeros((), device=device)
+        path_query_count = 0
+        path_count_sum = torch.zeros((), device=device)
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
         optimizer.zero_grad()
@@ -193,21 +197,34 @@ def train(args):
             r_batch = {key: value.to(device) for key, value in batch['r_batch'].items()}
             target_ids = batch['t_batch']['id'].to(device)
             context_batch = {key: value.to(device) for key, value in batch['context_batch'].items()}
+            path_batch = {
+                key: value.to(device)
+                for key, value in batch['path_batch'].items()
+            }
 
             query_slots, mixture_log_weights = model(
                 h_batch,
                 r_batch,
                 context_batch,
             )
+            path_evidence = model.encode_path_evidence(
+                h_batch,
+                r_batch,
+                path_batch,
+            )
             kg_loss = model.compute_loss(
                 query_slots,
                 mixture_log_weights,
                 target_ids,
+                path_evidence=path_evidence,
             )
             effective_slot_sum += torch.isfinite(
                 mixture_log_weights
             ).sum(dim=-1).sum()
             routed_query_count += mixture_log_weights.size(0)
+            path_gate_sum += path_evidence['gate'].detach().sum()
+            path_count_sum += path_evidence['mask'].sum()
+            path_query_count += path_evidence['mask'].size(0)
 
             eligible = context_batch['mask'].any(dim=1)
             reconstruct = (
@@ -279,11 +296,15 @@ def train(args):
         train_effective_slots = (
             effective_slot_sum / routed_query_count
         ).item()
+        train_path_gate = (path_gate_sum / path_query_count).item()
+        train_paths_per_query = (path_count_sum / path_query_count).item()
         print(
             f"Epoch {epoch + 1} Train Loss: {train_loss:.4f} | "
             f"KGC: {train_kg_loss:.4f} | "
             f"State: {train_state_loss:.4f} | "
             f"Effective Slots: {train_effective_slots:.3f} | "
+            f"Path Gate: {train_path_gate:.3f} | "
+            f"Paths/Query: {train_paths_per_query:.1f} | "
             f"Train Time: {train_seconds:.2f}s"
         )
 
@@ -316,6 +337,8 @@ def train(args):
             'train_kg_loss': train_kg_loss,
             'train_state_loss': train_state_loss,
             'train_effective_slots': train_effective_slots,
+            'train_path_gate': train_path_gate,
+            'train_paths_per_query': train_paths_per_query,
             'val_mrr': micro['MRR'],
             'val_mr': micro['MR'],
             'val_hits1': micro['Hits@1'],

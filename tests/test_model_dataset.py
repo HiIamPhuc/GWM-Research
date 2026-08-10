@@ -41,6 +41,7 @@ def make_config():
         transition_decoder_ffn_multiplier=3,
         transition_decoder_dropout=0.0,
         temperature=0.07,
+        path_score_gate_init=-2.0,
     )
 
 
@@ -49,6 +50,26 @@ def make_context_batch():
         'id': torch.tensor([[1, 2], [0, -1]]),
         'rel_id': torch.tensor([[0, 1], [2, -1]]),
         'mask': torch.tensor([[True, True], [True, False]]),
+    }
+
+
+def make_path_batch():
+    return {
+        'hop1_id': torch.tensor([[1, 2], [0, 2]]),
+        'hop1_rel_id': torch.tensor([[1, 2], [0, 3]]),
+        'hop1_mask': torch.tensor([[True, True], [True, False]]),
+        'hop2_id': torch.tensor([
+            [[2, 3], [3, 0]],
+            [[2, 3], [0, 0]],
+        ]),
+        'hop2_rel_id': torch.tensor([
+            [[2, 3], [0, 1]],
+            [[1, 2], [0, 0]],
+        ]),
+        'hop2_mask': torch.tensor([
+            [[True, True], [True, False]],
+            [[True, True], [False, False]],
+        ]),
     }
 
 
@@ -70,6 +91,11 @@ class ModelTests(unittest.TestCase):
                 'next_state_projection',
                 'context_fact_norm',
                 'token_roles',
+                'path_query_projection',
+                'path_edge_projection',
+                'path_delta',
+                'path_norm',
+                'path_score_gate',
             },
         )
         self.assertFalse(hasattr(model, 'text_ent_embs'))
@@ -204,11 +230,17 @@ class ModelTests(unittest.TestCase):
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
         )
+        path_evidence = model.encode_path_evidence(
+            {'id': torch.tensor([0, 1])},
+            {'id': torch.tensor([0, 1])},
+            make_path_batch(),
+        )
         target_ids = torch.tensor([2, 3])
         kg_loss = model.compute_loss(
             query_slots,
             mixture_log_weights,
             target_ids,
+            path_evidence=path_evidence,
         )
         reconstructed_heads = model.encode_masked_world_state(
             {'id': torch.tensor([0, 1])},
@@ -237,6 +269,11 @@ class ModelTests(unittest.TestCase):
         self.assertIsNotNone(model.token_roles.weight.grad)
         self.assertIsNotNone(model.next_state_tokens.grad)
         self.assertIsNotNone(model.masked_head_token.grad)
+        self.assertIsNotNone(model.path_query_projection.weight.grad)
+        self.assertIsNotNone(model.path_edge_projection.weight.grad)
+        self.assertIsNotNone(model.path_delta.weight.grad)
+        self.assertIsNotNone(model.path_norm.weight.grad)
+        self.assertIsNotNone(model.path_score_gate.weight.grad)
 
     def test_forward_and_inverse_relations_share_the_same_base_row(self):
         model = GWM(make_config())
@@ -276,9 +313,86 @@ class ModelTests(unittest.TestCase):
             {'id': torch.tensor([0, 1])},
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
+            path_batch=make_path_batch(),
         )
         self.assertEqual(scores.shape, (2, 4))
         self.assertTrue(torch.isfinite(scores).all())
+
+    def test_path_residual_only_changes_reached_candidates(self):
+        model = GWM(make_config())
+        model.eval()
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        baseline = model.score_all_entities(
+            h_batch,
+            r_batch,
+            make_context_batch(),
+        )
+        with_paths = model.score_all_entities(
+            h_batch,
+            r_batch,
+            make_context_batch(),
+            path_batch=make_path_batch(),
+        )
+
+        reached = make_path_batch()['hop1_mask'].new_zeros((2, 4))
+        path_batch = make_path_batch()
+        for row in range(2):
+            reached_ids = torch.cat([
+                path_batch['hop1_id'][row][path_batch['hop1_mask'][row]],
+                path_batch['hop2_id'][row][path_batch['hop2_mask'][row]],
+            ])
+            reached[row, reached_ids] = True
+
+        self.assertTrue(torch.allclose(
+            baseline[~reached],
+            with_paths[~reached],
+        ))
+        self.assertFalse(torch.allclose(
+            baseline[reached],
+            with_paths[reached],
+        ))
+
+    def test_sparse_path_loss_matches_dense_full_entity_ce(self):
+        model = GWM(make_config())
+        model.eval()
+        h_batch = {'id': torch.tensor([0, 1])}
+        r_batch = {'id': torch.tensor([0, 1])}
+        target_ids = torch.tensor([2, 3])
+        query_slots, mixture_log_weights = model(
+            h_batch,
+            r_batch,
+            make_context_batch(),
+        )
+        path_evidence = model.encode_path_evidence(
+            h_batch,
+            r_batch,
+            make_path_batch(),
+        )
+
+        actual = model.compute_loss(
+            query_slots,
+            mixture_log_weights,
+            target_ids,
+            path_evidence=path_evidence,
+        )
+        candidates = F.normalize(
+            model.struct_ent_embs.weight,
+            p=2,
+            dim=-1,
+        )
+        dense_scores = model.score_candidates(
+            query_slots,
+            mixture_log_weights,
+            candidates,
+        )
+        dense_scores = model._add_path_evidence(
+            dense_scores,
+            path_evidence,
+        )
+        expected = F.cross_entropy(dense_scores, target_ids)
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
 
     def test_study_factory_returns_the_same_basic_model(self):
         self.assertIsInstance(build_model(make_config()), GWM)
@@ -427,10 +541,10 @@ class DatasetTests(unittest.TestCase):
         torch.save(torch.tensor([[0, 0, 1]]), root / 'train_triples.pt')
         torch.save(
             {
-                'entity_ids': torch.tensor([[1, 2], [0, -1], [-1, -1]]),
-                'relation_ids': torch.tensor([[0, 0], [1, -1], [-1, -1]]),
+                'entity_ids': torch.tensor([[1, 2], [0, -1], [1, -1]]),
+                'relation_ids': torch.tensor([[0, 1], [1, -1], [1, -1]]),
                 'mask': torch.tensor(
-                    [[True, True], [True, False], [False, False]]
+                    [[True, True], [True, False], [True, False]]
                 ),
             },
             root / 'context_neighbors.pt',
@@ -452,11 +566,23 @@ class DatasetTests(unittest.TestCase):
                     'context_entity_ids',
                     'context_relation_ids',
                     'context_mask',
+                    'path_hop1_entity_ids',
+                    'path_hop1_relation_ids',
+                    'path_hop1_mask',
+                    'path_hop2_entity_ids',
+                    'path_hop2_relation_ids',
+                    'path_hop2_mask',
                 },
             )
             self.assertEqual(
                 set(batch),
-                {'h_batch', 'r_batch', 't_batch', 'context_batch'},
+                {
+                    'h_batch',
+                    'r_batch',
+                    't_batch',
+                    'context_batch',
+                    'path_batch',
+                },
             )
             self.assertEqual(batch['h_batch']['id'].tolist(), [0])
             self.assertEqual(batch['r_batch']['id'].tolist(), [0])
@@ -464,11 +590,22 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(batch['context_batch']['id'].tolist(), [[1, 2]])
             self.assertEqual(
                 batch['context_batch']['rel_id'].tolist(),
-                [[0, 0]],
+                [[0, 1]],
             )
             self.assertEqual(
                 batch['context_batch']['mask'].tolist(),
                 [[False, True]],
+            )
+            self.assertEqual(
+                batch['path_batch']['hop1_mask'].tolist(),
+                [[False, True]],
+            )
+            self.assertEqual(
+                batch['path_batch']['hop2_mask'].tolist(),
+                [[
+                    [False, False],
+                    [True, False],
+                ]],
             )
 
     def test_dataset_requires_precomputed_context(self):
@@ -535,6 +672,12 @@ class DatasetTests(unittest.TestCase):
                 'context_entity_ids',
                 'context_relation_ids',
                 'context_mask',
+                'path_hop1_entity_ids',
+                'path_hop1_relation_ids',
+                'path_hop1_mask',
+                'path_hop2_entity_ids',
+                'path_hop2_relation_ids',
+                'path_hop2_mask',
             }
             self.assertEqual(set(forward_dataset[0]), expected_keys)
             self.assertEqual(set(backward_dataset[0]), expected_keys)

@@ -1,5 +1,6 @@
-# Single-state Transformer with relation-conditioned temperature
+# Hard arity-conditioned world-state Transformer
 struct_emb_dim: 512
+num_next_state_slots: 3
 context_encoder_heads: 4
 context_encoder_ffn_multiplier: 2
 context_encoder_dropout: 0.1
@@ -9,8 +10,6 @@ transition_decoder_ffn_multiplier: 4
 transition_decoder_dropout: 0.1
 transition_decoder_layers: 2
 temperature: 0.07
-temperature_min: 0.03
-temperature_max: 0.20
 state_reconstruction_ratio: 0.2
 state_reconstruction_weight: 0.1
 
@@ -28,5 +27,5 @@ candidate_batch_size: 2048
 gradient_accumulation_steps: 1
 
 data_dir: data-processed/fb15k-237
-output_dir: output/fb15k-237-relation-temperature
+output_dir: output/fb15k-237-arity-slots
 seed: 42

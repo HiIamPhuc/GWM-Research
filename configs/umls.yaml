@@ -13,8 +13,8 @@ dropout: 0.2
 temperature: 0.07
 
 # Optimization
-learning_rate: 5e-5
-min_lr: 1e-6
+learning_rate: 0.00005
+min_lr: 0.000001
 weight_decay: 0.01
 warmup_ratio: 0.1
 grad_clip_norm: 1.0

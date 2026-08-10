@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def load_embedding_cache(path):
+    cache = torch.load(path, map_location='cpu')
+    return cache['embeddings'] if isinstance(cache, dict) else cache
+
+
 class GWM(nn.Module):
     """Head-centered world-state encoder with a transition decoder."""
 
@@ -17,6 +22,34 @@ class GWM(nn.Module):
             config.num_entities,
             self.embedding_dim,
         )
+        self.text_ent_embs = nn.Embedding(
+            config.num_entities,
+            config.text_emb_dim,
+        )
+        self.text_rel_embs = nn.Embedding(
+            config.num_relations,
+            config.text_emb_dim,
+        )
+        self.text_ent_embs.weight.requires_grad = False
+        self.text_rel_embs.weight.requires_grad = False
+        self.entity_text_projection = nn.Linear(
+            config.text_emb_dim,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.relation_text_projection = nn.Linear(
+            config.text_emb_dim,
+            self.embedding_dim,
+            bias=False,
+        )
+        self.entity_text_norm = nn.LayerNorm(self.embedding_dim)
+        self.relation_text_norm = nn.LayerNorm(self.embedding_dim)
+        self.head_fusion_gate = nn.Linear(self.embedding_dim * 3, 1)
+        self.relation_fusion_gate = nn.Linear(self.embedding_dim * 2, 1)
+        self.context_fusion_gate = nn.Linear(self.embedding_dim * 3, 1)
+        self.head_fusion_norm = nn.LayerNorm(self.embedding_dim)
+        self.relation_fusion_norm = nn.LayerNorm(self.embedding_dim)
+        self.context_text_norm = nn.LayerNorm(self.embedding_dim)
         self.base_rel_embs = nn.Embedding(
             config.num_base_relations,
             self.embedding_dim,
@@ -82,26 +115,6 @@ class GWM(nn.Module):
         )
         self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
         self.token_roles = nn.Embedding(3, self.embedding_dim)
-        self.path_query_projection = nn.Linear(
-            self.embedding_dim,
-            self.embedding_dim,
-            bias=False,
-        )
-        self.path_edge_projection = nn.Linear(
-            self.embedding_dim,
-            self.embedding_dim,
-            bias=False,
-        )
-        self.path_delta = nn.Linear(
-            self.embedding_dim,
-            self.embedding_dim,
-            bias=False,
-        )
-        self.path_norm = nn.LayerNorm(self.embedding_dim)
-        self.path_score_gate = nn.Linear(
-            self.embedding_dim,
-            1,
-        )
         self.next_state_tokens = nn.Parameter(
             torch.empty(
                 1,
@@ -127,10 +140,35 @@ class GWM(nn.Module):
         nn.init.zeros_(self.inverse_adapter.weight)
         nn.init.eye_(self.next_state_projection.weight)
         nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
-        nn.init.zeros_(self.path_score_gate.weight)
+        nn.init.zeros_(self.head_fusion_gate.weight)
+        nn.init.zeros_(self.relation_fusion_gate.weight)
+        nn.init.zeros_(self.context_fusion_gate.weight)
         nn.init.constant_(
-            self.path_score_gate.bias,
-            getattr(config, 'path_score_gate_init', -2.0),
+            self.head_fusion_gate.bias,
+            getattr(config, 'head_text_gate_bias', -2.0),
+        )
+        nn.init.constant_(
+            self.relation_fusion_gate.bias,
+            getattr(config, 'relation_text_gate_bias', -2.5),
+        )
+        nn.init.constant_(
+            self.context_fusion_gate.bias,
+            getattr(config, 'context_text_gate_bias', -2.0),
+        )
+
+    def load_text_embeddings(self, entity_path, relation_path):
+        with torch.no_grad():
+            self.text_ent_embs.weight.copy_(load_embedding_cache(entity_path))
+            self.text_rel_embs.weight.copy_(load_embedding_cache(relation_path))
+
+    def encode_entity_text(self, entity_ids):
+        return self.entity_text_norm(
+            self.entity_text_projection(self.text_ent_embs(entity_ids))
+        )
+
+    def encode_relation_text(self, relation_ids):
+        return self.relation_text_norm(
+            self.relation_text_projection(self.text_rel_embs(relation_ids))
         )
 
     def encode_relation(self, relation_ids):
@@ -142,10 +180,31 @@ class GWM(nn.Module):
         relation = relation + inverse_mask * self.inverse_adapter(base)
         return self.relation_norm(relation)
 
+    def fuse_relation(self, relation_ids):
+        structure = self.encode_relation(relation_ids)
+        text = self.encode_relation_text(relation_ids)
+        gate = torch.sigmoid(
+            self.relation_fusion_gate(torch.cat([structure, text], dim=-1))
+        )
+        return self.relation_fusion_norm(structure + gate * text)
+
+    def fuse_head(self, entity_ids, query_relation):
+        structure = self.struct_ent_embs(entity_ids)
+        text = self.encode_entity_text(entity_ids)
+        if query_relation is None:
+            query_relation = torch.zeros_like(structure)
+        gate = torch.sigmoid(
+            self.head_fusion_gate(
+                torch.cat([structure, text, query_relation], dim=-1)
+            )
+        )
+        return self.head_fusion_norm(structure + gate * text)
+
     def encode_world_state(
         self,
         h_batch,
         context_batch,
+        query_relation=None,
         mask_head=False,
     ):
         entity_ids = context_batch['id']
@@ -159,14 +218,32 @@ class GWM(nn.Module):
                 -1,
             ).squeeze(1)
         else:
-            head_token = self.struct_ent_embs(h_batch['id'])
+            head_token = self.fuse_head(h_batch['id'], query_relation)
         head_token = head_token + self.token_roles.weight[0]
         safe_entity_ids = entity_ids.masked_fill(~context_mask, 0)
         safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
         context_entities = self.struct_ent_embs(safe_entity_ids)
         context_relations = self.encode_relation(safe_relation_ids)
+        structural_facts = context_entities + context_relations
+        textual_facts = self.context_text_norm(
+            self.encode_entity_text(safe_entity_ids)
+            + self.encode_relation_text(safe_relation_ids)
+        )
+        if query_relation is None:
+            query_relation = torch.zeros_like(head_token)
+        context_condition = query_relation.unsqueeze(1).expand_as(
+            structural_facts
+        )
+        context_gate = torch.sigmoid(
+            self.context_fusion_gate(
+                torch.cat(
+                    [structural_facts, textual_facts, context_condition],
+                    dim=-1,
+                )
+            )
+        )
         fact_tokens = self.context_fact_norm(
-            context_entities + context_relations
+            structural_facts + context_gate * textual_facts
         )
         fact_tokens = fact_tokens + self.token_roles.weight[1]
         fact_tokens = fact_tokens.masked_fill(
@@ -207,7 +284,7 @@ class GWM(nn.Module):
 
     def encode_query(self, h_batch, r_batch, context_batch):
         relation_ids = r_batch['id']
-        relation = self.encode_relation(relation_ids)
+        relation = self.fuse_relation(relation_ids)
         slot_counts = self.relation_slot_counts[relation_ids]
         active_slots = (
             torch.arange(
@@ -225,6 +302,7 @@ class GWM(nn.Module):
         memory, memory_padding_mask = self.encode_world_state(
             h_batch,
             context_batch,
+            query_relation=relation,
         )
         next_state_tokens = self.next_state_tokens.expand(
             relation_token.size(0),
@@ -251,136 +329,6 @@ class GWM(nn.Module):
     def forward(self, h_batch, r_batch, context_batch):
         return self.encode_query(h_batch, r_batch, context_batch)
 
-    def _path_transition(self, states, edge_relations, query_relation):
-        expanded_query = query_relation
-        while expanded_query.dim() < states.dim():
-            expanded_query = expanded_query.unsqueeze(1)
-        expanded_query = expanded_query.expand_as(states)
-
-        query_key = F.normalize(
-            self.path_query_projection(expanded_query),
-            p=2,
-            dim=-1,
-        )
-        edge_key = F.normalize(
-            self.path_edge_projection(edge_relations),
-            p=2,
-            dim=-1,
-        )
-        relevance = torch.sigmoid(
-            4.0 * (query_key * edge_key).sum(dim=-1)
-        )
-        delta = torch.tanh(self.path_delta(edge_relations))
-        return F.normalize(
-            self.path_norm(
-                states + relevance.unsqueeze(-1) * delta
-            ),
-            p=2,
-            dim=-1,
-        )
-
-    def encode_path_evidence(self, h_batch, r_batch, path_batch):
-        relation = self.encode_relation(r_batch['id'])
-        source = F.normalize(
-            self.struct_ent_embs(h_batch['id']) + relation,
-            p=2,
-            dim=-1,
-        )
-
-        hop1_mask = path_batch['hop1_mask'].bool()
-        hop1_ids = path_batch['hop1_id'].masked_fill(~hop1_mask, 0)
-        hop1_rel_ids = path_batch['hop1_rel_id'].masked_fill(~hop1_mask, 0)
-        hop1_relations = self.encode_relation(hop1_rel_ids)
-        hop1_states = self._path_transition(
-            source.unsqueeze(1).expand_as(hop1_relations),
-            hop1_relations,
-            relation,
-        )
-        hop1_targets = F.normalize(
-            self.struct_ent_embs(hop1_ids),
-            p=2,
-            dim=-1,
-        )
-        hop1_scores = (hop1_states * hop1_targets).sum(dim=-1)
-        hop1_scores = hop1_scores / self.temperature
-
-        hop2_mask = path_batch['hop2_mask'].bool()
-        hop2_ids = path_batch['hop2_id'].masked_fill(~hop2_mask, 0)
-        hop2_rel_ids = path_batch['hop2_rel_id'].masked_fill(~hop2_mask, 0)
-        hop2_relations = self.encode_relation(hop2_rel_ids)
-        hop2_states = self._path_transition(
-            hop1_states.unsqueeze(2).expand_as(hop2_relations),
-            hop2_relations,
-            relation,
-        )
-        hop2_targets = F.normalize(
-            self.struct_ent_embs(hop2_ids),
-            p=2,
-            dim=-1,
-        )
-        hop2_scores = (hop2_states * hop2_targets).sum(dim=-1)
-        hop2_scores = hop2_scores / self.temperature
-
-        return {
-            'entity_ids': torch.cat(
-                [hop1_ids, hop2_ids.flatten(1)],
-                dim=1,
-            ),
-            'scores': torch.cat(
-                [hop1_scores, hop2_scores.flatten(1)],
-                dim=1,
-            ),
-            'mask': torch.cat(
-                [hop1_mask, hop2_mask.flatten(1)],
-                dim=1,
-            ),
-            'gate': torch.sigmoid(self.path_score_gate(relation)),
-        }
-
-    def _aggregate_path_evidence(self, path_evidence):
-        entity_ids = path_evidence['entity_ids']
-        path_scores = path_evidence['scores']
-        path_mask = path_evidence['mask'].bool()
-        path_count = entity_ids.size(1)
-
-        same_endpoint = entity_ids.unsqueeze(2).eq(entity_ids.unsqueeze(1))
-        valid_pairs = (
-            same_endpoint
-            & path_mask.unsqueeze(2)
-            & path_mask.unsqueeze(1)
-        )
-        endpoint_counts = valid_pairs.sum(dim=-1).clamp_min(1)
-        endpoint_scores = (
-            valid_pairs.to(path_scores.dtype)
-            * path_scores.unsqueeze(1)
-        ).sum(dim=-1) / endpoint_counts
-
-        previous = torch.tril(
-            torch.ones(
-                path_count,
-                path_count,
-                dtype=torch.bool,
-                device=entity_ids.device,
-            ),
-            diagonal=-1,
-        )
-        unique_mask = path_mask & ~(valid_pairs & previous).any(dim=-1)
-        bonuses = endpoint_scores * path_evidence['gate']
-        safe_entity_ids = entity_ids.masked_fill(~unique_mask, 0)
-        return safe_entity_ids, bonuses, unique_mask
-
-    def _add_path_evidence(self, scores, path_evidence):
-        if path_evidence is None:
-            return scores
-        entity_ids, bonuses, unique_mask = self._aggregate_path_evidence(
-            path_evidence
-        )
-        contributions = bonuses * unique_mask.to(bonuses.dtype)
-        if not torch.is_grad_enabled():
-            scores.scatter_add_(1, entity_ids, contributions)
-            return scores
-        return scores.scatter_add(1, entity_ids, contributions)
-
     def encode_target(self, t_batch):
         target = self.struct_ent_embs(t_batch['id'])
         return F.normalize(target, p=2, dim=-1)
@@ -406,7 +354,6 @@ class GWM(nn.Module):
         query_slots,
         mixture_log_weights,
         target_ids,
-        path_evidence=None,
     ):
         candidate_vectors = F.normalize(
             self.struct_ent_embs.weight,
@@ -418,29 +365,7 @@ class GWM(nn.Module):
             mixture_log_weights,
             candidate_vectors,
         )
-        if path_evidence is None:
-            return F.cross_entropy(scores, target_ids)
-
-        entity_ids, bonuses, unique_mask = self._aggregate_path_evidence(
-            path_evidence
-        )
-        log_partition = torch.logsumexp(scores, dim=1)
-        selected_scores = scores.gather(1, entity_ids)
-        partition_ratio = 1.0 + (
-            torch.exp(selected_scores - log_partition.unsqueeze(1))
-            * torch.expm1(bonuses)
-            * unique_mask.to(scores.dtype)
-        ).sum(dim=1)
-        combined_log_partition = (
-            log_partition + partition_ratio.clamp_min(1e-12).log()
-        )
-        target_scores = scores.gather(1, target_ids.unsqueeze(1)).squeeze(1)
-        target_bonus = (
-            bonuses
-            * unique_mask.to(bonuses.dtype)
-            * entity_ids.eq(target_ids.unsqueeze(1)).to(bonuses.dtype)
-        ).sum(dim=1)
-        return (combined_log_partition - target_scores - target_bonus).mean()
+        return F.cross_entropy(scores, target_ids)
 
     def compute_state_reconstruction_loss(
         self,
@@ -464,7 +389,6 @@ class GWM(nn.Module):
         h_batch,
         r_batch,
         context_batch,
-        path_batch=None,
         candidate_vectors=None,
     ):
         query_slots, mixture_log_weights = self.encode_query(
@@ -480,16 +404,8 @@ class GWM(nn.Module):
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
 
-        scores = self.score_candidates(
+        return self.score_candidates(
             query_slots,
             mixture_log_weights,
             candidate_vectors,
         )
-        path_evidence = None
-        if path_batch is not None:
-            path_evidence = self.encode_path_evidence(
-                h_batch,
-                r_batch,
-                path_batch,
-            )
-        return self._add_path_evidence(scores, path_evidence)

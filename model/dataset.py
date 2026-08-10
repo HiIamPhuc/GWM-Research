@@ -37,18 +37,6 @@ class GWMDataset(Dataset):
         )
         context_mask &= ~answer_edge
 
-        # The path branch must reason beyond direct query edges. Removing every
-        # observed (h, r, *) edge also prevents other known positives from
-        # becoming one-hop shortcuts for multi-answer queries.
-        path_hop1_mask = self.context_mask[h_idx].clone()
-        path_hop1_mask &= ~context_relation_ids.eq(r)
-        safe_hop1_ids = context_entity_ids.masked_fill(~path_hop1_mask, 0)
-        path_hop2_entity_ids = self.context_entity_ids[safe_hop1_ids]
-        path_hop2_relation_ids = self.context_relation_ids[safe_hop1_ids]
-        path_hop2_mask = self.context_mask[safe_hop1_ids].clone()
-        path_hop2_mask &= path_hop1_mask.unsqueeze(-1)
-        path_hop2_mask &= path_hop2_entity_ids.ne(h_idx)
-
         return {
             'h_id': h,
             'r_id': r,
@@ -56,12 +44,6 @@ class GWMDataset(Dataset):
             'context_entity_ids': context_entity_ids,
             'context_relation_ids': context_relation_ids,
             'context_mask': context_mask,
-            'path_hop1_entity_ids': context_entity_ids,
-            'path_hop1_relation_ids': context_relation_ids,
-            'path_hop1_mask': path_hop1_mask,
-            'path_hop2_entity_ids': path_hop2_entity_ids,
-            'path_hop2_relation_ids': path_hop2_relation_ids,
-            'path_hop2_mask': path_hop2_mask,
         }
 
     def __getitem__(self, idx):
@@ -80,25 +62,5 @@ class CollateFN:
                 'id': torch.stack([item['context_entity_ids'] for item in batch]),
                 'rel_id': torch.stack([item['context_relation_ids'] for item in batch]),
                 'mask': torch.stack([item['context_mask'] for item in batch]),
-            },
-            'path_batch': {
-                'hop1_id': torch.stack([
-                    item['path_hop1_entity_ids'] for item in batch
-                ]),
-                'hop1_rel_id': torch.stack([
-                    item['path_hop1_relation_ids'] for item in batch
-                ]),
-                'hop1_mask': torch.stack([
-                    item['path_hop1_mask'] for item in batch
-                ]),
-                'hop2_id': torch.stack([
-                    item['path_hop2_entity_ids'] for item in batch
-                ]),
-                'hop2_rel_id': torch.stack([
-                    item['path_hop2_relation_ids'] for item in batch
-                ]),
-                'hop2_mask': torch.stack([
-                    item['path_hop2_mask'] for item in batch
-                ]),
             },
         }

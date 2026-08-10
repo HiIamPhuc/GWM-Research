@@ -1,5 +1,9 @@
-# Hard arity-conditioned world-state Transformer
+# Residual text-fused, hard arity-conditioned world-state Transformer
 struct_emb_dim: 512
+text_emb_dim: 768
+head_text_gate_bias: -2.0
+relation_text_gate_bias: -2.5
+context_text_gate_bias: -2.0
 num_next_state_slots: 3
 context_encoder_heads: 4
 context_encoder_ffn_multiplier: 2
@@ -10,7 +14,6 @@ transition_decoder_ffn_multiplier: 4
 transition_decoder_dropout: 0.1
 transition_decoder_layers: 2
 temperature: 0.07
-path_score_gate_init: -2.0
 state_reconstruction_ratio: 0.2
 state_reconstruction_weight: 0.1
 
@@ -28,5 +31,5 @@ candidate_batch_size: 2048
 gradient_accumulation_steps: 1
 
 data_dir: data-processed/fb15k-237
-output_dir: output/fb15k-237-arity-slots
+output_dir: output/fb15k-237-residual-text-fusion
 seed: 42

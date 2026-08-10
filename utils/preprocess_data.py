@@ -483,10 +483,13 @@ def process_dataset(
     torch.save(valid_tensor, out_path / 'valid_triples.pt')
     torch.save(test_tensor, out_path / 'test_triples.pt')
 
-    # Text embeddings are disabled for the structural-only model.
-    # precompute_and_save_text_embeddings(
-    #     data_dir, out_path, dataset_name, entity2id, relation2id
-    # )
+    precompute_and_save_text_embeddings(
+        data_dir,
+        out_path,
+        dataset_name,
+        entity2id,
+        relation2id,
+    )
 
     # 4. Ground Truth for Filtered Eval
     # Standard filtered KGC ranking removes every other known true answer,

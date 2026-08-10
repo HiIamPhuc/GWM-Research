@@ -1,39 +1,27 @@
-model_variant: text_only
+# Data and outputs
+data_dir: data-processed/wn18rr
+output_dir: output/wn18rr_text
 
+# Model
+model_variant: text_only
 text_emb_dim: 768
 fusion_dim: 1024
-
-text_adapter_dim: 768
-
 dynamics_layers: 2
-
 adapter_dropout: 0.1
 dropout: 0.2
+temperature: 0.07
 
+# Optimization
 learning_rate: 5e-4
-weight_decay: 0.0001
 min_lr: 1e-5
+weight_decay: 1e-4
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
 num_epochs: 500
 early_stopping_patience: 15
-eval_every: 1
 
+# Runtime
 batch_size: 2048
 eval_batch_size: 2048
 candidate_batch_size: 2048
-
-temperature: 0.07
-
-data_dir: data-processed/wn18rr
-output_dir: output/wn18rr_text
-    
-add_inverse: true
-context_k: 5
-    
-device: cuda
 seed: 42
-
-save_eval_predictions: true
-eval_topk: 10
-eval_predictions_dir: output/wn18rr_text/predictions

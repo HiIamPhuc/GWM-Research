@@ -1,40 +1,27 @@
-# Config for UMLS with frozen text embeddings and trainable structural ID embeddings
+# Data and outputs
+data_dir: data-processed/umls
+output_dir: output/umls
+
+# Model
 text_emb_dim: 768
 struct_emb_dim: 128
 fusion_dim: 896
-
-text_adapter_dim: 768
-struct_adapter_dim: 128
-
 dynamics_layers: 1
-
 adapter_dropout: 0.1
 dropout: 0.2
+temperature: 0.07
 
+# Optimization
 learning_rate: 5e-5
-weight_decay: 0.01
 min_lr: 1e-6
+weight_decay: 0.01
 warmup_ratio: 0.1
 grad_clip_norm: 1.0
 num_epochs: 200
 early_stopping_patience: 10
-eval_every: 1
 
+# Runtime
 batch_size: 512
 eval_batch_size: 512
 candidate_batch_size: 512
-
-temperature: 0.07
-
-data_dir: data-processed/umls
-output_dir: output/umls
-
-add_inverse: true
-context_k: 5
-
-device: cuda
 seed: 42
-
-save_eval_predictions: true
-eval_topk: 10
-eval_predictions_dir: output/umls/predictions

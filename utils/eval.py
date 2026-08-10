@@ -31,7 +31,6 @@ class TensorTripleDataset(Dataset):
         self.context_entity_ids = base_dataset.context_entity_ids
         self.context_relation_ids = base_dataset.context_relation_ids
         self.context_mask = base_dataset.context_mask
-        self.context_pad_value = base_dataset.context_pad_value
         self.triples = torch.as_tensor(triples, dtype=torch.long)
 
     def __len__(self):
@@ -61,10 +60,7 @@ class TensorTripleDataset(Dataset):
         }
 
 
-def load_triples_for_filtering(data_dir, splits=None):
-    if splits is None:
-        splits = ['train']
-
+def load_triples_for_filtering(data_dir, splits):
     all_triples = set()
     for split in splits:
         path = os.path.join(data_dir, f'{split}_triples.pt')
@@ -75,22 +71,7 @@ def load_triples_for_filtering(data_dir, splits=None):
     return all_triples
 
 
-def load_hr_map_for_filtering(data_dir, preferred_ground_truth_file=None, fallback_splits=None):
-    if fallback_splits is None:
-        fallback_splits = ['train']
-
-    if preferred_ground_truth_file is not None:
-        gt_path = os.path.join(data_dir, preferred_ground_truth_file)
-        if os.path.exists(gt_path):
-            with open(gt_path, 'r') as f:
-                gt_json = json.load(f)
-
-            hr_map = {}
-            for key, tails in gt_json.items():
-                h, r = map(int, key.split(','))
-                hr_map[(h, r)] = set(int(t) for t in tails)
-            return hr_map
-
+def load_hr_map_for_filtering(data_dir, fallback_splits):
     all_triples = load_triples_for_filtering(data_dir, splits=fallback_splits)
     hr_map = {}
     for h, r, t in all_triples:
@@ -105,23 +86,11 @@ def load_inverse_relation_id_map(data_dir):
         relation2id = json.load(f)
 
     inverse_relation_ids = {}
-    missing = []
     for relation, relation_id in relation2id.items():
         inverse_relation = (
             relation[:-4] if relation.endswith('_inv') else relation + '_inv'
         )
-        if inverse_relation not in relation2id:
-            missing.append(relation)
-            continue
         inverse_relation_ids[int(relation_id)] = int(relation2id[inverse_relation])
-
-    if missing:
-        preview = ', '.join(missing[:10])
-        raise ValueError(
-            "Strict bidirectional evaluation requires every relation to have "
-            f"an inverse relation ID. Missing inverse entries for: {preview}"
-        )
-
     return inverse_relation_ids
 
 
@@ -167,10 +136,7 @@ def combine_forward_backward_metrics(forward_metrics, backward_metrics):
     return combined
 
 
-def build_bidirectional_hr_map_for_filtering(data_dir, splits=None):
-    if splits is None:
-        splits = ['train', 'valid', 'test']
-
+def build_bidirectional_hr_map_for_filtering(data_dir, splits):
     inverse_relation_ids = load_inverse_relation_id_map(data_dir)
     triples = load_triples_for_filtering(data_dir, splits=splits)
     hr_map = {}
@@ -180,8 +146,7 @@ def build_bidirectional_hr_map_for_filtering(data_dir, splits=None):
 
     for h, r, t in triples:
         add_truth(h, r, t)
-        if int(r) in inverse_relation_ids:
-            add_truth(t, inverse_relation_ids[int(r)], h)
+        add_truth(t, inverse_relation_ids[int(r)], h)
 
     return hr_map
 
@@ -300,9 +265,6 @@ def _add_ranks_to_state(state, ranks):
 
 def _finalize_metric_state(state):
     total = state['count']
-    if total == 0:
-        raise ValueError("Cannot compute ranking metrics from zero queries.")
-
     return {
         'MRR': state['mrr'] / total,
         'MR': state['mr'] / total,
@@ -345,9 +307,6 @@ def compute_filtered_ranking_metrics(
             query_vectors = model(h_batch, r_batch, context_batch)
             scores = torch.mm(query_vectors, all_entity_embeddings.t())
             scores = scores / model.temperature
-
-            # Prevent NaNs/Infs from masquerading as perfect ranks.
-            scores = torch.nan_to_num(scores, nan=-1e9, posinf=1e9, neginf=-1e9)
 
             for i in range(scores.size(0)):
                 h_id = h_ids[i]

@@ -14,35 +14,33 @@ from utils.eval import (
 )
 
 
-def make_config(context_agg='mean'):
+def make_config():
     return SimpleNamespace(
         num_entities=4,
         num_relations=4,
         text_emb_dim=6,
         struct_emb_dim=4,
         fusion_dim=10,
-        text_adapter_dim=6,
-        struct_adapter_dim=4,
         dynamics_layers=1,
         dropout=0.0,
         adapter_dropout=0.0,
         temperature=0.1,
-        context_agg=context_agg,
     )
 
 
 class ModelTests(unittest.TestCase):
     def test_text_embedding_load_and_freeze_targets_text_tables(self):
-        model = GWM(make_config())
-        model.load_text_embeddings(
-            torch.randn(4, 6),
-            torch.randn(4, 6),
-            freeze=True,
-        )
-        self.assertFalse(model.text_ent_embs.weight.requires_grad)
-        self.assertFalse(model.text_rel_embs.weight.requires_grad)
-        self.assertTrue(model.struct_ent_embs.weight.requires_grad)
-        self.assertTrue(model.struct_rel_embs.weight.requires_grad)
+        with tempfile.TemporaryDirectory() as root:
+            entity_path = Path(root) / 'entity.pt'
+            relation_path = Path(root) / 'relation.pt'
+            torch.save(torch.randn(4, 6), entity_path)
+            torch.save(torch.randn(4, 6), relation_path)
+            model = GWM(make_config())
+            model.load_text_embeddings(entity_path, relation_path)
+            self.assertFalse(model.text_ent_embs.weight.requires_grad)
+            self.assertFalse(model.text_rel_embs.weight.requires_grad)
+            self.assertTrue(model.struct_ent_embs.weight.requires_grad)
+            self.assertTrue(model.struct_rel_embs.weight.requires_grad)
 
     def test_structural_embeddings_are_trainable_by_default(self):
         model = GWM(make_config())
@@ -52,10 +50,10 @@ class ModelTests(unittest.TestCase):
     def test_isolated_head_preserves_self_state(self):
         layer = ContextAggregator(hidden_dim=4)
         output = layer(
-            head_feat=torch.randn(2, 4),
-            nbr_entity_feat=torch.empty(0, 4),
-            nbr_relation_feat=torch.empty(0, 4),
-            nbr_batch_index=torch.empty(0, dtype=torch.long),
+            head=torch.randn(2, 4),
+            context_entities=torch.empty(0, 4),
+            context_relations=torch.empty(0, 4),
+            batch_index=torch.empty(0, dtype=torch.long),
         )
         self.assertEqual(output.shape, (2, 4))
         self.assertTrue(torch.isfinite(output).all())
@@ -224,18 +222,9 @@ class ModelTests(unittest.TestCase):
         model.encode_target(t_batch)
         stats = model.pop_gate_stats()
 
-        self.assertEqual(
-            set(stats),
-            {
-                'head_gate',
-                'relation_gate',
-                'context_entity_gate',
-                'context_relation_gate',
-                'target_gate',
-            },
-        )
-        self.assertGreaterEqual(stats['head_gate'], 0.0)
-        self.assertLessEqual(stats['head_gate'], 1.0)
+        self.assertEqual(set(stats), {'entity_gate', 'relation_gate'})
+        self.assertGreaterEqual(stats['entity_gate'], 0.0)
+        self.assertLessEqual(stats['entity_gate'], 1.0)
         self.assertEqual(model.pop_gate_stats(), {})
 
 

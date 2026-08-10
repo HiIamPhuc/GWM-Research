@@ -305,8 +305,7 @@ def compute_filtered_ranking_metrics(
             r_ids = r_ids_tensor.cpu().numpy()
 
             query_vectors = model(h_batch, r_batch, context_batch)
-            scores = torch.mm(query_vectors, all_entity_embeddings.t())
-            scores = scores / model.temperature
+            scores = model.score_candidates(query_vectors, all_entity_embeddings)
 
             for i in range(scores.size(0)):
                 h_id = h_ids[i]

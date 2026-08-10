@@ -7,6 +7,7 @@ model_variant: text_only
 text_emb_dim: 768
 fusion_dim: 1024
 dynamics_layers: 2
+num_successor_modes: 4
 adapter_dropout: 0.1
 dropout: 0.2
 temperature: 0.07

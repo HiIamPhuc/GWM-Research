@@ -4,7 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.model import ContextAggregator, GWM, MLPAdapter, load_embedding_cache
+from model.model import (
+    ContextAggregator,
+    GWM,
+    MLPAdapter,
+    RoleAwareTransition,
+    load_embedding_cache,
+)
 
 
 def build_model(config):
@@ -31,14 +37,11 @@ class SingleModalityGWM(nn.Module):
         self.adapter = MLPAdapter(embedding_dim, config.adapter_dropout)
         self.input_projection = nn.Linear(embedding_dim, config.fusion_dim)
         self.context_aggregator = ContextAggregator(config.fusion_dim)
-        self.h0_projection = nn.Linear(config.fusion_dim, config.fusion_dim)
-        self.c0_projection = nn.Linear(config.fusion_dim, config.fusion_dim)
-        self.lstm = nn.LSTM(
+        self.transition = RoleAwareTransition(
             config.fusion_dim,
-            config.fusion_dim,
-            num_layers=config.dynamics_layers,
-            batch_first=True,
-            dropout=config.dropout if config.dynamics_layers > 1 else 0,
+            config.dynamics_layers,
+            config.num_successor_modes,
+            config.dropout,
         )
         self.output_projection = nn.Linear(config.fusion_dim, config.fusion_dim)
 
@@ -51,17 +54,6 @@ class SingleModalityGWM(nn.Module):
     def _encode_relations(self, ids):
         return self.input_projection(self.adapter(self.rel_embs(ids)))
 
-    def _run_transition(self, world_state, head, relation):
-        h0 = torch.tanh(self.h0_projection(world_state))
-        c0 = torch.tanh(self.c0_projection(world_state))
-        h0 = h0.unsqueeze(0).expand(self.lstm.num_layers, -1, -1).contiguous()
-        c0 = c0.unsqueeze(0).expand(self.lstm.num_layers, -1, -1).contiguous()
-        _, (hidden, _) = self.lstm(
-            torch.stack([head, relation], dim=1),
-            (h0, c0),
-        )
-        return hidden[-1]
-
     def forward(self, h_batch, r_batch, context_batch):
         head = self._encode_entities(h_batch['id'])
         relation = self._encode_relations(r_batch['id'])
@@ -73,17 +65,25 @@ class SingleModalityGWM(nn.Module):
             context_relations,
             context_batch['batch_index'],
         )
-        query = self._run_transition(world_state, head, relation)
-        return F.normalize(self.output_projection(query), dim=-1)
+        modes, mixture_logits = self.transition(world_state, head, relation)
+        return {
+            'modes': F.normalize(self.output_projection(modes), dim=-1),
+            'mixture_logits': mixture_logits,
+        }
 
     def encode_target(self, t_batch):
         target = self._encode_entities(t_batch['id'])
         return F.normalize(self.output_projection(target), dim=-1)
 
     def compute_loss(self, query_vectors, target_vectors, truth_mask):
-        scores = query_vectors @ target_vectors.t() / self.temperature
+        scores = self.score_candidates(query_vectors, target_vectors)
         loss = GWM._filtered_in_batch_contrastive_loss(scores, truth_mask).mean()
         return loss, scores
+
+    def score_candidates(self, query, candidates):
+        mode_scores = torch.einsum('bkd,nd->bkn', query['modes'], candidates)
+        log_weights = F.log_softmax(query['mixture_logits'], dim=-1).unsqueeze(-1)
+        return torch.logsumexp(log_weights + mode_scores / self.temperature, dim=1)
 
 
 class TextOnlyGWM(SingleModalityGWM):

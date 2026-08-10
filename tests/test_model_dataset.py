@@ -22,6 +22,7 @@ def make_config():
         struct_emb_dim=4,
         fusion_dim=10,
         dynamics_layers=1,
+        num_successor_modes=4,
         dropout=0.0,
         adapter_dropout=0.0,
         temperature=0.1,
@@ -200,12 +201,32 @@ class ModelTests(unittest.TestCase):
             truth_mask=torch.eye(2, dtype=torch.bool),
         )
         self.assertEqual(scores.shape, (2, 2))
-        self.assertEqual(query.shape, (2, 10))
+        self.assertEqual(query['modes'].shape, (2, 4, 10))
+        self.assertEqual(query['mixture_logits'].shape, (2, 4))
         self.assertEqual(targets.shape, (2, 10))
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertIsNotNone(model.entity_fusion.gate[1].weight.grad)
         self.assertIsNotNone(model.relation_fusion.gate[1].weight.grad)
+        self.assertIsNotNone(model.transition.role_embeddings.grad)
+        self.assertIsNotNone(model.transition.film.weight.grad)
+
+    def test_successor_scores_are_a_normalized_log_mixture(self):
+        model = GWM(make_config())
+        modes = torch.zeros(1, 4, 10)
+        modes[0, 0, 0] = 1.0
+        candidates = torch.zeros(2, 10)
+        candidates[0, 0] = 1.0
+        query = {
+            'modes': modes,
+            'mixture_logits': torch.zeros(1, 4),
+        }
+        scores = model.score_candidates(query, candidates)
+        expected_first = torch.log(
+            (torch.exp(torch.tensor(10.0)) + 3) / 4
+        )
+        self.assertTrue(torch.allclose(scores[0, 0], expected_first))
+        self.assertTrue(torch.allclose(scores[0, 1], torch.tensor(0.0)))
 
     def test_gate_statistics_are_recorded_and_consumed(self):
         model = GWM(make_config())
@@ -222,9 +243,19 @@ class ModelTests(unittest.TestCase):
         model.encode_target(t_batch)
         stats = model.pop_gate_stats()
 
-        self.assertEqual(set(stats), {'entity_gate', 'relation_gate'})
+        self.assertEqual(
+            set(stats),
+            {
+                'entity_gate',
+                'relation_gate',
+                'successor_entropy',
+                'successor_top_weight',
+            },
+        )
         self.assertGreaterEqual(stats['entity_gate'], 0.0)
         self.assertLessEqual(stats['entity_gate'], 1.0)
+        self.assertGreater(stats['successor_entropy'], 0.0)
+        self.assertGreaterEqual(stats['successor_top_weight'], 0.25)
         self.assertEqual(model.pop_gate_stats(), {})
 
 

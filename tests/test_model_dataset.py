@@ -8,6 +8,7 @@ import torch
 
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import ContextAggregator, GWM
+from studies.ablation_models import build_model
 from utils.eval import (
     build_bidirectional_eval_dataset,
     build_bidirectional_hr_map_for_filtering,
@@ -29,6 +30,48 @@ def make_config():
 
 
 class ModelTests(unittest.TestCase):
+    def test_no_context_variant_ignores_context_facts(self):
+        config = make_config()
+        config.model_variant = 'no_context'
+        model = build_model(config).eval()
+        heads = {'id': torch.tensor([0, 1])}
+        relations = {'id': torch.tensor([0, 1])}
+        context_a = {
+            'id': torch.tensor([1, 2]),
+            'rel_id': torch.tensor([0, 1]),
+            'batch_index': torch.tensor([0, 1]),
+        }
+        context_b = {
+            'id': torch.tensor([2, 3]),
+            'rel_id': torch.tensor([1, 0]),
+            'batch_index': torch.tensor([0, 1]),
+        }
+        self.assertTrue(
+            torch.allclose(
+                model(heads, relations, context_a),
+                model(heads, relations, context_b),
+            )
+        )
+
+    def test_mlp_transition_is_parameter_matched(self):
+        config = make_config()
+        recurrent = GWM(config)
+        recurrent_count = sum(
+            parameter.numel()
+            for module in (
+                recurrent.fused_h0_projection,
+                recurrent.fused_c0_projection,
+                recurrent.fused_lstm,
+            )
+            for parameter in module.parameters()
+        )
+        config.model_variant = 'mlp_transition'
+        mlp = build_model(config)
+        mlp_count = sum(
+            parameter.numel() for parameter in mlp.mlp_transition.parameters()
+        )
+        self.assertLess(abs(mlp_count - recurrent_count) / recurrent_count, 0.02)
+
     def test_text_embedding_load_and_freeze_targets_text_tables(self):
         with tempfile.TemporaryDirectory() as root:
             entity_path = Path(root) / 'entity.pt'

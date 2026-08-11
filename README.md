@@ -50,6 +50,11 @@ written to the configured output directory.
 Text-only and structure-only ablations use the same command with one of the
 `*_text.yaml` or `*_struct.yaml` configs.
 
+The complete controlled-ablation runs are available in
+`run_studies_fb15k-237.ipynb` and `run_studies_wn18rr.ipynb`. They train and
+evaluate the full, no-context, parameter-matched MLP-transition, text-only, and
+structure-only variants.
+
 ## Evaluation
 
 ```bash
@@ -70,3 +75,17 @@ python -m unittest discover -s tests -v
 
 The tests cover context masking, filtered in-batch negatives, fusion gradients,
 embedding freezing, and bidirectional filtered evaluation.
+
+## Efficiency study
+
+After training the full model, run:
+
+```bash
+python -m studies.efficiency_study \
+  --config configs/fb15k-237.yaml \
+  --repeats 3
+```
+
+The resulting `efficiency_results.json` records training time, model and
+checkpoint size, candidate encoding time, full-candidate inference throughput,
+latency, peak GPU memory, hardware, and software versions.

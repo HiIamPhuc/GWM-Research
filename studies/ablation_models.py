@@ -10,10 +10,56 @@ from model.model import ContextAggregator, GWM, MLPAdapter, load_embedding_cache
 def build_model(config):
     variants = {
         'fused': GWM,
+        'no_context': NoContextGWM,
+        'mlp_transition': MLPTransitionGWM,
         'text_only': TextOnlyGWM,
         'structure_only': StructureOnlyGWM,
     }
     return variants[getattr(config, 'model_variant', 'fused')](config)
+
+
+class NoContextGWM(GWM):
+    """Full model with the neighborhood world state removed."""
+
+    def forward(self, h_batch, r_batch, context_batch):
+        self._last_gate_stats = {}
+        head, head_gate = self._fuse_entity(h_batch['id'])
+        relation, relation_gate = self._fuse_relation(r_batch['id'])
+        self._record_gates(head_gate, relation_gate)
+        world_state = self.fused_context_aggregator.norm(head)
+        query = self._run_transition(world_state, head, relation)
+        return F.normalize(self.fused_output_projection(query), dim=-1)
+
+
+class MLPTransitionGWM(GWM):
+    """Replace the recurrent transition with a parameter-matched MLP."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        dim = config.fusion_dim
+        recurrent_parameters = sum(
+            parameter.numel()
+            for module in (
+                self.fused_h0_projection,
+                self.fused_c0_projection,
+                self.fused_lstm,
+            )
+            for parameter in module.parameters()
+        )
+        del self.fused_h0_projection
+        del self.fused_c0_projection
+        del self.fused_lstm
+
+        hidden_dim = round((recurrent_parameters - dim) / (4 * dim + 1))
+        self.mlp_transition = nn.Sequential(
+            nn.Linear(dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def _run_transition(self, world_state, head, relation):
+        return self.mlp_transition(torch.cat([world_state, head, relation], dim=-1))
 
 
 class SingleModalityGWM(nn.Module):

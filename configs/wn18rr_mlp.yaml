@@ -1,0 +1,28 @@
+# Data and outputs
+data_dir: data-processed/wn18rr
+output_dir: output/wn18rr_mlp
+
+# Model
+model_variant: mlp_transition
+text_emb_dim: 768
+struct_emb_dim: 384
+fusion_dim: 1024
+dynamics_layers: 2
+adapter_dropout: 0.1
+dropout: 0.2
+temperature: 0.07
+
+# Optimization
+learning_rate: 0.0005
+min_lr: 0.00001
+weight_decay: 0.0001
+warmup_ratio: 0.1
+grad_clip_norm: 1.0
+num_epochs: 500
+early_stopping_patience: 15
+
+# Runtime
+batch_size: 2048
+eval_batch_size: 2048
+candidate_batch_size: 2048
+seed: 42

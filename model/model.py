@@ -66,52 +66,6 @@ class GatedFusion(nn.Module):
         return self.output_norm(self.dropout(fused)), gate
 
 
-class RoleAwareTransition(nn.Module):
-    """Run a role-ordered transition and expand it into successor modes."""
-
-    def __init__(self, hidden_dim, num_layers, num_modes, dropout):
-        super().__init__()
-        self.num_modes = num_modes
-        self.role_embeddings = nn.Parameter(torch.empty(2, hidden_dim))
-        self.mode_embeddings = nn.Parameter(torch.empty(num_modes, hidden_dim))
-        self.h0_projection = nn.Linear(hidden_dim, hidden_dim)
-        self.c0_projection = nn.Linear(hidden_dim, hidden_dim)
-        self.lstm = nn.LSTM(
-            hidden_dim,
-            hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-        )
-        self.film = nn.Linear(hidden_dim, num_modes * hidden_dim * 2)
-        self.mixture = nn.Linear(hidden_dim * 2, num_modes)
-        self.mode_norm = nn.LayerNorm(hidden_dim)
-        nn.init.normal_(self.role_embeddings, std=0.02)
-        nn.init.normal_(self.mode_embeddings, std=0.02)
-        nn.init.zeros_(self.film.weight)
-        nn.init.zeros_(self.film.bias)
-
-    def forward(self, world_state, head, relation):
-        h0 = torch.tanh(self.h0_projection(world_state))
-        c0 = torch.tanh(self.c0_projection(world_state))
-        h0 = h0.unsqueeze(0).expand(self.lstm.num_layers, -1, -1).contiguous()
-        c0 = c0.unsqueeze(0).expand(self.lstm.num_layers, -1, -1).contiguous()
-        sequence = torch.stack(
-            [head + self.role_embeddings[0], relation + self.role_embeddings[1]],
-            dim=1,
-        )
-        _, (hidden, _) = self.lstm(sequence, (h0, c0))
-        base_state = hidden[-1]
-
-        gamma, beta = self.film(relation).view(
-            relation.size(0), self.num_modes, 2, relation.size(1)
-        ).unbind(dim=2)
-        modes = (1 + torch.tanh(gamma)) * base_state.unsqueeze(1)
-        modes = self.mode_norm(modes + beta + self.mode_embeddings.unsqueeze(0))
-        mixture_logits = self.mixture(torch.cat([base_state, relation], dim=-1))
-        return modes, mixture_logits
-
-
 class GWM(nn.Module):
     requires_text_embeddings = True
 
@@ -120,7 +74,6 @@ class GWM(nn.Module):
         self.config = config
         self.temperature = config.temperature
         self.fusion_dim = config.fusion_dim
-        self.num_successor_modes = config.num_successor_modes
 
         self.text_ent_embs = nn.Embedding(config.num_entities, config.text_emb_dim)
         self.text_rel_embs = nn.Embedding(config.num_relations, config.text_emb_dim)
@@ -143,11 +96,14 @@ class GWM(nn.Module):
         )
 
         self.fused_context_aggregator = ContextAggregator(config.fusion_dim)
-        self.transition = RoleAwareTransition(
+        self.fused_h0_projection = nn.Linear(config.fusion_dim, config.fusion_dim)
+        self.fused_c0_projection = nn.Linear(config.fusion_dim, config.fusion_dim)
+        self.fused_lstm = nn.LSTM(
             config.fusion_dim,
-            config.dynamics_layers,
-            config.num_successor_modes,
-            config.dropout,
+            config.fusion_dim,
+            num_layers=config.dynamics_layers,
+            batch_first=True,
+            dropout=config.dropout if config.dynamics_layers > 1 else 0,
         )
         self.fused_output_projection = nn.Linear(config.fusion_dim, config.fusion_dim)
         self._last_gate_stats = {}
@@ -179,6 +135,17 @@ class GWM(nn.Module):
         self._last_gate_stats = {}
         return stats
 
+    def _run_transition(self, world_state, head, relation):
+        h0 = torch.tanh(self.fused_h0_projection(world_state))
+        c0 = torch.tanh(self.fused_c0_projection(world_state))
+        h0 = h0.unsqueeze(0).expand(self.fused_lstm.num_layers, -1, -1).contiguous()
+        c0 = c0.unsqueeze(0).expand(self.fused_lstm.num_layers, -1, -1).contiguous()
+        _, (hidden, _) = self.fused_lstm(
+            torch.stack([head, relation], dim=1),
+            (h0, c0),
+        )
+        return hidden[-1]
+
     def forward(self, h_batch, r_batch, context_batch):
         self._last_gate_stats = {}
         head, head_gate = self._fuse_entity(h_batch['id'])
@@ -198,21 +165,8 @@ class GWM(nn.Module):
             context_relations,
             context_batch['batch_index'],
         )
-        modes, mixture_logits = self.transition(world_state, head, relation)
-        mixture_weights = F.softmax(mixture_logits, dim=-1)
-        self._last_gate_stats['successor_entropy'] = (
-            -(mixture_weights * mixture_weights.clamp_min(1e-9).log()).sum(dim=-1)
-            .mean()
-            .detach()
-            .item()
-        )
-        self._last_gate_stats['successor_top_weight'] = (
-            mixture_weights.max(dim=-1).values.mean().detach().item()
-        )
-        return {
-            'modes': F.normalize(self.fused_output_projection(modes), dim=-1),
-            'mixture_logits': mixture_logits,
-        }
+        query = self._run_transition(world_state, head, relation)
+        return F.normalize(self.fused_output_projection(query), dim=-1)
 
     def encode_target(self, t_batch):
         target, gate = self._fuse_entity(t_batch['id'])
@@ -227,11 +181,6 @@ class GWM(nn.Module):
         return F.cross_entropy(scores, labels, reduction='none')
 
     def compute_loss(self, query_vectors, target_vectors, truth_mask):
-        scores = self.score_candidates(query_vectors, target_vectors)
+        scores = query_vectors @ target_vectors.t() / self.temperature
         loss = self._filtered_in_batch_contrastive_loss(scores, truth_mask).mean()
         return loss, scores
-
-    def score_candidates(self, query, candidates):
-        mode_scores = torch.einsum('bkd,nd->bkn', query['modes'], candidates)
-        log_weights = F.log_softmax(query['mixture_logits'], dim=-1).unsqueeze(-1)
-        return torch.logsumexp(log_weights + mode_scores / self.temperature, dim=1)

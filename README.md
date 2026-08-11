@@ -2,10 +2,8 @@
 
 Official research code for **WST-KGC**, a world-model-inspired approach to
 knowledge graph completion. The model constructs a local world state from a
-head entity's graph context and applies a role-aware LSTM transition. Learned
-head/relation role embeddings define the transition order, while
-relation-conditioned FiLM generates a mixture of plausible successor states
-for candidate retrieval.
+head entity's graph context, applies a relation-conditioned LSTM transition,
+and retrieves candidate tail entities with cosine similarity.
 
 ## Setup
 
@@ -51,10 +49,6 @@ written to the configured output directory.
 
 Text-only and structure-only ablations use the same command with one of the
 `*_text.yaml` or `*_struct.yaml` configs.
-
-`num_successor_modes` controls the number of FiLM-conditioned successor states.
-Training logs their mixture entropy and average dominant-mode weight so mode
-collapse can be diagnosed directly.
 
 ## Evaluation
 

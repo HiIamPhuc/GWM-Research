@@ -77,6 +77,11 @@ def move_batch(batch, device):
     }
 
 
+def synchronize(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
 def train(config):
     os.makedirs(config.output_dir, exist_ok=True)
     seed_everything(config.seed)
@@ -136,6 +141,7 @@ def train(config):
 
     for epoch in range(config.num_epochs):
         model.train()
+        synchronize(device)
         epoch_start = time.perf_counter()
         total_loss = 0.0
         gate_sums = {}
@@ -159,18 +165,23 @@ def train(config):
             optimizer.step()
             scheduler.step()
 
-            total_loss += loss.item()
+            loss_value = loss.item()
+            total_loss += loss_value
             for name, value in model.pop_gate_stats().items():
                 gate_sums[name] = gate_sums.get(name, 0.0) + value
                 gate_counts[name] = gate_counts.get(name, 0) + 1
-            progress.set_postfix(loss=f'{loss.item():.4f}')
+            progress.set_postfix(loss=f'{loss_value:.4f}')
 
+        synchronize(device)
+        train_seconds = time.perf_counter() - epoch_start
         train_loss = total_loss / len(train_loader)
         gate_stats = {
             f'train_{name}': gate_sums[name] / gate_counts[name]
             for name in gate_sums
         }
 
+        synchronize(device)
+        validation_start = time.perf_counter()
         candidates = encode_all_entities_as_targets(model, entity_loader, device)
         metrics = compute_filtered_ranking_metrics(
             model,
@@ -180,12 +191,16 @@ def train(config):
             device,
             desc='Validation',
         )
+        synchronize(device)
+        validation_seconds = time.perf_counter() - validation_start
         val_mrr = metrics['MRR']
         epoch_log = {
             'epoch': epoch + 1,
             'validation_protocol': 'main',
             'train_loss': train_loss,
-            'train_seconds': time.perf_counter() - epoch_start,
+            'train_seconds': train_seconds,
+            'validation_seconds': validation_seconds,
+            'epoch_seconds': train_seconds + validation_seconds,
             'val_mrr': val_mrr,
             'val_mr': metrics['MR'],
             'val_hits1': metrics['Hits@1'],
@@ -199,7 +214,8 @@ def train(config):
 
         print(
             f"Epoch {epoch + 1} | loss {train_loss:.4f} | "
-            f"MRR {val_mrr:.4f} | H@10 {metrics['Hits@10']:.4f}"
+            f"MRR {val_mrr:.4f} | H@10 {metrics['Hits@10']:.4f} | "
+            f"train {train_seconds:.1f}s | validation {validation_seconds:.1f}s"
         )
 
         should_stop = stopper(val_mrr)

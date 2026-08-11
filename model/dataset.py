@@ -23,12 +23,12 @@ class TrainTruthIndex:
         for column, tail in enumerate(tails):
             tail_columns.setdefault(tail, []).append(column)
 
-        mask = torch.zeros(len(heads), len(tails), dtype=torch.bool, device=device)
+        mask = torch.zeros(len(heads), len(tails), dtype=torch.bool)
         for row, query in enumerate(zip(heads, relations)):
             for tail in self.query_tails.get(query, ()):
                 mask[row, tail_columns.get(tail, [])] = True
         mask.fill_diagonal_(True)
-        return mask
+        return mask.to(device) if device is not None else mask
 
 
 class GWMDataset(Dataset):

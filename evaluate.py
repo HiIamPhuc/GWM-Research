@@ -9,10 +9,10 @@ from model.dataset import CollateFN, GWMDataset
 from studies.ablation_models import build_model
 from utils.config import load_config
 from utils.eval import (
-    build_bidirectional_hr_map_for_filtering,
     build_entity_loader,
-    compute_bidirectional_filtered_ranking_metrics,
+    compute_filtered_ranking_metrics,
     encode_all_entities_as_targets,
+    load_hr_map_for_filtering,
 )
 
 
@@ -54,11 +54,11 @@ def evaluate(config):
         num_workers=4,
         pin_memory=device.type == 'cuda',
     )
-    filter_map = build_bidirectional_hr_map_for_filtering(
+    filter_map = load_hr_map_for_filtering(
         config.data_dir,
-        splits=['train', 'valid', 'test'],
+        fallback_splits=['train', 'valid', 'test'],
     )
-    metrics = compute_bidirectional_filtered_ranking_metrics(
+    metrics = compute_filtered_ranking_metrics(
         model,
         test_loader,
         candidates,
@@ -70,22 +70,18 @@ def evaluate(config):
     )
 
     results = {
-        **metric_record(metrics['micro']),
-        'evaluation_mode': 'bidirectional_test',
-        'forward': metric_record(metrics['forward']),
-        'backward': metric_record(metrics['backward']),
-        'micro': metric_record(metrics['micro']),
+        'evaluation_protocol': 'main',
+        'split': 'test',
+        'main': metric_record(metrics),
     }
     with open(os.path.join(config.output_dir, 'evaluation_results.json'), 'w') as file:
         json.dump(results, file, indent=2)
 
     print(
-        f"MRR {results['mrr']:.4f} | H@1 {results['hits1']:.4f} | "
-        f"H@3 {results['hits3']:.4f} | H@10 {results['hits10']:.4f}"
-    )
-    print(
-        f"Forward MRR {results['forward']['mrr']:.4f} | "
-        f"Backward MRR {results['backward']['mrr']:.4f}"
+        f"MRR {results['main']['mrr']:.4f} | "
+        f"H@1 {results['main']['hits1']:.4f} | "
+        f"H@3 {results['main']['hits3']:.4f} | "
+        f"H@10 {results['main']['hits10']:.4f}"
     )
 
 

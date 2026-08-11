@@ -26,6 +26,7 @@ def save_config(config, model):
     total = sum(parameter.numel() for parameter in model.parameters())
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     values = vars(config) | {
+        'validation_protocol': 'main',
         'model_parameters': {
             'total': total,
             'trainable': trainable,
@@ -182,6 +183,7 @@ def train(config):
         val_mrr = metrics['MRR']
         epoch_log = {
             'epoch': epoch + 1,
+            'validation_protocol': 'main',
             'train_loss': train_loss,
             'train_seconds': time.perf_counter() - epoch_start,
             'val_mrr': val_mrr,

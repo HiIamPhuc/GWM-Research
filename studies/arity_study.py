@@ -7,9 +7,7 @@ The relation arity classification follows the common OpenKE protocol:
 * avg tails per (head, relation) < 1.5 and avg heads per (relation, tail) >= 1.5 -> N-1
 * otherwise -> N-N
 
-For bidirectional GWM evaluation, backward predictions are assigned a
-direction-aware query arity by swapping 1-N and N-1. This reflects that
-ranking heads through an inverse relation reverses the query multiplicity.
+The study uses the saved main-protocol predictions for original test triples.
 """
 
 import argparse
@@ -38,18 +36,6 @@ def _relation_maps(data_dir):
 
 def _is_inverse_relation(relation_name):
     return relation_name.endswith('_inv')
-
-
-def _base_relation_name(relation_name):
-    return relation_name[:-4] if _is_inverse_relation(relation_name) else relation_name
-
-
-def _swap_arity(arity):
-    if arity == '1-N':
-        return 'N-1'
-    if arity == 'N-1':
-        return '1-N'
-    return arity
 
 
 def _iter_original_triples(data_dir, id2relation, splits):
@@ -170,7 +156,7 @@ def _finalize_state(state):
     }
 
 
-def _read_predictions(path, direction, id2relation, relation2id, arity_by_relation):
+def _read_predictions(path, id2relation, arity_by_relation):
     if path is None or not os.path.exists(path):
         return []
 
@@ -180,22 +166,15 @@ def _read_predictions(path, direction, id2relation, relation2id, arity_by_relati
             record = json.loads(line)
             relation_id = int(record['r'])
             relation_name = id2relation[relation_id]
-            base_relation = _base_relation_name(relation_name)
-            base_relation_id = int(relation2id[base_relation])
-            base_arity = arity_by_relation.get(base_relation_id, 'unknown')
-            query_arity = _swap_arity(base_arity) if direction == 'backward' else base_arity
+            arity = arity_by_relation.get(relation_id, 'unknown')
 
             rows.append({
-                'direction': direction,
                 'h': int(record['h']),
                 'r': relation_id,
                 't': int(record['t']),
                 'rank': int(record['rank']),
                 'relation': relation_name,
-                'base_relation_id': base_relation_id,
-                'base_relation': base_relation,
-                'base_arity': base_arity,
-                'query_arity': query_arity,
+                'arity': arity,
             })
     return rows
 
@@ -215,23 +194,12 @@ def _metric_rows(prediction_rows):
 
     for row in prediction_rows:
         rank = row['rank']
-        direction = row['direction']
-        arity = row['query_arity']
-
-        _add_rank(states[(direction, arity)], rank)
-        _add_rank(states[(direction, 'all')], rank)
-        _add_rank(states[('micro', arity)], rank)
-        _add_rank(states[('micro', 'all')], rank)
+        _add_rank(states[row['arity']], rank)
+        _add_rank(states['all'], rank)
 
     rows = []
-    for direction in ('forward', 'backward', 'micro'):
-        for arity in (*ARITY_ORDER, 'all'):
-            metrics = _finalize_state(states[(direction, arity)])
-            rows.append({
-                'direction': direction,
-                'arity': arity,
-                **metrics,
-            })
+    for arity in (*ARITY_ORDER, 'all'):
+        rows.append({'arity': arity, **_finalize_state(states[arity])})
     return rows
 
 
@@ -240,13 +208,11 @@ def _relation_metric_rows(prediction_rows):
     meta = {}
 
     for row in prediction_rows:
-        key = (row['base_relation_id'], row['direction'])
+        key = row['r']
         meta[key] = {
-            'relation_id': row['base_relation_id'],
-            'relation': row['base_relation'],
-            'base_arity': row['base_arity'],
-            'direction': row['direction'],
-            'query_arity': row['query_arity'],
+            'relation_id': row['r'],
+            'relation': row['relation'],
+            'arity': row['arity'],
         }
         _add_rank(states[key], row['rank'])
 
@@ -262,42 +228,25 @@ def _relation_metric_rows(prediction_rows):
 def run_arity_study(
     data_dir,
     output_dir,
-    forward_predictions_path=None,
-    backward_predictions_path=None,
+    predictions_path=None,
     splits=('train', 'valid', 'test'),
 ):
     output_dir = Path(output_dir)
     study_dir = output_dir / 'arity_study'
     study_dir.mkdir(parents=True, exist_ok=True)
 
-    if forward_predictions_path is None:
-        forward_predictions_path = output_dir / 'predictions_test.jsonl'
-    if backward_predictions_path is None:
-        backward_predictions_path = output_dir / 'predictions_test_backward.jsonl'
+    if predictions_path is None:
+        predictions_path = output_dir / 'predictions_test.jsonl'
 
-    relation_rows, arity_by_relation, relation2id, id2relation = classify_relation_arities(
+    relation_rows, arity_by_relation, _, id2relation = classify_relation_arities(
         data_dir=data_dir,
         splits=splits,
     )
 
-    prediction_rows = []
-    prediction_rows.extend(
-        _read_predictions(
-            forward_predictions_path,
-            direction='forward',
-            id2relation=id2relation,
-            relation2id=relation2id,
-            arity_by_relation=arity_by_relation,
-        )
-    )
-    prediction_rows.extend(
-        _read_predictions(
-            backward_predictions_path,
-            direction='backward',
-            id2relation=id2relation,
-            relation2id=relation2id,
-            arity_by_relation=arity_by_relation,
-        )
+    prediction_rows = _read_predictions(
+        predictions_path,
+        id2relation=id2relation,
+        arity_by_relation=arity_by_relation,
     )
 
     if not prediction_rows:
@@ -323,19 +272,16 @@ def run_arity_study(
         ],
     )
     _write_csv(
-        study_dir / 'arity_metrics.csv',
-        metric_rows,
-        ['direction', 'arity', 'count', 'mrr', 'mr', 'hits1', 'hits3', 'hits10'],
+        study_dir / 'arity_metrics.csv', metric_rows,
+        ['arity', 'count', 'mrr', 'mr', 'hits1', 'hits3', 'hits10'],
     )
     _write_csv(
-        study_dir / 'relation_direction_metrics.csv',
+        study_dir / 'relation_metrics.csv',
         relation_metric_rows,
         [
             'relation_id',
             'relation',
-            'base_arity',
-            'direction',
-            'query_arity',
+            'arity',
             'count',
             'mrr',
             'mr',
@@ -348,20 +294,17 @@ def run_arity_study(
         study_dir / 'predictions_with_arity.csv',
         prediction_rows,
         [
-            'direction',
             'h',
             'r',
             't',
             'rank',
             'relation',
-            'base_relation_id',
-            'base_relation',
-            'base_arity',
-            'query_arity',
+            'arity',
         ],
     )
 
     summary = {
+        'evaluation_protocol': 'main',
         'data_dir': str(data_dir),
         'output_dir': str(output_dir),
         'splits_used_for_arity': list(splits),
@@ -369,7 +312,7 @@ def run_arity_study(
         'files': {
             'relation_arity': str(study_dir / 'relation_arity.csv'),
             'arity_metrics': str(study_dir / 'arity_metrics.csv'),
-            'relation_direction_metrics': str(study_dir / 'relation_direction_metrics.csv'),
+            'relation_metrics': str(study_dir / 'relation_metrics.csv'),
             'predictions_with_arity': str(study_dir / 'predictions_with_arity.csv'),
         },
     }
@@ -383,8 +326,7 @@ def main():
     parser = argparse.ArgumentParser(description='Run arity-based study from saved predictions.')
     parser.add_argument('--data_dir', required=True, help='Processed data directory.')
     parser.add_argument('--output_dir', required=True, help='Training/evaluation artifact directory.')
-    parser.add_argument('--forward_predictions', default=None, help='Path to forward prediction JSONL.')
-    parser.add_argument('--backward_predictions', default=None, help='Path to backward prediction JSONL.')
+    parser.add_argument('--predictions', default=None, help='Path to prediction JSONL.')
     parser.add_argument(
         '--splits',
         nargs='+',
@@ -396,8 +338,7 @@ def main():
     summary = run_arity_study(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
-        forward_predictions_path=args.forward_predictions,
-        backward_predictions_path=args.backward_predictions,
+        predictions_path=args.predictions,
         splits=args.splits,
     )
     print(json.dumps(summary, indent=2))

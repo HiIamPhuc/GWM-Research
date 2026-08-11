@@ -63,9 +63,9 @@ python evaluate.py \
   --output_dir output/fb15k-237
 ```
 
-Evaluation loads `best_checkpoint.pt` and reports bidirectional filtered MRR,
-MR, Hits@1, Hits@3, and Hits@10. It also writes ranked test predictions to the
-experiment directory.
+Evaluation loads `best_checkpoint.pt` and reports main-protocol filtered MRR,
+MR, Hits@1, Hits@3, and Hits@10 for the original test queries. It also writes
+ranked test predictions to the experiment directory.
 
 ## Tests
 
@@ -74,7 +74,7 @@ python -m unittest discover -s tests -v
 ```
 
 The tests cover context masking, filtered in-batch negatives, fusion gradients,
-embedding freezing, and bidirectional filtered evaluation.
+embedding freezing, and main-protocol filtered evaluation.
 
 ## Efficiency study
 

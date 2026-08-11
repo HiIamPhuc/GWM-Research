@@ -21,45 +21,6 @@ class EntityDataset(Dataset):
         }
 
 
-class TensorTripleDataset(Dataset):
-    def __init__(self, base_dataset, triples):
-        self.base_dataset = base_dataset
-        self.data_dir = base_dataset.data_dir
-        self.split = base_dataset.split
-        self.num_entities = base_dataset.num_entities
-        self.num_relations = base_dataset.num_relations
-        self.context_entity_ids = base_dataset.context_entity_ids
-        self.context_relation_ids = base_dataset.context_relation_ids
-        self.context_mask = base_dataset.context_mask
-        self.triples = torch.as_tensor(triples, dtype=torch.long)
-
-    def __len__(self):
-        return int(self.triples.size(0))
-
-    def __getitem__(self, idx):
-        h, r, t = self.triples[idx]
-        h_idx = int(h.item())
-
-        ctx_entity_ids = self.context_entity_ids[h_idx]
-        ctx_relation_ids = self.context_relation_ids[h_idx]
-        ctx_mask = self.context_mask[h_idx].clone()
-
-        target_edge = (
-            ctx_entity_ids.eq(int(t.item()))
-            & ctx_relation_ids.eq(int(r.item()))
-        )
-        ctx_mask &= ~target_edge
-
-        return {
-            'h_id': h.long(),
-            'r_id': r.long(),
-            't_id': t.long(),
-            'context_entity_ids': ctx_entity_ids.long(),
-            'context_relation_ids': ctx_relation_ids.long(),
-            'context_mask': ctx_mask.bool(),
-        }
-
-
 def load_triples_for_filtering(data_dir, splits):
     all_triples = set()
     for split in splits:
@@ -79,137 +40,6 @@ def load_hr_map_for_filtering(data_dir, fallback_splits):
             hr_map[(h, r)] = set()
         hr_map[(h, r)].add(t)
     return hr_map
-
-
-def load_inverse_relation_id_map(data_dir):
-    with open(os.path.join(data_dir, 'relation2id.json'), 'r', encoding='utf-8') as f:
-        relation2id = json.load(f)
-
-    inverse_relation_ids = {}
-    for relation, relation_id in relation2id.items():
-        inverse_relation = (
-            relation[:-4] if relation.endswith('_inv') else relation + '_inv'
-        )
-        inverse_relation_ids[int(relation_id)] = int(relation2id[inverse_relation])
-    return inverse_relation_ids
-
-
-def build_inverse_triples(triples, inverse_relation_ids):
-    triples = torch.as_tensor(triples, dtype=torch.long)
-    inverse_rows = []
-    for h, r, t in triples.tolist():
-        inverse_rows.append((t, inverse_relation_ids[int(r)], h))
-    return torch.tensor(inverse_rows, dtype=torch.long)
-
-
-def build_bidirectional_eval_dataset(base_dataset, data_dir):
-    """Build forward and backward eval datasets from original-direction triples."""
-    inverse_relation_ids = load_inverse_relation_id_map(data_dir)
-    forward_dataset = TensorTripleDataset(
-        base_dataset=base_dataset,
-        triples=base_dataset.triples,
-    )
-    backward_dataset = TensorTripleDataset(
-        base_dataset=base_dataset,
-        triples=build_inverse_triples(base_dataset.triples, inverse_relation_ids),
-    )
-    return forward_dataset, backward_dataset
-
-
-def combine_forward_backward_metrics(forward_metrics, backward_metrics):
-    combined = {}
-    for key in ('MRR', 'MR', 'Hits@1', 'Hits@3', 'Hits@10'):
-        combined[key] = 0.5 * (forward_metrics[key] + backward_metrics[key])
-    combined['count'] = forward_metrics['count'] + backward_metrics['count']
-    combined['forward'] = forward_metrics
-    combined['backward'] = backward_metrics
-
-    total = combined['count']
-    combined['micro'] = {
-        key: (
-            forward_metrics[key] * forward_metrics['count']
-            + backward_metrics[key] * backward_metrics['count']
-        ) / total
-        for key in ('MRR', 'MR', 'Hits@1', 'Hits@3', 'Hits@10')
-    }
-    combined['micro']['count'] = total
-    return combined
-
-
-def build_bidirectional_hr_map_for_filtering(data_dir, splits):
-    inverse_relation_ids = load_inverse_relation_id_map(data_dir)
-    triples = load_triples_for_filtering(data_dir, splits=splits)
-    hr_map = {}
-
-    def add_truth(h, r, t):
-        hr_map.setdefault((h, r), set()).add(t)
-
-    for h, r, t in triples:
-        add_truth(h, r, t)
-        add_truth(t, inverse_relation_ids[int(r)], h)
-
-    return hr_map
-
-
-def build_loader_like(data_loader, dataset):
-    return DataLoader(
-        dataset,
-        batch_size=data_loader.batch_size,
-        shuffle=False,
-        collate_fn=data_loader.collate_fn,
-        num_workers=data_loader.num_workers,
-        pin_memory=data_loader.pin_memory,
-    )
-
-
-def compute_bidirectional_filtered_ranking_metrics(
-    model,
-    data_loader,
-    all_entity_embeddings,
-    hr_map,
-    device,
-    desc="Bidirectional Evaluation",
-    save_predictions_path=None,
-    topk=50,
-):
-    forward_dataset, backward_dataset = build_bidirectional_eval_dataset(
-        base_dataset=data_loader.dataset,
-        data_dir=data_loader.dataset.data_dir,
-    )
-    forward_loader = build_loader_like(data_loader, forward_dataset)
-    backward_loader = build_loader_like(data_loader, backward_dataset)
-
-    forward_metrics = compute_filtered_ranking_metrics(
-        model=model,
-        data_loader=forward_loader,
-        all_entity_embeddings=all_entity_embeddings,
-        hr_map=hr_map,
-        device=device,
-        desc=f"{desc} [forward]",
-        save_predictions_path=save_predictions_path,
-        topk=topk,
-    )
-
-    backward_path = None
-    if save_predictions_path is not None:
-        root, ext = os.path.splitext(save_predictions_path)
-        backward_path = f"{root}_backward{ext}"
-
-    backward_metrics = compute_filtered_ranking_metrics(
-        model=model,
-        data_loader=backward_loader,
-        all_entity_embeddings=all_entity_embeddings,
-        hr_map=hr_map,
-        device=device,
-        desc=f"{desc} [backward]",
-        save_predictions_path=backward_path,
-        topk=topk,
-    )
-
-    return combine_forward_backward_metrics(
-        forward_metrics,
-        backward_metrics,
-    )
 
 
 def build_entity_loader(data_dir, batch_size, num_workers=2):
@@ -285,7 +115,7 @@ def compute_filtered_ranking_metrics(
     save_predictions_path=None,
     topk=50,
 ):
-    micro_state = _new_metric_state()
+    main_state = _new_metric_state()
 
     writer = None
     if save_predictions_path is not None:
@@ -338,9 +168,9 @@ def compute_filtered_ranking_metrics(
                     }
                     writer.write(json.dumps(record) + '\n')
 
-            _add_ranks_to_state(micro_state, ranks)
+            _add_ranks_to_state(main_state, ranks)
 
     if writer is not None:
         writer.close()
 
-    return _finalize_metric_state(micro_state)
+    return _finalize_metric_state(main_state)

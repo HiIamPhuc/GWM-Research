@@ -9,10 +9,7 @@ import torch
 from model.dataset import CollateFN, GWMDataset, TrainTruthIndex
 from model.model import ContextAggregator, GWM
 from studies.ablation_models import build_model
-from utils.eval import (
-    build_bidirectional_eval_dataset,
-    build_bidirectional_hr_map_for_filtering,
-)
+from utils.eval import load_hr_map_for_filtering
 
 
 def make_config():
@@ -305,22 +302,7 @@ class DatasetTests(unittest.TestCase):
                 {'id', 'rel_id', 'batch_index'},
             )
 
-    def test_bidirectional_eval_dataset_builds_inverse_queries_on_the_fly(self):
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-            self._write_data(root_path)
-            torch.save(torch.tensor([[0, 0, 1]]), root_path / 'test_triples.pt')
-
-            base_dataset = GWMDataset(root, split='test')
-            forward_dataset, backward_dataset = build_bidirectional_eval_dataset(
-                base_dataset,
-                root,
-            )
-
-            self.assertEqual(forward_dataset.triples.tolist(), [[0, 0, 1]])
-            self.assertEqual(backward_dataset.triples.tolist(), [[1, 1, 0]])
-
-    def test_bidirectional_filter_map_adds_inverse_truths(self):
+    def test_main_protocol_filter_map_uses_original_triples(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
             (root_path / 'relation2id.json').write_text(
@@ -330,14 +312,13 @@ class DatasetTests(unittest.TestCase):
             torch.save(torch.tensor([[0, 0, 2]]), root_path / 'valid_triples.pt')
             torch.save(torch.tensor([[0, 0, 1]]), root_path / 'test_triples.pt')
 
-            hr_map = build_bidirectional_hr_map_for_filtering(
-                root,
-                splits=['train', 'valid', 'test'],
+            hr_map = load_hr_map_for_filtering(
+                root, fallback_splits=['train', 'valid', 'test']
             )
 
             self.assertEqual(hr_map[(0, 0)], {1, 2})
             self.assertEqual(hr_map[(1, 1)], {0})
-            self.assertEqual(hr_map[(2, 1)], {0})
+            self.assertNotIn((2, 1), hr_map)
 
 if __name__ == '__main__':
     unittest.main()

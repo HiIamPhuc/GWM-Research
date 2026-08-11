@@ -1,6 +1,6 @@
 """Visualize GWM training logs.
 
-Current training logs contain forward validation metrics and compact
+Current training logs contain main-protocol validation metrics and compact
 GatedFusion gate means. The plotting code stays tolerant of older logs that
 may not contain gate or filtered-negative diagnostics.
 """

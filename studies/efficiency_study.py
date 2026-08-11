@@ -95,6 +95,7 @@ def benchmark(config, repeats):
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     results = {
+        'evaluation_protocol': 'main',
         'device': torch.cuda.get_device_name(device) if device.type == 'cuda' else 'cpu',
         'software': {
             'python': sys.version.split()[0],

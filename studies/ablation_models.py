@@ -1,7 +1,7 @@
 """Model factory retained for study scripts.
 
-The current experiment has one architecture only: a residual text-fused
-context-memory encoder followed by a causal state-action Transformer decoder.
+The current experiment has one architecture only: residual text-fused graph
+memory followed by a relation-conditioned Transformer decoder.
 """
 
 from model.model import GWM

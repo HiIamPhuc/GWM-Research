@@ -9,14 +9,13 @@ def load_embedding_cache(path):
 
 
 class GWM(nn.Module):
-    """Head-centered world-state encoder with a transition decoder."""
+    """Relation-conditioned next-state prediction from local graph memory."""
 
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.embedding_dim = config.struct_emb_dim
         self.temperature = config.temperature
-        self.num_next_state_slots = config.num_next_state_slots
 
         self.struct_ent_embs = nn.Embedding(
             config.num_entities,
@@ -26,35 +25,19 @@ class GWM(nn.Module):
             config.num_entities,
             config.text_emb_dim,
         )
-        self.text_rel_embs = nn.Embedding(
-            config.num_relations,
-            config.text_emb_dim,
-        )
         self.text_ent_embs.weight.requires_grad = False
-        self.text_rel_embs.weight.requires_grad = False
-        self.entity_text_projection = nn.Linear(
+        self.text_projection = nn.Linear(
             config.text_emb_dim,
             self.embedding_dim,
             bias=False,
         )
-        self.relation_text_projection = nn.Linear(
-            config.text_emb_dim,
-            self.embedding_dim,
-            bias=False,
-        )
-        self.entity_text_norm = nn.LayerNorm(self.embedding_dim)
-        self.relation_text_norm = nn.LayerNorm(self.embedding_dim)
-        self.head_fusion_gate = nn.Linear(self.embedding_dim * 3, 1)
-        self.relation_fusion_gate = nn.Linear(self.embedding_dim * 2, 1)
-        self.context_fusion_gate = nn.Linear(self.embedding_dim * 3, 1)
-        self.head_fusion_norm = nn.LayerNorm(self.embedding_dim)
-        self.relation_fusion_norm = nn.LayerNorm(self.embedding_dim)
-        self.context_text_norm = nn.LayerNorm(self.embedding_dim)
+        self.text_norm = nn.LayerNorm(self.embedding_dim)
+        self.fusion_gate = nn.Linear(self.embedding_dim * 3, 1)
+
         self.base_rel_embs = nn.Embedding(
             config.num_base_relations,
             self.embedding_dim,
         )
-        self.direction_embs = nn.Embedding(2, self.embedding_dim)
         self.inverse_adapter = nn.Linear(
             self.embedding_dim,
             self.embedding_dim,
@@ -62,36 +45,15 @@ class GWM(nn.Module):
         )
         self.relation_norm = nn.LayerNorm(self.embedding_dim)
 
-        relation_base_ids = torch.as_tensor(
-            config.relation_base_ids,
-            dtype=torch.long,
-        )
-        relation_directions = torch.as_tensor(
-            config.relation_directions,
-            dtype=torch.long,
-        )
-        self.register_buffer('relation_base_ids', relation_base_ids)
-        self.register_buffer('relation_directions', relation_directions)
         self.register_buffer(
-            'relation_slot_counts',
-            torch.as_tensor(config.relation_slot_counts, dtype=torch.long),
+            'relation_base_ids',
+            torch.as_tensor(config.relation_base_ids, dtype=torch.long),
         )
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embedding_dim,
-            nhead=config.context_encoder_heads,
-            dim_feedforward=(
-                config.context_encoder_ffn_multiplier * self.embedding_dim
-            ),
-            dropout=config.context_encoder_dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
+        self.register_buffer(
+            'relation_directions',
+            torch.as_tensor(config.relation_directions, dtype=torch.long),
         )
-        self.context_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=config.context_encoder_layers,
-            norm=nn.LayerNorm(self.embedding_dim),
-        )
+
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.embedding_dim,
             nhead=config.transition_decoder_heads,
@@ -108,158 +70,82 @@ class GWM(nn.Module):
             num_layers=config.transition_decoder_layers,
             norm=nn.LayerNorm(self.embedding_dim),
         )
-        self.next_state_projection = nn.Linear(
-            self.embedding_dim,
-            self.embedding_dim,
-            bias=False,
-        )
-        self.context_fact_norm = nn.LayerNorm(self.embedding_dim)
-        self.token_roles = nn.Embedding(3, self.embedding_dim)
-        self.next_state_tokens = nn.Parameter(
-            torch.empty(
-                1,
-                self.num_next_state_slots,
-                self.embedding_dim,
-            )
-        )
-        self.masked_head_token = nn.Parameter(
+        self.memory_roles = nn.Parameter(torch.empty(2, self.embedding_dim))
+        self.next_state_token = nn.Parameter(
             torch.empty(1, 1, self.embedding_dim)
         )
-        transition_mask = torch.ones(
-            self.num_next_state_slots + 1,
-            self.num_next_state_slots + 1,
-            dtype=torch.bool,
-        )
-        transition_mask[0, 0] = False
-        transition_mask[1, :2] = False
-        transition_mask[2:, :] = False
-        self.register_buffer('transition_mask', transition_mask, persistent=False)
-        nn.init.normal_(self.token_roles.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.next_state_tokens, mean=0.0, std=0.02)
-        nn.init.normal_(self.direction_embs.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.inverse_adapter.weight)
-        nn.init.eye_(self.next_state_projection.weight)
-        nn.init.normal_(self.masked_head_token, mean=0.0, std=0.02)
-        nn.init.zeros_(self.head_fusion_gate.weight)
-        nn.init.zeros_(self.relation_fusion_gate.weight)
-        nn.init.zeros_(self.context_fusion_gate.weight)
-        nn.init.constant_(
-            self.head_fusion_gate.bias,
-            getattr(config, 'head_text_gate_bias', -2.0),
-        )
-        nn.init.constant_(
-            self.relation_fusion_gate.bias,
-            getattr(config, 'relation_text_gate_bias', -2.5),
-        )
-        nn.init.constant_(
-            self.context_fusion_gate.bias,
-            getattr(config, 'context_text_gate_bias', -2.0),
-        )
 
-    def load_text_embeddings(self, entity_path, relation_path):
+        nn.init.zeros_(self.inverse_adapter.weight)
+        nn.init.zeros_(self.fusion_gate.weight)
+        nn.init.constant_(
+            self.fusion_gate.bias,
+            getattr(config, 'text_gate_bias', -2.0),
+        )
+        nn.init.normal_(self.memory_roles, mean=0.0, std=0.02)
+        nn.init.normal_(self.next_state_token, mean=0.0, std=0.02)
+
+    def load_text_embeddings(self, entity_path):
         with torch.no_grad():
             self.text_ent_embs.weight.copy_(load_embedding_cache(entity_path))
-            self.text_rel_embs.weight.copy_(load_embedding_cache(relation_path))
-
-    def encode_entity_text(self, entity_ids):
-        return self.entity_text_norm(
-            self.entity_text_projection(self.text_ent_embs(entity_ids))
-        )
-
-    def encode_relation_text(self, relation_ids):
-        return self.relation_text_norm(
-            self.relation_text_projection(self.text_rel_embs(relation_ids))
-        )
 
     def encode_relation(self, relation_ids):
-        base_ids = self.relation_base_ids[relation_ids]
-        directions = self.relation_directions[relation_ids]
-        base = self.base_rel_embs(base_ids)
-        relation = base + self.direction_embs(directions)
-        inverse_mask = directions.unsqueeze(-1).to(dtype=base.dtype)
-        relation = relation + inverse_mask * self.inverse_adapter(base)
+        base = self.base_rel_embs(self.relation_base_ids[relation_ids])
+        inverse_mask = self.relation_directions[relation_ids]
+        inverse_mask = inverse_mask.unsqueeze(-1).to(base.dtype)
+        relation = base + inverse_mask * self.inverse_adapter(base)
         return self.relation_norm(relation)
 
-    def fuse_relation(self, relation_ids):
-        structure = self.encode_relation(relation_ids)
-        text = self.encode_relation_text(relation_ids)
-        gate = torch.sigmoid(
-            self.relation_fusion_gate(torch.cat([structure, text], dim=-1))
+    def _fuse_entity_text(self, structure, entity_ids, query_relation):
+        text = self.text_norm(
+            self.text_projection(self.text_ent_embs(entity_ids))
         )
-        return self.relation_fusion_norm(structure + gate * text)
-
-    def fuse_head(self, entity_ids, query_relation):
-        structure = self.struct_ent_embs(entity_ids)
-        text = self.encode_entity_text(entity_ids)
-        if query_relation is None:
-            query_relation = torch.zeros_like(structure)
         gate = torch.sigmoid(
-            self.head_fusion_gate(
+            self.fusion_gate(
                 torch.cat([structure, text, query_relation], dim=-1)
             )
         )
-        return self.head_fusion_norm(structure + gate * text)
+        return structure + gate * text
 
-    def encode_world_state(
-        self,
-        h_batch,
-        context_batch,
-        query_relation=None,
-        mask_head=False,
-    ):
-        entity_ids = context_batch['id']
-        relation_ids = context_batch['rel_id']
+    def build_world_memory(self, h_batch, context_batch, query_relation):
         context_mask = context_batch['mask'].bool()
+        entity_ids = context_batch['id'].masked_fill(~context_mask, 0)
+        relation_ids = context_batch['rel_id'].masked_fill(~context_mask, 0)
 
-        if mask_head:
-            head_token = self.masked_head_token.expand(
-                entity_ids.size(0),
-                -1,
-                -1,
-            ).squeeze(1)
-        else:
-            head_token = self.fuse_head(h_batch['id'], query_relation)
-        head_token = head_token + self.token_roles.weight[0]
-        safe_entity_ids = entity_ids.masked_fill(~context_mask, 0)
-        safe_relation_ids = relation_ids.masked_fill(~context_mask, 0)
-        context_entities = self.struct_ent_embs(safe_entity_ids)
-        context_relations = self.encode_relation(safe_relation_ids)
-        structural_facts = context_entities + context_relations
-        textual_facts = self.context_text_norm(
-            self.encode_entity_text(safe_entity_ids)
-            + self.encode_relation_text(safe_relation_ids)
+        head_structure = self.struct_ent_embs(h_batch['id'])
+        head = self._fuse_entity_text(
+            head_structure,
+            h_batch['id'],
+            query_relation,
         )
-        if query_relation is None:
-            query_relation = torch.zeros_like(head_token)
+
+        context_structure = (
+            self.struct_ent_embs(entity_ids)
+            + self.encode_relation(relation_ids)
+        )
         context_condition = query_relation.unsqueeze(1).expand_as(
-            structural_facts
+            context_structure
         )
-        context_gate = torch.sigmoid(
-            self.context_fusion_gate(
-                torch.cat(
-                    [structural_facts, textual_facts, context_condition],
-                    dim=-1,
-                )
-            )
+        context_facts = self._fuse_entity_text(
+            context_structure,
+            entity_ids,
+            context_condition,
         )
-        fact_tokens = self.context_fact_norm(
-            structural_facts + context_gate * textual_facts
-        )
-        fact_tokens = fact_tokens + self.token_roles.weight[1]
-        fact_tokens = fact_tokens.masked_fill(
+        context_facts = context_facts.masked_fill(
             ~context_mask.unsqueeze(-1),
             0.0,
         )
 
-        batch_size = entity_ids.size(0)
-        memory_tokens = torch.cat(
-            [head_token.unsqueeze(1), fact_tokens],
+        memory = torch.cat(
+            [
+                (head + self.memory_roles[0]).unsqueeze(1),
+                context_facts + self.memory_roles[1],
+            ],
             dim=1,
         )
         memory_padding_mask = torch.cat(
             [
                 torch.zeros(
-                    batch_size,
+                    context_mask.size(0),
                     1,
                     dtype=torch.bool,
                     device=context_mask.device,
@@ -268,121 +154,46 @@ class GWM(nn.Module):
             ],
             dim=1,
         )
-        memory = self.context_encoder(
-            memory_tokens,
-            src_key_padding_mask=memory_padding_mask,
-        )
         return memory, memory_padding_mask
 
-    def encode_masked_world_state(self, h_batch, context_batch):
-        memory, _ = self.encode_world_state(
-            h_batch,
-            context_batch,
-            mask_head=True,
-        )
-        return F.normalize(memory[:, 0], p=2, dim=-1)
-
     def encode_query(self, h_batch, r_batch, context_batch):
-        relation_ids = r_batch['id']
-        relation = self.fuse_relation(relation_ids)
-        slot_counts = self.relation_slot_counts[relation_ids]
-        active_slots = (
-            torch.arange(
-                self.num_next_state_slots,
-                device=relation.device,
-            ).unsqueeze(0)
-            < slot_counts.unsqueeze(1)
-        )
-        mixture_log_weights = torch.where(
-            active_slots,
-            -slot_counts.to(relation.dtype).log().unsqueeze(1),
-            relation.new_full((), float('-inf')),
-        )
-        relation_token = relation + self.token_roles.weight[2]
-        memory, memory_padding_mask = self.encode_world_state(
+        relation = self.encode_relation(r_batch['id'])
+        memory, memory_padding_mask = self.build_world_memory(
             h_batch,
             context_batch,
-            query_relation=relation,
+            relation,
         )
-        next_state_tokens = self.next_state_tokens.expand(
-            relation_token.size(0),
-            -1,
-            -1,
-        )
-        transition_tokens = torch.cat(
-            [relation_token.unsqueeze(1), next_state_tokens],
-            dim=1,
-        )
-        decoded = self.transition_decoder(
-            tgt=transition_tokens,
+        transition_query = self.next_state_token + relation.unsqueeze(1)
+        next_state = self.transition_decoder(
+            tgt=transition_query,
             memory=memory,
-            tgt_mask=self.transition_mask,
             memory_key_padding_mask=memory_padding_mask,
-        )
-        decoded_states = decoded[:, 1:]
-        next_states = self.next_state_projection(decoded_states)
-        return (
-            F.normalize(next_states, p=2, dim=-1),
-            mixture_log_weights,
-        )
+        )[:, 0]
+        return F.normalize(next_state, p=2, dim=-1)
 
     def forward(self, h_batch, r_batch, context_batch):
         return self.encode_query(h_batch, r_batch, context_batch)
 
     def encode_target(self, t_batch):
-        target = self.struct_ent_embs(t_batch['id'])
-        return F.normalize(target, p=2, dim=-1)
-
-    def score_candidates(
-        self,
-        query_slots,
-        mixture_log_weights,
-        candidate_vectors,
-    ):
-        component_logits = torch.einsum(
-            'bkd,nd->bkn',
-            query_slots,
-            candidate_vectors,
-        ) / self.temperature
-        return torch.logsumexp(
-            component_logits + mixture_log_weights.unsqueeze(-1),
-            dim=1,
+        return F.normalize(
+            self.struct_ent_embs(t_batch['id']),
+            p=2,
+            dim=-1,
         )
 
-    def compute_loss(
-        self,
-        query_slots,
-        mixture_log_weights,
-        target_ids,
-    ):
-        candidate_vectors = F.normalize(
+    def score_candidates(self, query, candidates):
+        return torch.mm(query, candidates.t()) / self.temperature
+
+    def compute_loss(self, query, target_ids):
+        candidates = F.normalize(
             self.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
-        scores = self.score_candidates(
-            query_slots,
-            mixture_log_weights,
-            candidate_vectors,
+        return F.cross_entropy(
+            self.score_candidates(query, candidates),
+            target_ids,
         )
-        return F.cross_entropy(scores, target_ids)
-
-    def compute_state_reconstruction_loss(
-        self,
-        reconstructed_states,
-        entity_ids,
-    ):
-        candidate_vectors = F.normalize(
-            self.struct_ent_embs.weight,
-            p=2,
-            dim=-1,
-        )
-        scores = torch.mm(
-            reconstructed_states,
-            candidate_vectors.t(),
-        )
-        scores = scores / self.temperature
-        return F.cross_entropy(scores, entity_ids)
 
     def score_all_entities(
         self,
@@ -391,21 +202,12 @@ class GWM(nn.Module):
         context_batch,
         candidate_vectors=None,
     ):
-        query_slots, mixture_log_weights = self.encode_query(
-            h_batch,
-            r_batch,
-            context_batch,
-        )
+        query = self.encode_query(h_batch, r_batch, context_batch)
         if candidate_vectors is None:
             entity_ids = torch.arange(
                 self.config.num_entities,
-                device=query_slots.device,
+                device=query.device,
                 dtype=torch.long,
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
-
-        return self.score_candidates(
-            query_slots,
-            mixture_log_weights,
-            candidate_vectors,
-        )
+        return self.score_candidates(query, candidate_vectors)

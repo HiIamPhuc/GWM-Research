@@ -28,15 +28,11 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 
 ARCHITECTURE = (
-    'head_centered_world_state_transformer_'
-    'residual_text_query_and_context_fusion_'
-    'hard_arity_conditioned_spherical_next_state_slots_'
-    'masked_reconstruction'
+    'minimal_head_centered_world_memory_'
+    'residual_entity_text_fusion_'
+    'relation_conditioned_transition_decoder'
 )
-TRAINING_OBJECTIVE = (
-    'triple_level_full_entity_cross_entropy_with_arity_slots_and_'
-    'masked_state_reconstruction'
-)
+TRAINING_OBJECTIVE = 'triple_level_full_entity_cross_entropy'
 
 
 def get_config(args):
@@ -111,7 +107,6 @@ def train(args):
     model = GWM(config)
     model.load_text_embeddings(
         os.path.join(config.data_dir, 'entity_text_embeddings.pt'),
-        os.path.join(config.data_dir, 'relation_text_embeddings.pt'),
     )
     model = model.to(device)
     print("Loaded frozen text embeddings for residual fusion.")
@@ -147,14 +142,18 @@ def train(args):
         f"Loaded {len(train_dataset)} triples and "
         f"{relation_mapping['num_base_relations']} shared relations."
     )
-    slot_summary = {
-        slot_count: relation_mapping['slot_counts'].count(slot_count)
-        for slot_count in sorted(set(relation_mapping['slot_counts']))
-    }
-    print(f"Relation slot counts: {slot_summary}")
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameter_count = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
     training_config = vars(config).copy()
-    training_config['model_parameters'] = parameter_count
+    training_config['model_parameters'] = {
+        'total': parameter_count,
+        'trainable': trainable_parameter_count,
+        'frozen': parameter_count - trainable_parameter_count,
+    }
     training_config['architecture'] = ARCHITECTURE
     training_config['training_objective'] = TRAINING_OBJECTIVE
     training_config['cli_args'] = vars(args)
@@ -187,11 +186,6 @@ def train(args):
         epoch_start = time.perf_counter()
         model.train()
         total_loss = 0.0
-        total_kg_loss = 0.0
-        total_state_loss = 0.0
-        state_examples = 0
-        effective_slot_sum = torch.zeros((), device=device)
-        routed_query_count = 0
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
         optimizer.zero_grad()
@@ -201,48 +195,14 @@ def train(args):
             target_ids = batch['t_batch']['id'].to(device)
             context_batch = {key: value.to(device) for key, value in batch['context_batch'].items()}
 
-            query_slots, mixture_log_weights = model(
+            query = model(
                 h_batch,
                 r_batch,
                 context_batch,
             )
-            kg_loss = model.compute_loss(
-                query_slots,
-                mixture_log_weights,
+            loss = model.compute_loss(
+                query,
                 target_ids,
-            )
-            effective_slot_sum += torch.isfinite(
-                mixture_log_weights
-            ).sum(dim=-1).sum()
-            routed_query_count += mixture_log_weights.size(0)
-
-            eligible = context_batch['mask'].any(dim=1)
-            reconstruct = (
-                torch.rand(eligible.size(0), device=device)
-                < config.state_reconstruction_ratio
-            ) & eligible
-            state_loss = kg_loss.new_zeros(())
-            selected_count = int(reconstruct.sum().item())
-            if selected_count:
-                state_h_batch = {
-                    'id': h_batch['id'][reconstruct],
-                }
-                state_context_batch = {
-                    key: value[reconstruct]
-                    for key, value in context_batch.items()
-                }
-                reconstructed_heads = model.encode_masked_world_state(
-                    state_h_batch,
-                    state_context_batch,
-                )
-                state_loss = model.compute_state_reconstruction_loss(
-                    reconstructed_heads,
-                    state_h_batch['id'],
-                )
-
-            loss = (
-                kg_loss
-                + config.state_reconstruction_weight * state_loss
             )
             accumulation_group_start = (
                 step // config.gradient_accumulation_steps
@@ -267,30 +227,13 @@ def train(args):
                 optimizer.zero_grad()
 
             total_loss += loss.item()
-            total_kg_loss += kg_loss.item()
-            total_state_loss += state_loss.item() * selected_count
-            state_examples += selected_count
-            progress.set_postfix(
-                loss=loss.item(),
-                state=state_loss.item(),
-            )
+            progress.set_postfix(loss=loss.item())
 
         sync_device(device)
         train_seconds = time.perf_counter() - epoch_start
         train_loss = total_loss / len(train_loader)
-        train_kg_loss = total_kg_loss / len(train_loader)
-        train_state_loss = (
-            total_state_loss / state_examples
-            if state_examples else 0.0
-        )
-        train_effective_slots = (
-            effective_slot_sum / routed_query_count
-        ).item()
         print(
             f"Epoch {epoch + 1} Train Loss: {train_loss:.4f} | "
-            f"KGC: {train_kg_loss:.4f} | "
-            f"State: {train_state_loss:.4f} | "
-            f"Effective Slots: {train_effective_slots:.3f} | "
             f"Train Time: {train_seconds:.2f}s"
         )
 
@@ -320,9 +263,6 @@ def train(args):
         history.append({
             'epoch': epoch + 1,
             'train_loss': train_loss,
-            'train_kg_loss': train_kg_loss,
-            'train_state_loss': train_state_loss,
-            'train_effective_slots': train_effective_slots,
             'val_mrr': micro['MRR'],
             'val_mr': micro['MR'],
             'val_hits1': micro['Hits@1'],

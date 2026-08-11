@@ -290,20 +290,15 @@ def triples_to_ids(triples, entity2id, relation2id, add_inverse=False):
             ids.append((t_id, r_inv_id, h_id))
     return torch.tensor(ids, dtype=torch.long)
 
-def precompute_text_embeddings(
+def precompute_entity_text_embeddings(
     entity_text_dict,
-    relation_text_dict,
     num_entities,
-    num_relations,
     pretrained_model='bert-base-uncased',
     batch_size=128,
     max_entity_length=256,
-    max_relation_length=64,
     device=None,
 ):
-    """
-    Encode entity/relation text once and return dense embedding tensors.
-    """
+    """Encode entity descriptions once for residual semantic fusion."""
     from transformers import AutoModel, AutoTokenizer
 
     if device is None:
@@ -332,27 +327,21 @@ def precompute_text_embeddings(
                 all_emb.append(outputs.last_hidden_state[:, 0, :].detach().cpu())
         return torch.cat(all_emb, dim=0).contiguous()
 
-    entity_embeddings = encode_ordered_texts(
+    embeddings = encode_ordered_texts(
         entity_text_dict,
         num_entities,
         max_entity_length,
         desc='Encoding entity text',
-    )
-    relation_embeddings = encode_ordered_texts(
-        relation_text_dict,
-        num_relations,
-        max_relation_length,
-        desc='Encoding relation text',
     )
 
     del text_encoder
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return entity_embeddings, relation_embeddings
+    return embeddings
 
 
-def precompute_and_save_text_embeddings(
+def precompute_and_save_entity_text_embeddings(
     data_dir,
     output_dir,
     dataset_name,
@@ -361,31 +350,30 @@ def precompute_and_save_text_embeddings(
     pretrained_model='bert-base-uncased',
     text_batch_size=128,
     max_entity_length=256,
-    max_relation_length=64,
     text_device=None,
 ):
-    """Optional text preprocessing retained for future experiments."""
+    """Build and cache frozen entity-description embeddings."""
     dataset_key = dataset_name.lower()
     if 'fb15k' in dataset_key:
-        entity_text, relation_text = process_text_fb15k237(
+        entity_text, _ = process_text_fb15k237(
             data_dir,
             entity2id,
             relation2id,
         )
     elif 'wn18' in dataset_key:
-        entity_text, relation_text = process_text_wn18rr(
+        entity_text, _ = process_text_wn18rr(
             data_dir,
             entity2id,
             relation2id,
         )
     elif 'nell' in dataset_key:
-        entity_text, relation_text = process_text_nell995(
+        entity_text, _ = process_text_nell995(
             data_dir,
             entity2id,
             relation2id,
         )
     elif 'umls' in dataset_key:
-        entity_text, relation_text = process_text_umls(
+        entity_text, _ = process_text_umls(
             data_dir,
             entity2id,
             relation2id,
@@ -396,18 +384,12 @@ def precompute_and_save_text_embeddings(
     output_dir = Path(output_dir)
     with open(output_dir / 'entity_text.json', 'w') as f:
         json.dump(entity_text, f, indent=2)
-    with open(output_dir / 'relation_text.json', 'w') as f:
-        json.dump(relation_text, f, indent=2)
-
-    entity_embeddings, relation_embeddings = precompute_text_embeddings(
+    entity_embeddings = precompute_entity_text_embeddings(
         entity_text_dict=entity_text,
-        relation_text_dict=relation_text,
         num_entities=len(entity2id),
-        num_relations=len(relation2id),
         pretrained_model=pretrained_model,
         batch_size=text_batch_size,
         max_entity_length=max_entity_length,
-        max_relation_length=max_relation_length,
         device=text_device,
     )
     torch.save(
@@ -417,14 +399,6 @@ def precompute_and_save_text_embeddings(
             'embedding_dim': entity_embeddings.size(1),
         },
         output_dir / 'entity_text_embeddings.pt',
-    )
-    torch.save(
-        {
-            'embeddings': relation_embeddings,
-            'model_name': pretrained_model,
-            'embedding_dim': relation_embeddings.size(1),
-        },
-        output_dir / 'relation_text_embeddings.pt',
     )
 
 
@@ -483,7 +457,7 @@ def process_dataset(
     torch.save(valid_tensor, out_path / 'valid_triples.pt')
     torch.save(test_tensor, out_path / 'test_triples.pt')
 
-    precompute_and_save_text_embeddings(
+    precompute_and_save_entity_text_embeddings(
         data_dir,
         out_path,
         dataset_name,

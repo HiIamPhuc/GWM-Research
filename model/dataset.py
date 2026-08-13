@@ -58,9 +58,10 @@ class GWMDataset(Dataset):
 
     def __getitem__(self, index):
         head, relation, tail = self.triples[index]
-        context_entities = self.context_entity_ids[head]
-        context_relations = self.context_relation_ids[head]
-        context_mask = self.context_mask[head].clone()
+        head_index = int(head.item())
+        context_entities = self.context_entity_ids[head_index]
+        context_relations = self.context_relation_ids[head_index]
+        context_mask = self.context_mask[head_index].clone()
         answer_edge = context_entities.eq(tail) & context_relations.eq(relation)
 
         return {

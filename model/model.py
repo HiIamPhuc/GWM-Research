@@ -155,10 +155,8 @@ class GWM(nn.Module):
             context_batch['rel_id']
         )
 
-        self._record_gates(
-            torch.cat([head_gate, context_entity_gate]),
-            torch.cat([relation_gate, context_relation_gate]),
-        )
+        self._record_gates(head_gate, relation_gate)
+        self._record_gates(context_entity_gate, context_relation_gate)
         world_state = self.fused_context_aggregator(
             head,
             context_entities,

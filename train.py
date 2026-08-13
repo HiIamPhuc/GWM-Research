@@ -27,6 +27,9 @@ def save_config(config, model):
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     values = vars(config) | {
         'validation_protocol': 'main',
+        'deterministic_training': True,
+        'pytorch_version': torch.__version__,
+        'cuda_version': torch.version.cuda,
         'model_parameters': {
             'total': total,
             'trainable': trainable,
@@ -86,7 +89,6 @@ def train(config):
     os.makedirs(config.output_dir, exist_ok=True)
     seed_everything(config.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
 
     collate = CollateFN()
     train_dataset = GWMDataset(config.data_dir, 'train')

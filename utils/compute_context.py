@@ -17,7 +17,6 @@ class ContextProcessor:
         self.relation2id = json.load(open(os.path.join(data_dir, 'relation2id.json')))
         
     def _load_precomputed_embeddings(self):
-        """Load precomputed text embeddings from cache files."""
         print("Loading precomputed text embeddings...")
         
         entity_emb_path = os.path.join(self.data_dir, 'entity_text_embeddings.pt')
@@ -45,7 +44,6 @@ class ContextProcessor:
         return embeddings
         
     def _compute_embeddings(self, batch_size=32):
-        """Load precomputed embeddings for all entities."""
         embeddings = self._load_precomputed_embeddings()
         return embeddings
 

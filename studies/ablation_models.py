@@ -4,7 +4,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.model import ContextAggregator, GWM, MLPAdapter, load_embedding_cache
+from model.model import ContextAggregator, GWM, MLPAdapter
+
+
+def load_embedding_cache(path):
+    cache = torch.load(path, map_location='cpu')
+    return cache['embeddings'] if isinstance(cache, dict) else cache
 
 
 def build_model(config):
@@ -19,21 +24,29 @@ def build_model(config):
 
 
 class NoContextGWM(GWM):
-    """Full model with the neighborhood world state removed."""
-
     def forward(self, h_batch, r_batch, context_batch):
-        self._last_gate_stats = {}
-        head, head_gate = self._fuse_entity(h_batch['id'])
-        relation, relation_gate = self._fuse_relation(r_batch['id'])
-        self._record_gates(head_gate, relation_gate)
+        self.reset_gate_stats()
+        h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
+        r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
+        h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
+        r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
+        head, head_gate = self.entity_fusion(h_text, h_struct)
+        relation, relation_gate = self.relation_fusion(r_text, r_struct)
+        self._record_gate_stats('entity_gate', head_gate)
+        self._record_gate_stats('relation_gate', relation_gate)
         world_state = self.fused_context_aggregator.norm(head)
-        query = self._run_transition(world_state, head, relation)
+        query = self._run_dynamics(
+            world_state,
+            head,
+            relation,
+            self.fused_lstm,
+            self.fused_h0_projection,
+            self.fused_c0_projection,
+        )
         return F.normalize(self.fused_output_projection(query), dim=-1)
 
 
 class MLPTransitionGWM(GWM):
-    """Replace the recurrent transition with a parameter-matched MLP."""
-
     def __init__(self, config):
         super().__init__(config)
         dim = config.fusion_dim
@@ -58,7 +71,7 @@ class MLPTransitionGWM(GWM):
             nn.Linear(hidden_dim, dim),
         )
 
-    def _run_transition(self, world_state, head, relation):
+    def _run_dynamics(self, world_state, head, relation, lstm, h0_proj, c0_proj):
         return self.mlp_transition(torch.cat([world_state, head, relation], dim=-1))
 
 
@@ -74,7 +87,11 @@ class SingleModalityGWM(nn.Module):
 
         self.ent_embs = nn.Embedding(config.num_entities, embedding_dim)
         self.rel_embs = nn.Embedding(config.num_relations, embedding_dim)
-        self.adapter = MLPAdapter(embedding_dim, config.adapter_dropout)
+        self.adapter = MLPAdapter(
+            embedding_dim,
+            embedding_dim,
+            dropout=config.adapter_dropout,
+        )
         self.input_projection = nn.Linear(embedding_dim, config.fusion_dim)
         self.context_aggregator = ContextAggregator(config.fusion_dim)
         self.h0_projection = nn.Linear(config.fusion_dim, config.fusion_dim)
@@ -114,10 +131,10 @@ class SingleModalityGWM(nn.Module):
         context_entities = self._encode_entities(context_batch['id'])
         context_relations = self._encode_relations(context_batch['rel_id'])
         world_state = self.context_aggregator(
-            head,
-            context_entities,
-            context_relations,
-            context_batch['batch_index'],
+            head_feat=head,
+            nbr_entity_feat=context_entities,
+            nbr_relation_feat=context_relations,
+            nbr_batch_index=context_batch['batch_index'],
         )
         query = self._run_transition(world_state, head, relation)
         return F.normalize(self.output_projection(query), dim=-1)

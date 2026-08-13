@@ -1,34 +1,45 @@
+import torch
+from torch.utils.data import Dataset
 import json
 import os
 
-import torch
-from torch.utils.data import Dataset
-
 
 class TrainTruthIndex:
-    """Known training tails used to filter false in-batch negatives."""
-
     def __init__(self, train_triples):
+        train_triples = torch.as_tensor(train_triples, dtype=torch.long)
         self.query_tails = {}
         for h, r, t in train_triples.tolist():
             self.query_tails.setdefault((h, r), set()).add(t)
 
     def build_in_batch_truth_mask(
-        self, head_ids, relation_ids, candidate_tail_ids, device=None
+        self,
+        head_ids,
+        relation_ids,
+        candidate_tail_ids,
+        device=None,
     ):
-        heads = head_ids.tolist()
-        relations = relation_ids.tolist()
-        tails = candidate_tail_ids.tolist()
-        tail_columns = {}
-        for column, tail in enumerate(tails):
-            tail_columns.setdefault(tail, []).append(column)
+        head_ids = torch.as_tensor(head_ids, dtype=torch.long).reshape(-1).cpu()
+        relation_ids = torch.as_tensor(relation_ids, dtype=torch.long).reshape(-1).cpu()
+        candidate_tail_ids = torch.as_tensor(candidate_tail_ids, dtype=torch.long).reshape(-1).cpu()
 
-        mask = torch.zeros(len(heads), len(tails), dtype=torch.bool)
-        for row, query in enumerate(zip(heads, relations)):
-            for tail in self.query_tails.get(query, ()):
-                mask[row, tail_columns.get(tail, [])] = True
-        mask.fill_diagonal_(True)
-        return mask.to(device) if device is not None else mask
+        batch_size = head_ids.numel()
+        candidate_columns = {}
+        for column, tail_id in enumerate(candidate_tail_ids.tolist()):
+            candidate_columns.setdefault(tail_id, []).append(column)
+
+        truth_mask = torch.zeros(batch_size, batch_size, dtype=torch.bool)
+        for row, (head_id, relation_id) in enumerate(
+            zip(head_ids.tolist(), relation_ids.tolist())
+        ):
+            for tail_id in self.query_tails.get((head_id, relation_id), ()):
+                columns = candidate_columns.get(tail_id)
+                if columns:
+                    truth_mask[row, columns] = True
+
+        truth_mask.fill_diagonal_(True)
+        if device is not None:
+            truth_mask = truth_mask.to(device)
+        return truth_mask
 
 
 class GWMDataset(Dataset):
@@ -36,78 +47,80 @@ class GWMDataset(Dataset):
         self.data_dir = data_dir
         self.split = split
 
-        with open(os.path.join(data_dir, 'entity2id.json'), encoding='utf-8') as file:
-            self.num_entities = len(json.load(file))
-        with open(os.path.join(data_dir, 'relation2id.json'), encoding='utf-8') as file:
-            self.num_relations = len(json.load(file))
-
-        self.triples = torch.load(
-            os.path.join(data_dir, f'{split}_triples.pt'),
-            map_location='cpu',
-        ).long()
-        context = torch.load(
-            os.path.join(data_dir, 'context_neighbors.pt'),
-            map_location='cpu',
-        )
-        self.context_entity_ids = context['entity_ids'].long()
-        self.context_relation_ids = context['relation_ids'].long()
-        self.context_mask = context['mask'].bool()
+        with open(os.path.join(data_dir, 'entity2id.json'), 'r', encoding='utf-8') as f:
+            self.num_entities = len(json.load(f))
+        with open(os.path.join(data_dir, 'relation2id.json'), 'r', encoding='utf-8') as f:
+            self.num_relations = len(json.load(f))
+        
+        triples_path = os.path.join(data_dir, f'{split}_triples.pt')
+        self.triples = torch.load(triples_path, map_location='cpu').long()
+        context_pack_path = os.path.join(data_dir, 'context_neighbors.pt')
+        context_pack = torch.load(context_pack_path, map_location='cpu')
+        self.context_entity_ids = context_pack['entity_ids'].long()
+        self.context_relation_ids = context_pack['relation_ids'].long()
+        self.context_mask = context_pack['mask'].bool()
 
     def __len__(self):
         return len(self.triples)
+        
+    def __getitem__(self, idx):
+        h, r, t = self.triples[idx]
+        h_idx = int(h.item())
 
-    def __getitem__(self, index):
-        head, relation, tail = self.triples[index]
-        head_index = int(head.item())
-        context_entities = self.context_entity_ids[head_index]
-        context_relations = self.context_relation_ids[head_index]
-        context_mask = self.context_mask[head_index].clone()
-        answer_edge = context_entities.eq(tail) & context_relations.eq(relation)
+        ctx_entity_ids = self.context_entity_ids[h_idx]
+        ctx_relation_ids = self.context_relation_ids[h_idx]
+        ctx_mask = self.context_mask[h_idx].clone()
+        target_edge = ctx_entity_ids.eq(t) & ctx_relation_ids.eq(r)
+        ctx_mask &= ~target_edge
 
         return {
-            'h_id': head,
-            'r_id': relation,
-            't_id': tail,
-            'context_entity_ids': context_entities,
-            'context_relation_ids': context_relations,
-            'context_mask': context_mask & ~answer_edge,
+            'h_id': h.long(),
+            'r_id': r.long(),
+            't_id': t.long(),
+            'context_entity_ids': ctx_entity_ids.long(),
+            'context_relation_ids': ctx_relation_ids.long(),
+            'context_mask': ctx_mask.bool(),
         }
-
 
 class CollateFN:
     def __call__(self, batch):
-        heads = torch.stack([item['h_id'] for item in batch])
-        relations = torch.stack([item['r_id'] for item in batch])
-        tails = torch.stack([item['t_id'] for item in batch])
+        h_ids = torch.stack([b['h_id'] for b in batch])
+        r_ids = torch.stack([b['r_id'] for b in batch])
+        t_ids = torch.stack([b['t_id'] for b in batch])
 
-        entity_chunks = []
-        relation_chunks = []
-        batch_chunks = []
-        for batch_index, item in enumerate(batch):
-            mask = item['context_mask']
-            entities = item['context_entity_ids'][mask]
-            context_relations = item['context_relation_ids'][mask]
-            if entities.numel():
-                entity_chunks.append(entities)
-                relation_chunks.append(context_relations)
-                batch_chunks.append(torch.full_like(entities, batch_index))
+        # Build ragged context representation: flattened edges + edge->sample index.
+        context_entity_chunks = []
+        context_relation_chunks = []
+        context_batch_chunks = []
+        for sample_idx, item in enumerate(batch):
+            ent_ids = item['context_entity_ids']
+            rel_ids = item['context_relation_ids']
+            mask = item['context_mask'].bool()
 
-        if entity_chunks:
-            context_entities = torch.cat(entity_chunks)
-            context_relations = torch.cat(relation_chunks)
-            context_batch = torch.cat(batch_chunks)
+            valid_ent = ent_ids[mask]
+            valid_rel = rel_ids[mask]
+
+            if valid_ent.numel() > 0:
+                context_entity_chunks.append(valid_ent.long())
+                context_relation_chunks.append(valid_rel.long())
+                context_batch_chunks.append(torch.full((valid_ent.numel(),), sample_idx, dtype=torch.long))
+
+        if context_entity_chunks:
+            context_entity_ids = torch.cat(context_entity_chunks, dim=0)
+            context_relation_ids = torch.cat(context_relation_chunks, dim=0)
+            context_batch_index = torch.cat(context_batch_chunks, dim=0)
         else:
-            context_entities = torch.empty(0, dtype=torch.long)
-            context_relations = torch.empty(0, dtype=torch.long)
-            context_batch = torch.empty(0, dtype=torch.long)
-
+            context_entity_ids = torch.zeros(0, dtype=torch.long)
+            context_relation_ids = torch.zeros(0, dtype=torch.long)
+            context_batch_index = torch.zeros(0, dtype=torch.long)
+        
         return {
-            'h_batch': {'id': heads},
-            'r_batch': {'id': relations},
-            't_batch': {'id': tails},
+            'h_batch': {'id': h_ids},
+            'r_batch': {'id': r_ids},
+            't_batch': {'id': t_ids},
             'context_batch': {
-                'id': context_entities,
-                'rel_id': context_relations,
-                'batch_index': context_batch,
+                'id': context_entity_ids,
+                'rel_id': context_relation_ids,
+                'batch_index': context_batch_index,
             },
         }

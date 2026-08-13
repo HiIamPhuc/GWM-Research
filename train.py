@@ -75,7 +75,10 @@ def make_scheduler(optimizer, config, steps_per_epoch):
 
 def move_batch(batch, device):
     return {
-        name: {key: value.to(device) for key, value in values.items()}
+        name: {
+            key: value.to(device, non_blocking=True)
+            for key, value in values.items()
+        }
         for name, values in batch.items()
     }
 
@@ -155,8 +158,7 @@ def train(config):
                 cpu_batch['h_batch']['id'],
                 cpu_batch['r_batch']['id'],
                 cpu_batch['t_batch']['id'],
-                device=device,
-            )
+            ).to(device)
             batch = move_batch(cpu_batch, device)
             optimizer.zero_grad(set_to_none=True)
             query = model(batch['h_batch'], batch['r_batch'], batch['context_batch'])

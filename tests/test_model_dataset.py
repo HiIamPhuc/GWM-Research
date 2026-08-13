@@ -19,6 +19,8 @@ def make_config():
         text_emb_dim=6,
         struct_emb_dim=4,
         fusion_dim=10,
+        text_adapter_dim=6,
+        struct_adapter_dim=4,
         dynamics_layers=1,
         dropout=0.0,
         adapter_dropout=0.0,
@@ -76,7 +78,7 @@ class ModelTests(unittest.TestCase):
             torch.save(torch.randn(4, 6), entity_path)
             torch.save(torch.randn(4, 6), relation_path)
             model = GWM(make_config())
-            model.load_text_embeddings(entity_path, relation_path)
+            model.load_text_embeddings(str(entity_path), str(relation_path))
             self.assertFalse(model.text_ent_embs.weight.requires_grad)
             self.assertFalse(model.text_rel_embs.weight.requires_grad)
             self.assertTrue(model.struct_ent_embs.weight.requires_grad)
@@ -90,10 +92,10 @@ class ModelTests(unittest.TestCase):
     def test_isolated_head_preserves_self_state(self):
         layer = ContextAggregator(hidden_dim=4)
         output = layer(
-            head=torch.randn(2, 4),
-            context_entities=torch.empty(0, 4),
-            context_relations=torch.empty(0, 4),
-            batch_index=torch.empty(0, dtype=torch.long),
+            head_feat=torch.randn(2, 4),
+            nbr_entity_feat=torch.empty(0, 4),
+            nbr_relation_feat=torch.empty(0, 4),
+            nbr_batch_index=torch.empty(0, dtype=torch.long),
         )
         self.assertEqual(output.shape, (2, 4))
         self.assertTrue(torch.isfinite(output).all())

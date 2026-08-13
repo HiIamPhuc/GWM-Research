@@ -7,7 +7,6 @@ import re
 from transformers import AutoModel, AutoTokenizer
 
 def load_triples(file_path):
-    """Load triples from a text file."""
     triples = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -16,7 +15,6 @@ def load_triples(file_path):
     return triples
 
 def load_counted_id_map(file_path):
-    """Load files with first-line count followed by token<TAB>id rows."""
     token_to_id = {}
     id_to_token = {}
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -127,7 +125,6 @@ def load_umls_dataset(data_dir, add_inverse=True):
     return train_triples, valid_triples, test_triples, entity2id, relation2id
 
 def create_vocabularies(train_triples, valid_triples, test_triples, add_inverse=True):
-    """Create entity and relation mappings."""
     entities = set()
     relations = set()
     
@@ -337,9 +334,6 @@ def precompute_text_embeddings(
     max_relation_length=64,
     device=None,
 ):
-    """
-    Encode entity/relation text once and return dense embedding tensors.
-    """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.model import ContextAggregator, GWM, MLPAdapter
+from model.model import ContextAggregator, GWM
 
 
 def load_embedding_cache(path):
@@ -26,10 +26,10 @@ def build_model(config):
 class NoContextGWM(GWM):
     def forward(self, h_batch, r_batch, context_batch):
         self.reset_gate_stats()
-        h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
-        r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
-        h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
-        r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
+        h_text = self.text_ent_embs(h_batch['id'])
+        r_text = self.text_rel_embs(r_batch['id'])
+        h_struct = self.struct_ent_embs(h_batch['id'])
+        r_struct = self.struct_rel_embs(r_batch['id'])
         head, head_gate = self.entity_fusion(h_text, h_struct)
         relation, relation_gate = self.relation_fusion(r_text, r_struct)
         self._record_gate_stats('entity_gate', head_gate)
@@ -39,9 +39,6 @@ class NoContextGWM(GWM):
             world_state,
             head,
             relation,
-            self.fused_lstm,
-            self.fused_h0_projection,
-            self.fused_c0_projection,
         )
         return F.normalize(self.fused_output_projection(query), dim=-1)
 
@@ -71,7 +68,7 @@ class MLPTransitionGWM(GWM):
             nn.Linear(hidden_dim, dim),
         )
 
-    def _run_dynamics(self, world_state, head, relation, lstm, h0_proj, c0_proj):
+    def _run_dynamics(self, world_state, head, relation):
         return self.mlp_transition(torch.cat([world_state, head, relation], dim=-1))
 
 
@@ -87,11 +84,6 @@ class SingleModalityGWM(nn.Module):
 
         self.ent_embs = nn.Embedding(config.num_entities, embedding_dim)
         self.rel_embs = nn.Embedding(config.num_relations, embedding_dim)
-        self.adapter = MLPAdapter(
-            embedding_dim,
-            embedding_dim,
-            dropout=config.adapter_dropout,
-        )
         self.input_projection = nn.Linear(embedding_dim, config.fusion_dim)
         self.context_aggregator = ContextAggregator(config.fusion_dim)
         self.h0_projection = nn.Linear(config.fusion_dim, config.fusion_dim)
@@ -109,10 +101,10 @@ class SingleModalityGWM(nn.Module):
         return {}
 
     def _encode_entities(self, ids):
-        return self.input_projection(self.adapter(self.ent_embs(ids)))
+        return self.input_projection(self.ent_embs(ids))
 
     def _encode_relations(self, ids):
-        return self.input_projection(self.adapter(self.rel_embs(ids)))
+        return self.input_projection(self.rel_embs(ids))
 
     def _run_transition(self, world_state, head, relation):
         h0 = torch.tanh(self.h0_projection(world_state))

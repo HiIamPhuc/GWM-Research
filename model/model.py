@@ -31,25 +31,6 @@ class ContextAggregator(nn.Module):
         return self.norm(head_feat + agg)
 
 
-class MLPAdapter(nn.Module):
-    def __init__(self, in_dim, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.norm = nn.LayerNorm(in_dim)
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, in_dim)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return residual + x
-
-
 class GatedFusion(nn.Module):
     def __init__(self, text_dim, struct_dim, fusion_dim, dropout=0.0):
         super().__init__()
@@ -79,28 +60,16 @@ class GWM(nn.Module):
         super().__init__()
         self.config = config
         self.dropout = float(getattr(config, 'dropout'))
-        self.adapter_dropout = float(getattr(config, 'adapter_dropout', self.dropout))
 
         # 1. Text Components (Entity/Relation Embeddings)
         self.text_emb_dim = int(getattr(config, 'text_emb_dim'))
         self.text_ent_embs = nn.Embedding(config.num_entities, self.text_emb_dim)
         self.text_rel_embs = nn.Embedding(config.num_relations, self.text_emb_dim)
 
-        self.text_adapter = MLPAdapter(self.text_emb_dim,
-            self.text_emb_dim,
-            dropout=self.adapter_dropout
-            )
-
         # 2. Structural Components (Entity/Relation Embeddings)
         self.struct_emb_dim = int(getattr(config, 'struct_emb_dim'))
         self.struct_ent_embs = nn.Embedding(config.num_entities, self.struct_emb_dim)
         self.struct_rel_embs = nn.Embedding(config.num_relations, self.struct_emb_dim)
-
-        self.struct_adapter = MLPAdapter(
-            self.struct_emb_dim, 
-            self.struct_emb_dim,
-            dropout=self.adapter_dropout
-            )
 
         # 3. Early Fusion and Shared Dynamics
         self.fusion_dim = int(getattr(config, 'fusion_dim'))
@@ -159,17 +128,20 @@ class GWM(nn.Module):
         )
 
     # def _run_dynamics(self, world_state, head_emb, relation_emb, mixer, lstm, h0_proj, c0_proj):
-    def _run_dynamics(self, world_state, head_emb, relation_emb, lstm, h0_proj, c0_proj):
-        h_0 = torch.tanh(h0_proj(world_state))
-        c_0 = torch.tanh(c0_proj(world_state))
+    def _run_dynamics(self, world_state, head_emb, relation_emb):
+        h_0 = torch.tanh(self.fused_h0_projection(world_state))
+        c_0 = torch.tanh(self.fused_c0_projection(world_state))
 
         # Prepare initial LSTM states
-        num_layers = lstm.num_layers
+        num_layers = self.fused_lstm.num_layers
         h_0_lstm = h_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
         c_0_lstm = c_0.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
 
         # Run LSTM over the sequence
-        _, (h_n, _) = lstm(torch.stack([head_emb, relation_emb], dim=1), (h_0_lstm, c_0_lstm))
+        _, (h_n, _) = self.fused_lstm(
+            torch.stack([head_emb, relation_emb], dim=1),
+            (h_0_lstm, c_0_lstm),
+        )
         query_vector = h_n[-1]
         return query_vector
 
@@ -231,20 +203,20 @@ class GWM(nn.Module):
 
     def forward(self, h_batch, r_batch, context_batch):
         self.reset_gate_stats()
-        h_text = self.text_adapter(self.text_ent_embs(h_batch['id']))
-        r_text = self.text_adapter(self.text_rel_embs(r_batch['id']))
-        h_struct = self.struct_adapter(self.struct_ent_embs(h_batch['id']))
-        r_struct = self.struct_adapter(self.struct_rel_embs(r_batch['id']))
+        h_text = self.text_ent_embs(h_batch['id'])
+        r_text = self.text_rel_embs(r_batch['id'])
+        h_struct = self.struct_ent_embs(h_batch['id'])
+        r_struct = self.struct_rel_embs(r_batch['id'])
         h_fused, h_gate = self.entity_fusion(h_text, h_struct)
         r_fused, r_gate = self.relation_fusion(r_text, r_struct)
         self._record_gate_stats('entity_gate', h_gate)
         self._record_gate_stats('relation_gate', r_gate)
 
         flat_context_entity_ids, flat_context_relation_ids, context_batch_index = self._prepare_context_batch(context_batch)
-        ctx_ent_text = self.text_adapter(self.text_ent_embs(flat_context_entity_ids))
-        ctx_rel_text = self.text_adapter(self.text_rel_embs(flat_context_relation_ids))
-        ctx_ent_struct = self.struct_adapter(self.struct_ent_embs(flat_context_entity_ids))
-        ctx_rel_struct = self.struct_adapter(self.struct_rel_embs(flat_context_relation_ids))
+        ctx_ent_text = self.text_ent_embs(flat_context_entity_ids)
+        ctx_rel_text = self.text_rel_embs(flat_context_relation_ids)
+        ctx_ent_struct = self.struct_ent_embs(flat_context_entity_ids)
+        ctx_rel_struct = self.struct_rel_embs(flat_context_relation_ids)
         ctx_ent_fused, ctx_ent_gate = self.entity_fusion(ctx_ent_text, ctx_ent_struct)
         ctx_rel_fused, ctx_rel_gate = self.relation_fusion(ctx_rel_text, ctx_rel_struct)
         self._record_gate_stats('entity_gate', ctx_ent_gate)
@@ -260,15 +232,12 @@ class GWM(nn.Module):
             world_state,
             h_fused,
             r_fused,
-            self.fused_lstm,
-            self.fused_h0_projection,
-            self.fused_c0_projection,
         )
         return F.normalize(self.fused_output_projection(query), p=2, dim=1)
 
     def encode_target(self, t_batch):
-        t_text = self.text_adapter(self.text_ent_embs(t_batch['id']))
-        t_struct = self.struct_adapter(self.struct_ent_embs(t_batch['id']))
+        t_text = self.text_ent_embs(t_batch['id'])
+        t_struct = self.struct_ent_embs(t_batch['id'])
         t_fused, t_gate = self.entity_fusion(t_text, t_struct)
         self._record_gate_stats('entity_gate', t_gate)
         return F.normalize(

@@ -26,8 +26,6 @@ def save_config(config, model):
     total = sum(parameter.numel() for parameter in model.parameters())
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     values = vars(config) | {
-        'validation_protocol': 'main',
-        'deterministic_training': True,
         'pytorch_version': torch.__version__,
         'cuda_version': torch.version.cuda,
         'model_parameters': {

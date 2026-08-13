@@ -7,7 +7,6 @@ text_emb_dim: 768
 struct_emb_dim: 128
 fusion_dim: 896
 dynamics_layers: 1
-adapter_dropout: 0.1
 dropout: 0.2
 temperature: 0.07
 

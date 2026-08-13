@@ -19,11 +19,8 @@ def make_config():
         text_emb_dim=6,
         struct_emb_dim=4,
         fusion_dim=10,
-        text_adapter_dim=6,
-        struct_adapter_dim=4,
         dynamics_layers=1,
         dropout=0.0,
-        adapter_dropout=0.0,
         temperature=0.1,
     )
 
@@ -70,6 +67,17 @@ class ModelTests(unittest.TestCase):
             parameter.numel() for parameter in mlp.mlp_transition.parameters()
         )
         self.assertLess(abs(mlp_count - recurrent_count) / recurrent_count, 0.02)
+
+        query = mlp(
+            {'id': torch.tensor([0, 1])},
+            {'id': torch.tensor([0, 1])},
+            {
+                'id': torch.tensor([1, 2]),
+                'rel_id': torch.tensor([0, 1]),
+                'batch_index': torch.tensor([0, 1]),
+            },
+        )
+        self.assertEqual(query.shape, (2, config.fusion_dim))
 
     def test_text_embedding_load_and_freeze_targets_text_tables(self):
         with tempfile.TemporaryDirectory() as root:

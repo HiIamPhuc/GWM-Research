@@ -73,6 +73,8 @@ class GatedFusion(nn.Module):
 
 
 class GWM(nn.Module):
+    requires_text_embeddings = True
+
     def __init__(self, config):
         super().__init__()
         self.config = config

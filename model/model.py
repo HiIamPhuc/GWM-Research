@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +18,7 @@ class GWM(nn.Module):
         self.config = config
         self.embedding_dim = config.struct_emb_dim
         self.temperature = config.temperature
+        self.complex_residual_weight = config.complex_residual_weight
 
         self.struct_ent_embs = nn.Embedding(
             config.num_entities,
@@ -181,17 +184,34 @@ class GWM(nn.Module):
             dim=-1,
         )
 
-    def score_candidates(self, query, candidates):
-        return torch.mm(query, candidates.t()) / self.temperature
+    def complex_scores(self, h_ids, r_ids, candidates):
+        head = F.normalize(self.struct_ent_embs(h_ids), p=2, dim=-1)
+        relation = F.normalize(self.encode_relation(r_ids), p=2, dim=-1)
+        head_real, head_imag = head.chunk(2, dim=-1)
+        relation_real, relation_imag = relation.chunk(2, dim=-1)
+        tail_real, tail_imag = candidates.chunk(2, dim=-1)
 
-    def compute_loss(self, query, target_ids):
+        real = head_real * relation_real - head_imag * relation_imag
+        imag = head_real * relation_imag + head_imag * relation_real
+        scores = torch.mm(real, tail_real.t()) + torch.mm(imag, tail_imag.t())
+        return scores * math.sqrt(self.embedding_dim)
+
+    def score_candidates(self, query, candidates, h_ids, r_ids):
+        dot_scores = torch.mm(query, candidates.t())
+        complex_scores = self.complex_scores(h_ids, r_ids, candidates)
+        return (
+            dot_scores
+            + self.complex_residual_weight * complex_scores
+        ) / self.temperature
+
+    def compute_loss(self, query, h_ids, r_ids, target_ids):
         candidates = F.normalize(
             self.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
         return F.cross_entropy(
-            self.score_candidates(query, candidates),
+            self.score_candidates(query, candidates, h_ids, r_ids),
             target_ids,
         )
 
@@ -210,4 +230,9 @@ class GWM(nn.Module):
                 dtype=torch.long,
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
-        return self.score_candidates(query, candidate_vectors)
+        return self.score_candidates(
+            query,
+            candidate_vectors,
+            h_batch['id'],
+            r_batch['id'],
+        )

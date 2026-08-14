@@ -30,7 +30,8 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 ARCHITECTURE = (
     'minimal_head_centered_world_memory_'
     'residual_entity_text_fusion_'
-    'relation_conditioned_transition_decoder'
+    'relation_conditioned_transition_decoder_'
+    'complex_residual_readout'
 )
 TRAINING_OBJECTIVE = 'triple_level_full_entity_cross_entropy'
 
@@ -202,6 +203,8 @@ def train(args):
             )
             loss = model.compute_loss(
                 query,
+                h_batch['id'],
+                r_batch['id'],
                 target_ids,
             )
             accumulation_group_start = (

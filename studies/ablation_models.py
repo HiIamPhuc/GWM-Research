@@ -1,8 +1,4 @@
-"""Model factory retained for study scripts.
-
-The current experiment has one architecture only: residual text-fused graph
-memory followed by a relation-conditioned Transformer decoder.
-"""
+"""Model factory retained for study scripts."""
 
 from model.model import GWM
 

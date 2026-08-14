@@ -1,7 +1,5 @@
-# Minimal GWM with a parameter-free ComplEx residual readout
+# Structural-only GWM with a parameter-free ComplEx residual readout
 struct_emb_dim: 768
-text_emb_dim: 768
-text_gate_bias: -2.0
 transition_decoder_heads: 8
 transition_decoder_ffn_multiplier: 4
 transition_decoder_dropout: 0.1
@@ -23,5 +21,5 @@ candidate_batch_size: 2048
 gradient_accumulation_steps: 1
 
 data_dir: data-processed/fb15k-237
-output_dir: output/fb15k-237-complex-residual
+output_dir: output/fb15k-237-structural-complex-residual
 seed: 42

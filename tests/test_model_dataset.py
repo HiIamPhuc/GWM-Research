@@ -30,8 +30,6 @@ def make_config():
         relation_base_ids=[0, 0, 1, 1],
         relation_directions=[0, 1, 0, 1],
         struct_emb_dim=4,
-        text_emb_dim=6,
-        text_gate_bias=-2.0,
         transition_decoder_layers=2,
         transition_decoder_heads=2,
         transition_decoder_ffn_multiplier=3,
@@ -56,10 +54,6 @@ class ModelTests(unittest.TestCase):
             set(dict(model.named_children())),
             {
                 'struct_ent_embs',
-                'text_ent_embs',
-                'text_projection',
-                'text_norm',
-                'fusion_gate',
                 'base_rel_embs',
                 'inverse_adapter',
                 'relation_norm',
@@ -68,23 +62,11 @@ class ModelTests(unittest.TestCase):
         )
         self.assertEqual(tuple(model.memory_roles.shape), (2, 4))
         self.assertEqual(tuple(model.next_state_token.shape), (1, 1, 4))
-        self.assertFalse(model.text_ent_embs.weight.requires_grad)
-        self.assertFalse(hasattr(model, 'text_rel_embs'))
+        self.assertFalse(hasattr(model, 'text_ent_embs'))
         self.assertFalse(hasattr(model, 'context_encoder'))
         self.assertFalse(hasattr(model, 'next_state_projection'))
         self.assertFalse(hasattr(model, 'masked_head_token'))
         self.assertFalse(hasattr(model, 'transition_mask'))
-
-    def test_entity_text_cache_loads_into_frozen_table(self):
-        model = GWM(make_config())
-        embeddings = torch.arange(24, dtype=torch.float).view(4, 6)
-        with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / 'entities.pt'
-            torch.save({'embeddings': embeddings}, path)
-            model.load_text_embeddings(path)
-
-        self.assertTrue(torch.equal(model.text_ent_embs.weight, embeddings))
-        self.assertFalse(model.text_ent_embs.weight.requires_grad)
 
     def test_decoder_uses_one_relation_conditioned_query_and_raw_memory(self):
         model = GWM(make_config())
@@ -107,7 +89,6 @@ class ModelTests(unittest.TestCase):
         memory, _ = model.build_world_memory(
             {'id': h_ids},
             make_context_batch(),
-            relation,
         )
         expected_query = model.next_state_token + relation.unsqueeze(1)
         self.assertTrue(torch.allclose(captured['query'], expected_query))
@@ -151,9 +132,6 @@ class ModelTests(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(model.struct_ent_embs.weight.grad)
-        self.assertIsNone(model.text_ent_embs.weight.grad)
-        self.assertIsNotNone(model.text_projection.weight.grad)
-        self.assertIsNotNone(model.fusion_gate.weight.grad)
         self.assertIsNotNone(model.base_rel_embs.weight.grad)
         self.assertIsNotNone(model.inverse_adapter.weight.grad)
         self.assertIsNotNone(model.memory_roles.grad)

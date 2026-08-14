@@ -5,11 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def load_embedding_cache(path):
-    cache = torch.load(path, map_location='cpu')
-    return cache['embeddings'] if isinstance(cache, dict) else cache
-
-
 class GWM(nn.Module):
     """Relation-conditioned next-state prediction from local graph memory."""
 
@@ -24,18 +19,6 @@ class GWM(nn.Module):
             config.num_entities,
             self.embedding_dim,
         )
-        self.text_ent_embs = nn.Embedding(
-            config.num_entities,
-            config.text_emb_dim,
-        )
-        self.text_ent_embs.weight.requires_grad = False
-        self.text_projection = nn.Linear(
-            config.text_emb_dim,
-            self.embedding_dim,
-            bias=False,
-        )
-        self.text_norm = nn.LayerNorm(self.embedding_dim)
-        self.fusion_gate = nn.Linear(self.embedding_dim * 3, 1)
 
         self.base_rel_embs = nn.Embedding(
             config.num_base_relations,
@@ -79,17 +62,8 @@ class GWM(nn.Module):
         )
 
         nn.init.zeros_(self.inverse_adapter.weight)
-        nn.init.zeros_(self.fusion_gate.weight)
-        nn.init.constant_(
-            self.fusion_gate.bias,
-            getattr(config, 'text_gate_bias', -2.0),
-        )
         nn.init.normal_(self.memory_roles, mean=0.0, std=0.02)
         nn.init.normal_(self.next_state_token, mean=0.0, std=0.02)
-
-    def load_text_embeddings(self, entity_path):
-        with torch.no_grad():
-            self.text_ent_embs.weight.copy_(load_embedding_cache(entity_path))
 
     def encode_relation(self, relation_ids):
         base = self.base_rel_embs(self.relation_base_ids[relation_ids])
@@ -98,40 +72,15 @@ class GWM(nn.Module):
         relation = base + inverse_mask * self.inverse_adapter(base)
         return self.relation_norm(relation)
 
-    def _fuse_entity_text(self, structure, entity_ids, query_relation):
-        text = self.text_norm(
-            self.text_projection(self.text_ent_embs(entity_ids))
-        )
-        gate = torch.sigmoid(
-            self.fusion_gate(
-                torch.cat([structure, text, query_relation], dim=-1)
-            )
-        )
-        return structure + gate * text
-
-    def build_world_memory(self, h_batch, context_batch, query_relation):
+    def build_world_memory(self, h_batch, context_batch):
         context_mask = context_batch['mask'].bool()
         entity_ids = context_batch['id'].masked_fill(~context_mask, 0)
         relation_ids = context_batch['rel_id'].masked_fill(~context_mask, 0)
 
-        head_structure = self.struct_ent_embs(h_batch['id'])
-        head = self._fuse_entity_text(
-            head_structure,
-            h_batch['id'],
-            query_relation,
-        )
-
-        context_structure = (
+        head = self.struct_ent_embs(h_batch['id'])
+        context_facts = (
             self.struct_ent_embs(entity_ids)
             + self.encode_relation(relation_ids)
-        )
-        context_condition = query_relation.unsqueeze(1).expand_as(
-            context_structure
-        )
-        context_facts = self._fuse_entity_text(
-            context_structure,
-            entity_ids,
-            context_condition,
         )
         context_facts = context_facts.masked_fill(
             ~context_mask.unsqueeze(-1),
@@ -164,7 +113,6 @@ class GWM(nn.Module):
         memory, memory_padding_mask = self.build_world_memory(
             h_batch,
             context_batch,
-            relation,
         )
         transition_query = self.next_state_token + relation.unsqueeze(1)
         next_state = self.transition_decoder(

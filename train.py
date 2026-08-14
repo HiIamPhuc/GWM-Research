@@ -29,7 +29,7 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 ARCHITECTURE = (
     'minimal_head_centered_world_memory_'
-    'residual_entity_text_fusion_'
+    'structural_only_'
     'relation_conditioned_transition_decoder_'
     'complex_residual_readout'
 )
@@ -106,11 +106,8 @@ def train(args):
 
     print("Initializing model...")
     model = GWM(config)
-    model.load_text_embeddings(
-        os.path.join(config.data_dir, 'entity_text_embeddings.pt'),
-    )
     model = model.to(device)
-    print("Loaded frozen text embeddings for residual fusion.")
+    print("Using trainable structural entity and relation embeddings.")
     collate_fn = CollateFN()
     train_loader = DataLoader(
         train_dataset,

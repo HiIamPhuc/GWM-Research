@@ -30,12 +30,13 @@ def make_config():
         relation_base_ids=[0, 0, 1, 1],
         relation_directions=[0, 1, 0, 1],
         struct_emb_dim=4,
+        text_emb_dim=6,
+        text_gate_bias=-2.0,
         transition_decoder_layers=2,
         transition_decoder_heads=2,
         transition_decoder_ffn_multiplier=3,
         transition_decoder_dropout=0.0,
         temperature=0.07,
-        complex_residual_weight=0.1,
     )
 
 
@@ -54,6 +55,10 @@ class ModelTests(unittest.TestCase):
             set(dict(model.named_children())),
             {
                 'struct_ent_embs',
+                'text_ent_embs',
+                'text_projection',
+                'text_norm',
+                'fusion_gate',
                 'base_rel_embs',
                 'inverse_adapter',
                 'relation_norm',
@@ -62,11 +67,23 @@ class ModelTests(unittest.TestCase):
         )
         self.assertEqual(tuple(model.memory_roles.shape), (2, 4))
         self.assertEqual(tuple(model.next_state_token.shape), (1, 1, 4))
-        self.assertFalse(hasattr(model, 'text_ent_embs'))
+        self.assertFalse(model.text_ent_embs.weight.requires_grad)
+        self.assertFalse(hasattr(model, 'text_rel_embs'))
         self.assertFalse(hasattr(model, 'context_encoder'))
         self.assertFalse(hasattr(model, 'next_state_projection'))
         self.assertFalse(hasattr(model, 'masked_head_token'))
         self.assertFalse(hasattr(model, 'transition_mask'))
+
+    def test_entity_text_cache_loads_into_frozen_table(self):
+        model = GWM(make_config())
+        embeddings = torch.arange(24, dtype=torch.float).view(4, 6)
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'entities.pt'
+            torch.save({'embeddings': embeddings}, path)
+            model.load_text_embeddings(path)
+
+        self.assertTrue(torch.equal(model.text_ent_embs.weight, embeddings))
+        self.assertFalse(model.text_ent_embs.weight.requires_grad)
 
     def test_decoder_uses_one_relation_conditioned_query_and_raw_memory(self):
         model = GWM(make_config())
@@ -89,6 +106,7 @@ class ModelTests(unittest.TestCase):
         memory, _ = model.build_world_memory(
             {'id': h_ids},
             make_context_batch(),
+            relation,
         )
         expected_query = model.next_state_token + relation.unsqueeze(1)
         self.assertTrue(torch.allclose(captured['query'], expected_query))
@@ -122,16 +140,14 @@ class ModelTests(unittest.TestCase):
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
         )
-        loss = model.compute_loss(
-            query,
-            torch.tensor([0, 1]),
-            torch.tensor([0, 1]),
-            torch.tensor([2, 3]),
-        )
+        loss = model.compute_loss(query, torch.tensor([2, 3]))
         loss.backward()
 
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(model.struct_ent_embs.weight.grad)
+        self.assertIsNone(model.text_ent_embs.weight.grad)
+        self.assertIsNotNone(model.text_projection.weight.grad)
+        self.assertIsNotNone(model.fusion_gate.weight.grad)
         self.assertIsNotNone(model.base_rel_embs.weight.grad)
         self.assertIsNotNone(model.inverse_adapter.weight.grad)
         self.assertIsNotNone(model.memory_roles.grad)
@@ -173,50 +189,21 @@ class ModelTests(unittest.TestCase):
         expected = F.normalize(model.struct_ent_embs(ids), p=2, dim=-1)
         self.assertTrue(torch.allclose(actual, expected))
 
-    def test_loss_is_full_entity_cross_entropy_with_complex_residual(self):
+    def test_loss_is_full_entity_cross_entropy(self):
         model = GWM(make_config())
         query = F.normalize(
             torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
             p=2,
             dim=-1,
         )
-        h_ids = torch.tensor([0])
-        r_ids = torch.tensor([1])
         target_ids = torch.tensor([2])
-        actual = model.compute_loss(query, h_ids, r_ids, target_ids)
+        actual = model.compute_loss(query, target_ids)
         candidates = F.normalize(model.struct_ent_embs.weight, p=2, dim=-1)
-        dot_scores = torch.mm(query, candidates.t())
-        complex_scores = model.complex_scores(h_ids, r_ids, candidates)
         expected = F.cross_entropy(
-            (
-                dot_scores
-                + model.complex_residual_weight * complex_scores
-            ) / model.temperature,
+            torch.mm(query, candidates.t()) / model.temperature,
             target_ids,
         )
         self.assertTrue(torch.allclose(actual, expected))
-
-    def test_complex_residual_is_asymmetric(self):
-        model = GWM(make_config())
-        model.relation_norm = torch.nn.Identity()
-        with torch.no_grad():
-            model.struct_ent_embs.weight.zero_()
-            model.struct_ent_embs.weight[0, 0] = 1.0
-            model.struct_ent_embs.weight[1, 2] = 1.0
-            model.base_rel_embs.weight.zero_()
-            model.base_rel_embs.weight[0, 2] = 1.0
-        candidates = F.normalize(model.struct_ent_embs.weight, p=2, dim=-1)
-        forward = model.complex_scores(
-            torch.tensor([0]),
-            torch.tensor([0]),
-            candidates,
-        )[0, 1]
-        reversed_score = model.complex_scores(
-            torch.tensor([1]),
-            torch.tensor([0]),
-            candidates,
-        )[0, 0]
-        self.assertFalse(torch.allclose(forward, reversed_score))
 
     def test_scorer_scores_every_entity(self):
         model = GWM(make_config())

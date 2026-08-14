@@ -1,5 +1,5 @@
 # Minimal GWM with a parameter-free ComplEx residual readout
-struct_emb_dim: 512
+struct_emb_dim: 768
 text_emb_dim: 768
 text_gate_bias: -2.0
 transition_decoder_heads: 8
@@ -7,7 +7,7 @@ transition_decoder_ffn_multiplier: 4
 transition_decoder_dropout: 0.1
 transition_decoder_layers: 2
 temperature: 0.07
-complex_residual_weight: 0.1
+complex_residual_weight: 0.2
 
 learning_rate: 0.005
 weight_decay: 0.01

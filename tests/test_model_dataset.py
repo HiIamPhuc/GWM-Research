@@ -30,8 +30,6 @@ def make_config():
         relation_base_ids=[0, 0, 1, 1],
         relation_directions=[0, 1, 0, 1],
         struct_emb_dim=4,
-        text_emb_dim=6,
-        text_gate_bias=-2.0,
         transition_decoder_layers=2,
         transition_decoder_heads=2,
         transition_decoder_ffn_multiplier=3,
@@ -55,35 +53,21 @@ class ModelTests(unittest.TestCase):
             set(dict(model.named_children())),
             {
                 'struct_ent_embs',
-                'text_ent_embs',
-                'text_projection',
-                'text_norm',
-                'fusion_gate',
-                'base_rel_embs',
-                'inverse_adapter',
+                'base_rel_head_embs',
+                'base_rel_tail_embs',
                 'relation_norm',
+                'state_norm',
                 'transition_decoder',
             },
         )
         self.assertEqual(tuple(model.memory_roles.shape), (2, 4))
         self.assertEqual(tuple(model.next_state_token.shape), (1, 1, 4))
-        self.assertFalse(model.text_ent_embs.weight.requires_grad)
+        self.assertFalse(hasattr(model, 'text_ent_embs'))
         self.assertFalse(hasattr(model, 'text_rel_embs'))
         self.assertFalse(hasattr(model, 'context_encoder'))
         self.assertFalse(hasattr(model, 'next_state_projection'))
         self.assertFalse(hasattr(model, 'masked_head_token'))
         self.assertFalse(hasattr(model, 'transition_mask'))
-
-    def test_entity_text_cache_loads_into_frozen_table(self):
-        model = GWM(make_config())
-        embeddings = torch.arange(24, dtype=torch.float).view(4, 6)
-        with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / 'entities.pt'
-            torch.save({'embeddings': embeddings}, path)
-            model.load_text_embeddings(path)
-
-        self.assertTrue(torch.equal(model.text_ent_embs.weight, embeddings))
-        self.assertFalse(model.text_ent_embs.weight.requires_grad)
 
     def test_decoder_uses_one_relation_conditioned_query_and_raw_memory(self):
         model = GWM(make_config())
@@ -102,11 +86,12 @@ class ModelTests(unittest.TestCase):
         model({'id': h_ids}, {'id': r_ids}, make_context_batch())
         handle.remove()
 
+        head_role, _ = model.encode_relation_roles(r_ids)
         relation = model.encode_relation(r_ids)
         memory, _ = model.build_world_memory(
             {'id': h_ids},
             make_context_batch(),
-            relation,
+            head_role,
         )
         expected_query = model.next_state_token + relation.unsqueeze(1)
         self.assertTrue(torch.allclose(captured['query'], expected_query))
@@ -140,36 +125,32 @@ class ModelTests(unittest.TestCase):
             {'id': torch.tensor([0, 1])},
             make_context_batch(),
         )
-        loss = model.compute_loss(query, torch.tensor([2, 3]))
+        relation_ids = torch.tensor([0, 1])
+        loss = model.compute_loss(
+            query,
+            relation_ids,
+            torch.tensor([2, 3]),
+        )
         loss.backward()
 
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(model.struct_ent_embs.weight.grad)
-        self.assertIsNone(model.text_ent_embs.weight.grad)
-        self.assertIsNotNone(model.text_projection.weight.grad)
-        self.assertIsNotNone(model.fusion_gate.weight.grad)
-        self.assertIsNotNone(model.base_rel_embs.weight.grad)
-        self.assertIsNotNone(model.inverse_adapter.weight.grad)
+        self.assertIsNotNone(model.base_rel_head_embs.weight.grad)
+        self.assertIsNotNone(model.base_rel_tail_embs.weight.grad)
         self.assertIsNotNone(model.memory_roles.grad)
         self.assertIsNotNone(model.next_state_token.grad)
         self.assertIsNotNone(
             model.transition_decoder.layers[0].multihead_attn.in_proj_weight.grad
         )
 
-    def test_inverse_relation_is_a_transform_of_shared_base(self):
+    def test_inverse_relation_exactly_swaps_pairre_roles(self):
         model = GWM(make_config())
         self.assertEqual(model.relation_base_ids[[0, 1]].tolist(), [0, 0])
-        with torch.no_grad():
-            model.inverse_adapter.weight.zero_()
-            model.inverse_adapter.weight[0, 1] = 0.2
-
-        relation_vectors = model.encode_relation(torch.tensor([0, 1]))
-        self.assertFalse(torch.allclose(relation_vectors[0], relation_vectors[1]))
-        relation_vectors.sum().backward()
-        self.assertGreater(
-            model.base_rel_embs.weight.grad[0].abs().sum().item(),
-            0.0,
+        head_roles, tail_roles = model.encode_relation_roles(
+            torch.tensor([0, 1])
         )
+        self.assertTrue(torch.equal(head_roles[0], tail_roles[1]))
+        self.assertTrue(torch.equal(tail_roles[0], head_roles[1]))
 
     def test_relation_mapping_does_not_assume_contiguous_pairs(self):
         mapping = build_relation_direction_mapping({
@@ -196,13 +177,33 @@ class ModelTests(unittest.TestCase):
             p=2,
             dim=-1,
         )
+        relation_ids = torch.tensor([0])
         target_ids = torch.tensor([2])
-        actual = model.compute_loss(query, target_ids)
+        actual = model.compute_loss(query, relation_ids, target_ids)
         candidates = F.normalize(model.struct_ent_embs.weight, p=2, dim=-1)
+        _, tail_roles = model.encode_relation_roles(relation_ids)
         expected = F.cross_entropy(
-            torch.mm(query, candidates.t()) / model.temperature,
+            model.score_candidates(query, candidates, tail_roles),
             target_ids,
         )
+        self.assertTrue(torch.allclose(actual, expected))
+
+    def test_pairre_scores_match_explicit_squared_distance(self):
+        model = GWM(make_config())
+        query = torch.tensor([[0.5, -0.5, 0.5, -0.5]])
+        candidates = F.normalize(
+            torch.tensor(
+                [[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]]
+            ),
+            p=2,
+            dim=-1,
+        )
+        tail_roles = torch.tensor([[1.0, 0.5, -1.0, 2.0]])
+        actual = model.score_candidates(query, candidates, tail_roles)
+        expected = -(
+            query.unsqueeze(1)
+            - candidates.unsqueeze(0) * tail_roles.unsqueeze(1)
+        ).square().sum(dim=-1) / model.temperature
         self.assertTrue(torch.allclose(actual, expected))
 
     def test_scorer_scores_every_entity(self):

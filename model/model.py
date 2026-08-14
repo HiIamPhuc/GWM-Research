@@ -3,13 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def load_embedding_cache(path):
-    cache = torch.load(path, map_location='cpu')
-    return cache['embeddings'] if isinstance(cache, dict) else cache
-
-
 class GWM(nn.Module):
-    """Relation-conditioned next-state prediction from local graph memory."""
+    """PairRE-conditioned next-state prediction from local graph memory."""
 
     def __init__(self, config):
         super().__init__()
@@ -21,29 +16,16 @@ class GWM(nn.Module):
             config.num_entities,
             self.embedding_dim,
         )
-        self.text_ent_embs = nn.Embedding(
-            config.num_entities,
-            config.text_emb_dim,
-        )
-        self.text_ent_embs.weight.requires_grad = False
-        self.text_projection = nn.Linear(
-            config.text_emb_dim,
-            self.embedding_dim,
-            bias=False,
-        )
-        self.text_norm = nn.LayerNorm(self.embedding_dim)
-        self.fusion_gate = nn.Linear(self.embedding_dim * 3, 1)
-
-        self.base_rel_embs = nn.Embedding(
+        self.base_rel_head_embs = nn.Embedding(
             config.num_base_relations,
             self.embedding_dim,
         )
-        self.inverse_adapter = nn.Linear(
+        self.base_rel_tail_embs = nn.Embedding(
+            config.num_base_relations,
             self.embedding_dim,
-            self.embedding_dim,
-            bias=False,
         )
         self.relation_norm = nn.LayerNorm(self.embedding_dim)
+        self.state_norm = nn.LayerNorm(self.embedding_dim)
 
         self.register_buffer(
             'relation_base_ids',
@@ -75,60 +57,42 @@ class GWM(nn.Module):
             torch.empty(1, 1, self.embedding_dim)
         )
 
-        nn.init.zeros_(self.inverse_adapter.weight)
-        nn.init.zeros_(self.fusion_gate.weight)
-        nn.init.constant_(
-            self.fusion_gate.bias,
-            getattr(config, 'text_gate_bias', -2.0),
-        )
         nn.init.normal_(self.memory_roles, mean=0.0, std=0.02)
         nn.init.normal_(self.next_state_token, mean=0.0, std=0.02)
 
-    def load_text_embeddings(self, entity_path):
-        with torch.no_grad():
-            self.text_ent_embs.weight.copy_(load_embedding_cache(entity_path))
+    def encode_relation_roles(self, relation_ids):
+        base_ids = self.relation_base_ids[relation_ids]
+        forward_head = self.base_rel_head_embs(base_ids)
+        forward_tail = self.base_rel_tail_embs(base_ids)
+        inverse = self.relation_directions[relation_ids].bool().unsqueeze(-1)
+        head_role = torch.where(inverse, forward_tail, forward_head)
+        tail_role = torch.where(inverse, forward_head, forward_tail)
+        return head_role, tail_role
 
     def encode_relation(self, relation_ids):
-        base = self.base_rel_embs(self.relation_base_ids[relation_ids])
-        inverse_mask = self.relation_directions[relation_ids]
-        inverse_mask = inverse_mask.unsqueeze(-1).to(base.dtype)
-        relation = base + inverse_mask * self.inverse_adapter(base)
-        return self.relation_norm(relation)
+        head_role, tail_role = self.encode_relation_roles(relation_ids)
+        return self.relation_norm(head_role - tail_role)
 
-    def _fuse_entity_text(self, structure, entity_ids, query_relation):
-        text = self.text_norm(
-            self.text_projection(self.text_ent_embs(entity_ids))
-        )
-        gate = torch.sigmoid(
-            self.fusion_gate(
-                torch.cat([structure, text, query_relation], dim=-1)
-            )
-        )
-        return structure + gate * text
-
-    def build_world_memory(self, h_batch, context_batch, query_relation):
+    def build_world_memory(self, h_batch, context_batch, query_head_role):
         context_mask = context_batch['mask'].bool()
         entity_ids = context_batch['id'].masked_fill(~context_mask, 0)
         relation_ids = context_batch['rel_id'].masked_fill(~context_mask, 0)
 
-        head_structure = self.struct_ent_embs(h_batch['id'])
-        head = self._fuse_entity_text(
-            head_structure,
-            h_batch['id'],
-            query_relation,
+        head_entity = F.normalize(
+            self.struct_ent_embs(h_batch['id']),
+            p=2,
+            dim=-1,
         )
+        head = self.state_norm(head_entity * query_head_role)
 
-        context_structure = (
-            self.struct_ent_embs(entity_ids)
-            + self.encode_relation(relation_ids)
+        context_entities = F.normalize(
+            self.struct_ent_embs(entity_ids),
+            p=2,
+            dim=-1,
         )
-        context_condition = query_relation.unsqueeze(1).expand_as(
-            context_structure
-        )
-        context_facts = self._fuse_entity_text(
-            context_structure,
-            entity_ids,
-            context_condition,
+        _, context_tail_roles = self.encode_relation_roles(relation_ids)
+        context_facts = self.state_norm(
+            context_entities * context_tail_roles
         )
         context_facts = context_facts.masked_fill(
             ~context_mask.unsqueeze(-1),
@@ -157,13 +121,14 @@ class GWM(nn.Module):
         return memory, memory_padding_mask
 
     def encode_query(self, h_batch, r_batch, context_batch):
-        relation = self.encode_relation(r_batch['id'])
+        head_role, _ = self.encode_relation_roles(r_batch['id'])
+        relation_action = self.encode_relation(r_batch['id'])
         memory, memory_padding_mask = self.build_world_memory(
             h_batch,
             context_batch,
-            relation,
+            head_role,
         )
-        transition_query = self.next_state_token + relation.unsqueeze(1)
+        transition_query = self.next_state_token + relation_action.unsqueeze(1)
         next_state = self.transition_decoder(
             tgt=transition_query,
             memory=memory,
@@ -181,19 +146,26 @@ class GWM(nn.Module):
             dim=-1,
         )
 
-    def score_candidates(self, query, candidates):
-        return torch.mm(query, candidates.t()) / self.temperature
+    def score_candidates(self, query, candidates, tail_roles):
+        cross_term = torch.mm(query * tail_roles, candidates.t())
+        candidate_norm = torch.mm(
+            tail_roles.square(),
+            candidates.square().t(),
+        )
+        query_norm = query.square().sum(dim=-1, keepdim=True)
+        return (
+            2.0 * cross_term - candidate_norm - query_norm
+        ) / self.temperature
 
-    def compute_loss(self, query, target_ids):
+    def compute_loss(self, query, relation_ids, target_ids):
         candidates = F.normalize(
             self.struct_ent_embs.weight,
             p=2,
             dim=-1,
         )
-        return F.cross_entropy(
-            self.score_candidates(query, candidates),
-            target_ids,
-        )
+        _, tail_roles = self.encode_relation_roles(relation_ids)
+        scores = self.score_candidates(query, candidates, tail_roles)
+        return F.cross_entropy(scores, target_ids)
 
     def score_all_entities(
         self,
@@ -210,4 +182,5 @@ class GWM(nn.Module):
                 dtype=torch.long,
             )
             candidate_vectors = self.encode_target({'id': entity_ids})
-        return self.score_candidates(query, candidate_vectors)
+        _, tail_roles = self.encode_relation_roles(r_batch['id'])
+        return self.score_candidates(query, candidate_vectors, tail_roles)

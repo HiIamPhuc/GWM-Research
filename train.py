@@ -28,9 +28,8 @@ from utils.seed import make_torch_generator, make_worker_init_fn, seed_everythin
 
 
 ARCHITECTURE = (
-    'minimal_head_centered_world_memory_'
-    'residual_entity_text_fusion_'
-    'relation_conditioned_transition_decoder'
+    'structural_pairre_role_conditioned_'
+    'world_memory_transition_decoder'
 )
 TRAINING_OBJECTIVE = 'triple_level_full_entity_cross_entropy'
 
@@ -105,9 +104,6 @@ def train(args):
 
     print("Initializing model...")
     model = GWM(config)
-    model.load_text_embeddings(
-        os.path.join(config.data_dir, 'entity_text_embeddings.pt'),
-    )
     model = model.to(device)
     collate_fn = CollateFN()
     train_loader = DataLoader(
@@ -201,6 +197,7 @@ def train(args):
             )
             loss = model.compute_loss(
                 query,
+                r_batch['id'],
                 target_ids,
             )
             accumulation_group_start = (
